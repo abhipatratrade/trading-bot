@@ -1,0 +1,45 @@
+# Railway service definitions.
+# This repo is deployed as three services sharing one Postgres add-on.
+# Railway reads the [build] / [deploy] sections per-service via the dashboard;
+# this file is the canonical reference for what each service should run.
+
+# -----------------------------------------------------------------------------
+# Service 1: bot-worker
+#   Long-running. Holds Delta WS, places orders. Single replica only.
+# -----------------------------------------------------------------------------
+# Start command:    python -m src.entrypoints.run_bot
+# Replicas:         1   (NEVER scale up — would double-fire orders)
+# Env (from secrets): TRADING_MODE, DELTA_*, BINANCE_*, DATABASE_URL,
+#                     TELEGRAM_*, LOG_*, *DRAWDOWN_PCT, DRIFT_BPS_MAX
+
+# -----------------------------------------------------------------------------
+# Service 2: dashboard
+#   FastAPI + HTMX, read-only views + kill switch button.
+# -----------------------------------------------------------------------------
+# Start command:    uvicorn src.dashboard.app:app --host 0.0.0.0 --port $PORT
+# Replicas:         1
+# Env:              DATABASE_URL, LOG_*
+
+# -----------------------------------------------------------------------------
+# Service 3: scheduler
+#   Cron jobs: nightly export, reconciler heartbeat, scanner daily job
+#   (when later phases land).
+# -----------------------------------------------------------------------------
+# Start command:    python -m src.entrypoints.run_scheduler
+# Replicas:         1
+# Env:              DATABASE_URL, GDRIVE_*, TELEGRAM_*, LOG_*
+
+# -----------------------------------------------------------------------------
+# Add-on: Postgres
+#   Railway-managed. DATABASE_URL is auto-injected into all three services.
+# -----------------------------------------------------------------------------
+
+[build]
+builder = "NIXPACKS"
+
+[build.nixpacksPlan.phases.setup]
+nixPkgs = ["python311", "gcc"]
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

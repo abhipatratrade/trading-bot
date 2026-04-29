@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.installed.cfg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Type checkers / linters / coverage
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Env / secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+gdrive-service-account.json
+
+# Local DB / archives
+*.sqlite
+*.sqlite3
+local-archive/
+local-export/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Railway
+.railway/
+
+# OS
+Thumbs.db
