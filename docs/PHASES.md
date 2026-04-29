@@ -17,22 +17,22 @@ continuity files in place. No live orders. No real strategy yet.
 - [x] `CLAUDE.md` — bible pointer
 - [x] `docs/PHASES.md` — this file
 - [x] `docs/DECISIONS.md` — locked architecture decisions
-- [ ] `pyproject.toml` (Python ≥ 3.11, deps pinned)
-- [ ] `.gitignore`
-- [ ] `.env.example`
-- [ ] `railway.toml` — service definitions
-- [ ] `README.md`
-- [ ] Initial git commit
+- [x] `pyproject.toml` (Python ≥ 3.11, deps pinned)
+- [x] `.gitignore`
+- [x] `.env.example`
+- [x] `railway.toml` — service definitions
+- [x] `README.md`
+- [x] Initial git commit
 
 ### 0.2 Core plumbing
-- [ ] `src/core/config.py` — pydantic Settings, env-driven, TRADING_MODE switch
-- [ ] `src/core/logging.py` — structured JSON logs + secret redaction filter
-- [ ] `src/core/db.py` — SQLAlchemy engine + session factory
-- [ ] `src/core/models.py` — `Trade`, `Position`, `AuditLog`, `KillSwitch`,
+- [x] `src/core/config.py` — pydantic Settings, env-driven, TRADING_MODE switch
+- [x] `src/core/logging.py` — structured JSON logs + secret redaction filter
+- [x] `src/core/db.py` — SQLAlchemy engine + session factory
+- [x] `src/core/models.py` — `Trade`, `Position`, `AuditLog`, `KillSwitch`,
       `StrategyParamChange`, `DailyUniverse`, `ScannerSnapshot`,
       `SymbolMapping`
-- [ ] `src/core/clock.py` — injectable clock (real / fake) for tests
-- [ ] Alembic init + first migration
+- [x] `src/core/clock.py` — injectable clock (real / fake) for tests
+- [x] Alembic init + first migration (`0001_initial_schema`)
 
 ### 0.3 Broker layer (testnet only in this phase)
 - [ ] `src/brokers/base.py` — `Broker` ABC (place_order, cancel, positions, balances)
@@ -122,3 +122,4 @@ equal-weight, daily rebalance.
 Append a one-liner per session for traceability.
 
 - 2026-04-30 — Phase 0 kicked off: scaffold + continuity files written.
+- 2026-04-30 — Phase 0.2 done: core plumbing (config, logging, db, models, clock) + Alembic + initial migration.
