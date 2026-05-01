@@ -81,12 +81,12 @@ dashboard shows kill switch, scheduler runs nightly export. **No real strategy y
 Strategy: 1D timeframe, 5x leverage, top-5 by Delta India 24h volume,
 equal-weight, daily rebalance.
 
-- [ ] `src/strategies/crypto_longterm/policy.yaml` (v1, with backtest_ref)
-- [ ] `src/strategies/crypto_longterm/runner.py`
-- [ ] Volume scanner: rank Delta India perps by 24h notional, take top 5
-- [ ] Filter: only symbols with a Binance equivalent (signal feed available)
-- [ ] Daily rebalance loop: close non-universe, open new at equal weight × 5x
-- [ ] Strategy-specific safety wrapper
+- [x] `src/strategies/crypto_longterm/policy.yaml` (v1, with backtest_ref)
+- [x] `src/strategies/crypto_longterm/runner.py`
+- [x] Volume scanner: rank Delta India perps by 24h notional, take top 5
+- [x] Filter: only symbols with a Binance equivalent (signal feed available)
+- [x] Daily rebalance loop: close non-universe, open new at equal weight × 5x
+- [x] Strategy-specific safety wrapper
 - [ ] **Run on testnet ≥ 14 days unattended before going live**
 - [ ] Go live with ₹50,000 capital
 
@@ -130,3 +130,4 @@ Append a one-liner per session for traceability.
 - 2026-05-01 — Phase 0.7 done: FastAPI+HTMX dashboard (positions, trades, kill switch toggle, params snapshot, CSV export). Dark theme.
 - 2026-05-01 — Phase 0.8 done: APScheduler entrypoint, nightly Parquet+CSV export, GDrive upload, Telegram alerts (env-gated).
 - 2026-05-01 — Phase 0.9 done: Railway deployed — dashboard live at dashboard-production-71e0.up.railway.app, scheduler online, Postgres migrated. Phase 0 COMPLETE.
+- 2026-05-02 — Phase 1 code complete: policy.yaml + schema validator, volume scanner (top-5 by Delta 24h volume, Binance-filtered), daily rebalance runner (close exits → open entries at equal-weight × 5x), strategy-specific breaker wrapper, bot entrypoint with startup reconciliation + symbol mapping refresh. Ready for testnet deployment.
