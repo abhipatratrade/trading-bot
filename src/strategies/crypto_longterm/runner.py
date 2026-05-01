@@ -85,8 +85,8 @@ class CryptoLongtermRunner:
         )
 
         if should_rebalance:
+            self._last_rebalance_date = today  # set before attempt — never retry same day
             self._run_rebalance(today, now)
-            self._last_rebalance_date = today
         else:
             self._run_safety_check()
 
