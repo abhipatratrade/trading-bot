@@ -65,11 +65,11 @@ continuity files in place. No live orders. No real strategy yet.
 - [x] Telegram alert wiring (env-gated, no-op if no token)
 
 ### 0.9 Railway provisioning (USER does this part interactively)
-- [ ] User: create Railway project
-- [ ] User: provision Postgres
-- [ ] User: set env vars (DELTA_TESTNET_*, BINANCE_PUBLIC_*, KITE_*, TELEGRAM_*, GDRIVE_*)
-- [ ] Deploy 3 services: bot-worker, dashboard, scheduler
-- [ ] Verify all 3 boot, dashboard reachable, kill switch flippable
+- [x] User: create Railway project
+- [x] User: provision Postgres
+- [x] User: set env vars (DELTA_TESTNET_*, BINANCE_PUBLIC_*, KITE_*, TELEGRAM_*, GDRIVE_*)
+- [x] Deploy 3 services: bot-worker, dashboard, scheduler
+- [x] Verify all 3 boot, dashboard reachable, kill switch flippable
 
 **Phase 0 exit criterion**: bot-worker boots on testnet, reconciles cleanly,
 dashboard shows kill switch, scheduler runs nightly export. **No real strategy yet.**
@@ -129,3 +129,4 @@ Append a one-liner per session for traceability.
 - 2026-05-01 — Phase 0.6 done: kill_switch.py (engage/disengage/is_engaged) + breakers.py (daily DD, liq distance, funding extreme).
 - 2026-05-01 — Phase 0.7 done: FastAPI+HTMX dashboard (positions, trades, kill switch toggle, params snapshot, CSV export). Dark theme.
 - 2026-05-01 — Phase 0.8 done: APScheduler entrypoint, nightly Parquet+CSV export, GDrive upload, Telegram alerts (env-gated).
+- 2026-05-01 — Phase 0.9 done: Railway deployed — dashboard live at dashboard-production-71e0.up.railway.app, scheduler online, Postgres migrated. Phase 0 COMPLETE.
