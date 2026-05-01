@@ -17,8 +17,9 @@ def kill_switch_page(request: Request):
     rows = _get_kill_switch_rows()
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "kill_switch.html",
-        {"request": request, "switches": rows},
+        {"switches": rows},
     )
 
 
@@ -45,8 +46,9 @@ def toggle_kill_switch(
     rows = _get_kill_switch_rows()
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "partials/kill_switch_table.html",
-        {"request": request, "switches": rows},
+        {"switches": rows},
     )
 
 

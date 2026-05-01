@@ -17,8 +17,9 @@ def params_page(request: Request):
     snapshots = _load_all_policies()
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "params.html",
-        {"request": request, "strategies": snapshots},
+        {"strategies": snapshots},
     )
 
 

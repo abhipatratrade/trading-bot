@@ -61,12 +61,9 @@ def home(request: Request):
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "home.html",
-        {
-            "request": request,
-            "positions": pos_data,
-            "trades": trade_data,
-        },
+        {"positions": pos_data, "trades": trade_data},
     )
 
 
@@ -97,8 +94,9 @@ def positions_partial(request: Request):
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "partials/positions_table.html",
-        {"request": request, "positions": pos_data},
+        {"positions": pos_data},
     )
 
 
@@ -130,6 +128,7 @@ def trades_partial(request: Request):
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
+        request,
         "partials/trades_table.html",
-        {"request": request, "trades": trade_data},
+        {"trades": trade_data},
     )
