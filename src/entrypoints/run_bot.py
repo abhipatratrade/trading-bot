@@ -26,7 +26,7 @@ from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
-from src.data_sources.symbol_loader import fetch_mappings, load_to_db
+from src.data_sources.symbol_loader import DEFAULT_CSV, fetch_mappings, load_csv, load_to_db
 from src.order_manager.manager import OrderManager
 from src.order_manager.reconciler import Reconciler
 from src.strategies.crypto_longterm.params import load_and_audit
@@ -63,6 +63,8 @@ def main() -> None:
     reconciler = Reconciler(broker, BrokerName.DELTA_INDIA)
 
     # -- Refresh symbol mappings --
+    # Binance Futures API is geo-blocked in some Railway regions (HTTP 451).
+    # Fall back to the committed CSV so the scanner always has data.
     _log.info("refreshing_symbol_mappings")
     try:
         binance_data = BinanceData(settings)
@@ -71,7 +73,16 @@ def main() -> None:
         _log.info("symbol_mappings_refreshed", count=count)
         binance_data.close()
     except Exception:
-        _log.error("symbol_mapping_refresh_failed", exc_info=True)
+        _log.warning("symbol_mapping_api_failed_using_csv", exc_info=True)
+        if DEFAULT_CSV.exists():
+            try:
+                rows = load_csv(DEFAULT_CSV)
+                count = load_to_db(rows)
+                _log.info("symbol_mappings_loaded_from_csv", count=count, path=str(DEFAULT_CSV))
+            except Exception:
+                _log.error("symbol_mapping_csv_load_failed", exc_info=True)
+        else:
+            _log.error("symbol_mapping_csv_not_found", path=str(DEFAULT_CSV))
 
     # -- Load strategy config --
     policy = load_and_audit()
