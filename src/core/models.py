@@ -20,18 +20,16 @@ Tables:
 
 from __future__ import annotations
 
-from datetime import date as date_, datetime
+from datetime import date as date_
+from datetime import datetime
 from decimal import Decimal
-from enum import Enum
+from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     Date,
     DateTime,
-)
-from sqlalchemy import Enum as SAEnum
-from sqlalchemy import (
     Index,
     Integer,
     Numeric,
@@ -40,6 +38,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -49,23 +48,23 @@ from src.core.db import Base
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-class BrokerName(str, Enum):
+class BrokerName(StrEnum):
     DELTA_INDIA = "delta_india"
     ZERODHA = "zerodha"
 
 
-class OrderSide(str, Enum):
+class OrderSide(StrEnum):
     BUY = "buy"
     SELL = "sell"
 
 
-class PositionSide(str, Enum):
+class PositionSide(StrEnum):
     LONG = "long"
     SHORT = "short"
     FLAT = "flat"
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     PENDING = "pending"          # submitted to broker, ack'd
     OPEN = "open"                # resting on book
     FILLED = "filled"
@@ -75,12 +74,12 @@ class OrderStatus(str, Enum):
     UNKNOWN = "unknown"          # set by reconciler when broker state ambiguous
 
 
-class KillSwitchScope(str, Enum):
+class KillSwitchScope(StrEnum):
     GLOBAL = "global"
     STRATEGY = "strategy"
 
 
-class AuditEventType(str, Enum):
+class AuditEventType(StrEnum):
     # Lifecycle
     BOT_STARTUP = "bot_startup"
     BOT_SHUTDOWN = "bot_shutdown"

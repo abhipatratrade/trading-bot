@@ -15,7 +15,7 @@ Usage:
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 from typing import Literal
 
@@ -23,12 +23,12 @@ from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class TradingMode(str, Enum):
+class TradingMode(StrEnum):
     TESTNET = "testnet"
     LIVE = "live"
 
 
-class LogFormat(str, Enum):
+class LogFormat(StrEnum):
     JSON = "json"
     CONSOLE = "console"
 
@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: LogFormat = LogFormat.JSON
 
+    # -- Dashboard ----------------------------------------------------------
+    dashboard_host: str = "0.0.0.0"  # noqa: S104
+    dashboard_port: int = 8000
+
     # -- Safety thresholds --------------------------------------------------
     daily_drawdown_pct: float = 5.0
     weekly_drawdown_pct: float = 10.0
@@ -94,7 +98,7 @@ class Settings(BaseSettings):
     # Validation
     # -----------------------------------------------------------------------
     @model_validator(mode="after")
-    def _validate_mode_credentials(self) -> "Settings":
+    def _validate_mode_credentials(self) -> Settings:
         """Ensure the broker keys exist for the active mode.
 
         We deliberately do NOT raise if Telegram/GDrive are missing —

@@ -35,34 +35,34 @@ continuity files in place. No live orders. No real strategy yet.
 - [x] Alembic init + first migration (`0001_initial_schema`)
 
 ### 0.3 Broker layer (testnet only in this phase)
-- [ ] `src/brokers/base.py` — `Broker` ABC (place_order, cancel, positions, balances)
-- [ ] `src/brokers/delta_india/client.py` — REST + HMAC signing (testnet)
-- [ ] `src/brokers/delta_india/ws.py` — WebSocket: positions, fills, ticker
-- [ ] Smoke script: place + cancel a testnet order from CLI
+- [x] `src/brokers/base.py` — `Broker` ABC (place_order, cancel, positions, balances)
+- [x] `src/brokers/delta_india/client.py` — REST + HMAC signing (testnet)
+- [x] `src/brokers/delta_india/ws.py` — WebSocket: positions, fills, ticker
+- [x] Smoke script: place + cancel a testnet order from CLI
 
 ### 0.4 Data sources
-- [ ] `src/data_sources/base.py` — `MarketData` interface
-- [ ] `src/data_sources/binance.py` — public WS + REST (no auth)
-- [ ] `src/data_sources/delta_india.py` — public market data
-- [ ] Symbol mapping loader (CSV → `symbol_mapping` table)
+- [x] `src/data_sources/base.py` — `MarketData` interface
+- [x] `src/data_sources/binance.py` — public WS + REST (no auth)
+- [x] `src/data_sources/delta_india.py` — public market data
+- [x] Symbol mapping loader (CSV → `symbol_mapping` table)
 
 ### 0.5 Order manager + reconciler
-- [ ] `src/order_manager/manager.py` — idempotent placement (`client_order_id`)
-- [ ] `src/order_manager/reconciler.py` — DB ↔ exchange diff at startup + every 5 min
+- [x] `src/order_manager/manager.py` — idempotent placement (`client_order_id`)
+- [x] `src/order_manager/reconciler.py` — DB ↔ exchange diff at startup + every 5 min
 
 ### 0.6 Safety
-- [ ] `src/safety/kill_switch.py` — DB-flag check, called every loop
-- [ ] `src/safety/breakers.py` — daily DD, liquidation distance, funding extreme
-- [ ] Dashboard kill-switch button writes to DB
+- [x] `src/safety/kill_switch.py` — DB-flag check, called every loop
+- [x] `src/safety/breakers.py` — daily DD, liquidation distance, funding extreme
+- [x] Dashboard kill-switch button writes to DB (built in 0.7)
 
 ### 0.7 Dashboard skeleton
-- [ ] `src/dashboard/app.py` — FastAPI + HTMX shell
-- [ ] Pages: positions, recent trades, kill switch, params snapshot, CSV export
+- [x] `src/dashboard/app.py` — FastAPI + HTMX shell
+- [x] Pages: positions, recent trades, kill switch, params snapshot, CSV export
 
 ### 0.8 Scheduler + nightly export
-- [ ] `src/entrypoints/run_scheduler.py`
-- [ ] Nightly job: dump trades to Parquet + CSV → Google Drive folder
-- [ ] Telegram alert wiring (env-gated, no-op if no token)
+- [x] `src/entrypoints/run_scheduler.py`
+- [x] Nightly job: dump trades to Parquet + CSV → Google Drive folder
+- [x] Telegram alert wiring (env-gated, no-op if no token)
 
 ### 0.9 Railway provisioning (USER does this part interactively)
 - [ ] User: create Railway project
@@ -123,3 +123,9 @@ Append a one-liner per session for traceability.
 
 - 2026-04-30 — Phase 0 kicked off: scaffold + continuity files written.
 - 2026-04-30 — Phase 0.2 done: core plumbing (config, logging, db, models, clock) + Alembic + initial migration.
+- 2026-05-01 — Phase 0.3 done: Broker ABC, Delta India REST+WS client, smoke test passed on testnet (place+cancel+balances+positions all verified).
+- 2026-05-01 — Phase 0.4 done: MarketData ABC, Binance REST+WS, Delta India public data, symbol mapping sync (9 overlapping perps on testnet). CSV at data/symbol_mapping.csv.
+- 2026-05-01 — Phase 0.5 done: OrderManager (idempotent placement, kill switch, audit logging) + Reconciler (position/order sync, orphan detection). Broker.get_order added.
+- 2026-05-01 — Phase 0.6 done: kill_switch.py (engage/disengage/is_engaged) + breakers.py (daily DD, liq distance, funding extreme).
+- 2026-05-01 — Phase 0.7 done: FastAPI+HTMX dashboard (positions, trades, kill switch toggle, params snapshot, CSV export). Dark theme.
+- 2026-05-01 — Phase 0.8 done: APScheduler entrypoint, nightly Parquet+CSV export, GDrive upload, Telegram alerts (env-gated).

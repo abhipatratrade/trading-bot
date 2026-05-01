@@ -1,0 +1,40 @@
+{% if trades %}
+<table>
+    <thead>
+        <tr>
+            <th>Strategy</th>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>Price</th>
+            <th>Status</th>
+            <th>Submitted</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for t in trades %}
+        <tr>
+            <td>{{ t.strategy_id }}</td>
+            <td>{{ t.symbol }}</td>
+            <td><span class="badge {% if t.side == 'buy' %}badge-green{% else %}badge-red{% endif %}">{{ t.side }}</span></td>
+            <td>{{ t.quantity }}</td>
+            <td>{{ t.price }}</td>
+            <td>
+                {% if t.status == 'filled' %}
+                    <span class="badge badge-green">{{ t.status }}</span>
+                {% elif t.status == 'canceled' or t.status == 'rejected' %}
+                    <span class="badge badge-red">{{ t.status }}</span>
+                {% elif t.status == 'open' or t.status == 'pending' %}
+                    <span class="badge badge-blue">{{ t.status }}</span>
+                {% else %}
+                    <span class="badge badge-yellow">{{ t.status }}</span>
+                {% endif %}
+            </td>
+            <td>{{ t.submitted_at }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No recent trades.</p>
+{% endif %}

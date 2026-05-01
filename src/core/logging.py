@@ -28,7 +28,6 @@ from structlog.types import EventDict, Processor
 
 from src.core.config import LogFormat, get_settings
 
-
 # Patterns that should never appear in logs. Order matters — most-specific first.
 _REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Pydantic SecretStr repr — defence in depth

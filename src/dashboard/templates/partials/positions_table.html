@@ -1,0 +1,32 @@
+{% if positions %}
+<table>
+    <thead>
+        <tr>
+            <th>Strategy</th>
+            <th>Broker</th>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>Entry</th>
+            <th>Leverage</th>
+            <th>Liq Price</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for p in positions %}
+        <tr>
+            <td>{{ p.strategy_id }}</td>
+            <td>{{ p.broker }}</td>
+            <td>{{ p.symbol }}</td>
+            <td><span class="badge {% if p.side == 'long' %}badge-green{% else %}badge-red{% endif %}">{{ p.side }}</span></td>
+            <td>{{ p.quantity }}</td>
+            <td>{{ p.entry_price }}</td>
+            <td>{{ p.leverage }}</td>
+            <td>{{ p.liquidation_price }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No open positions.</p>
+{% endif %}

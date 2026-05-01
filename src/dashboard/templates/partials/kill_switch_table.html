@@ -1,0 +1,48 @@
+{% if switches %}
+<table>
+    <thead>
+        <tr>
+            <th>Scope</th>
+            <th>Strategy</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Engaged By</th>
+            <th>Engaged At</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in switches %}
+        <tr>
+            <td>{{ s.scope }}</td>
+            <td>{{ s.strategy_id }}</td>
+            <td>
+                {% if s.engaged %}
+                    <span class="badge badge-red">ENGAGED</span>
+                {% else %}
+                    <span class="badge badge-green">OFF</span>
+                {% endif %}
+            </td>
+            <td>{{ s.reason }}</td>
+            <td>{{ s.engaged_by }}</td>
+            <td>{{ s.engaged_at }}</td>
+            <td>
+                {% if s.engaged %}
+                <form hx-post="/kill-switch/toggle" hx-target="#ks-table" hx-swap="innerHTML" class="inline">
+                    <input type="hidden" name="scope" value="{{ s.scope }}">
+                    <input type="hidden" name="strategy_id" value="{{ s.strategy_id if s.strategy_id != '—' else '' }}">
+                    <input type="hidden" name="action" value="disengage">
+                    <input type="hidden" name="reason" value="">
+                    <button type="submit" class="btn btn-success">Disengage</button>
+                </form>
+                {% else %}
+                <span style="color:#8b949e;">—</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No kill switch rows configured yet. Use the form above to create one.</p>
+{% endif %}

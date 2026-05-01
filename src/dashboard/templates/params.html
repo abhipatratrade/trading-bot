@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Strategy Params{% endblock %}
+{% block content %}
+<h1>Strategy Parameters</h1>
+<p style="font-size:0.85rem; color:#8b949e; margin-bottom:1rem;">
+    Read-only snapshot of each strategy's <code>policy.yaml</code>.
+    Changes require a git commit with a <code>backtest_ref</code>.
+</p>
+
+{% if strategies %}
+    {% for s in strategies %}
+    <div class="section">
+        <h2>{{ s.name }}</h2>
+        <pre>{{ s.policy | tojson(indent=2) }}</pre>
+    </div>
+    {% endfor %}
+{% else %}
+<p class="empty">No strategy policy files found in src/strategies/*/policy.yaml.</p>
+{% endif %}
+{% endblock %}

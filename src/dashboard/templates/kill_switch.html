@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Kill Switch{% endblock %}
+{% block content %}
+<h1>Kill Switch</h1>
+
+<div class="section">
+    <h2>Engage New</h2>
+    <form hx-post="/kill-switch/toggle" hx-target="#ks-table" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:end; flex-wrap:wrap;">
+        <div>
+            <label style="font-size:0.8rem;">Scope</label><br>
+            <select name="scope">
+                <option value="global">Global</option>
+                <option value="strategy">Strategy</option>
+            </select>
+        </div>
+        <div>
+            <label style="font-size:0.8rem;">Strategy ID (if strategy)</label><br>
+            <input type="text" name="strategy_id" placeholder="e.g. crypto_longterm">
+        </div>
+        <div>
+            <label style="font-size:0.8rem;">Reason</label><br>
+            <input type="text" name="reason" placeholder="Why?" style="width:200px;">
+        </div>
+        <input type="hidden" name="action" value="engage">
+        <button type="submit" class="btn btn-danger">Engage Kill Switch</button>
+    </form>
+</div>
+
+<h2>Current State</h2>
+<div id="ks-table">
+    {% include "partials/kill_switch_table.html" %}
+</div>
+{% endblock %}
