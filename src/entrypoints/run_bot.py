@@ -56,6 +56,14 @@ def main() -> None:
         trading_mode=settings.trading_mode.value,
     )
 
+    # TEMP: log current outbound IP — remove after whitelisting
+    try:
+        import httpx as _httpx
+        _ip = _httpx.get("https://ifconfig.me", timeout=5).text.strip()
+        _log.info("RAILWAY_OUTBOUND_IP", ip=_ip)
+    except Exception:
+        pass
+
     # -- Init clients --
     broker = DeltaIndiaClient(settings)
     data_source = DeltaIndiaData(settings)
