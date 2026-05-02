@@ -56,6 +56,14 @@ def main() -> None:
         trading_mode=settings.trading_mode.value,
     )
 
+    # Log outbound IP on every startup — needed to update Delta IP whitelist after redeploys
+    try:
+        import httpx as _httpx
+        _ip = _httpx.get("https://api.ipify.org", timeout=5).text.strip()
+        _log.info("RAILWAY_OUTBOUND_IP", ip=_ip)
+    except Exception:
+        _log.warning("outbound_ip_check_failed")
+
     # -- Init clients --
     broker = DeltaIndiaClient(settings)
     data_source = DeltaIndiaData(settings)
