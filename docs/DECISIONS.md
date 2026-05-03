@@ -160,6 +160,26 @@ without Telegram still runs).
 
 ---
 
+## 012 — Stocks broker: switch from Zerodha to Dhan
+Date: 2026-05-03
+Status: Accepted
+Supersedes: 005
+
+Decision: Use Dhan (DhanHQ API) instead of Zerodha Kite Connect for all
+Indian equity data and execution (Phase 3 onwards).
+Rationale: The Zerodha decision assumed an existing live Kite system —
+that system does not exist. Dhan has a free API tier (vs ₹2k/month for
+Kite Connect), access tokens valid for 30 days (vs Zerodha's daily expiry
+which requires a login script), and user already has a Dhan account.
+Consequences:
+- Remove all Kite-related config, broker adapter, and data source code.
+- Add Dhan REST + WebSocket broker adapter in Phase 3.
+- BrokerName enum: replace ZERODHA with DHAN.
+- Symbol mapping: use Dhan symbol format instead of Kite NSE tokens.
+- No daily re-authentication cron job needed (30-day tokens).
+
+---
+
 ## 011 — Session continuity: CLAUDE.md + PHASES.md + DECISIONS.md
 Date: 2026-04-29
 Status: Accepted

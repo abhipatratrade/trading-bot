@@ -45,7 +45,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Crypto signals data | Binance public WS/REST |
 | Crypto execution | Delta Exchange India (HMAC client) |
 | Crypto funding source (for logic) | Always Delta India's funding rate |
-| Stocks data + execution | Zerodha Kite Connect |
+| Stocks data + execution | Dhan (DhanHQ API) — see Decision 012 |
 | Strategy params | YAML in git, schema-validated, audit-logged, `backtest_ref` required |
 | Trade archive | Postgres (truth) + nightly Parquet/CSV → Google Drive auto-sync to local |
 | Alerts channel | Telegram |
