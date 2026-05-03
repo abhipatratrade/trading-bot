@@ -19,7 +19,7 @@ rebalance_hour: 10
 rebalance_minute: 0
 
 # Safety thresholds (override global defaults for this strategy)
-max_daily_drawdown_pct: 5.0
+max_daily_drawdown_pct: 20.0   # relaxed for testnet soak — revert to 5.0 before going live
 min_liquidation_distance_pct: 15.0
 max_funding_rate: 0.01
 
