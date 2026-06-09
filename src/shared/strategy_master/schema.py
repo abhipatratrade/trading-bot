@@ -40,12 +40,13 @@ class StrategyMasterRow(BaseModel):
     trading_regime_2: MarketRegime | None = None
     trading_type: str = Field(min_length=1)
 
-    # CSV cells arrive as strings. Blank → None.
+    # CSV cells arrive as strings. Combined parser: blanks → None,
+    # then min_vol gets numeric coercion (underscores/commas stripped).
     @field_validator(
-        "min_vol", "trading_regime_1", "trading_regime_2", mode="before"
+        "trading_regime_1", "trading_regime_2", mode="before"
     )
     @classmethod
-    def _blank_to_none(cls, v: object) -> object:
+    def _blank_regime_to_none(cls, v: object) -> object:
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
@@ -54,7 +55,10 @@ class StrategyMasterRow(BaseModel):
     @classmethod
     def _parse_volume(cls, v: object) -> object:
         if isinstance(v, str):
-            return Decimal(v.replace("_", "").replace(",", "").strip())
+            stripped = v.replace("_", "").replace(",", "").strip()
+            if stripped == "":
+                return None
+            return Decimal(stripped)
         return v
 
     @property

@@ -40,16 +40,20 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Decision | Value |
 |---|---|
 | Language | Python |
-| Hosting | Railway (all services + Postgres) |
+| Hosting | Railway (services + Postgres); bot-worker on GCP VM since 2026-05-03 |
 | Dashboard | FastAPI + HTMX (single Python service) |
 | Crypto signals data | Binance public WS/REST |
 | Crypto execution | Delta Exchange India (HMAC client) |
 | Crypto funding source (for logic) | Always Delta India's funding rate |
 | Stocks data + execution | Dhan (DhanHQ API) — see Decision 012 |
-| Strategy params | YAML in git, schema-validated, audit-logged, `backtest_ref` required |
+| Strategy params | YAML/CSV in git, schema-validated, audit-logged, `backtest_ref` required |
 | Trade archive | Postgres (truth) + nightly Parquet/CSV → Google Drive auto-sync to local |
 | Alerts channel | Telegram |
-| Architecture | Deterministic core now; agentic perimeter (postmortem, research, news) later |
+| Architecture | Six (type × market) buckets w/ isolated capital — Decision 013 |
+| Regime | Per-bucket HMM at bucket TF (3-state bear/neutral/bull) — Decision 014 |
+| Sizing | Kelly on bucket capital, skip if insufficient — Decision 015 |
+| Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
+| Determinism | No LLM in the trading loop; agentic perimeter later |
 | Backtest engine | Out of scope for this repo |
 | Options trading | Deferred until all futures/spot phases live |
 
@@ -106,17 +110,26 @@ Phase 8+ Options (deferred)
 ## Repo Layout (one-line orientation)
 
 ```
-src/core/          shared plumbing (config, db, models, logging, clock)
-src/scanner/       Goal 2 framework — filters + rankers, pluggable
-src/strategies/    one folder per priority; each has policy.yaml
-src/brain/         regime classifier (HMM) — added in Phase 2+
-src/allocator/     Goal 4 — top-level capital split across strategies
-src/safety/        breakers + kill switch
-src/brokers/       broker adapters behind a common interface
-src/data_sources/  Binance / Delta / Kite market data behind common interface
-src/order_manager/ idempotent orders, reconciler
-src/dashboard/     FastAPI + HTMX read-only UI
-src/entrypoints/   run_bot.py / run_dashboard.py / run_scheduler.py
-docs/              PHASES.md, DECISIONS.md, runbook
-ops/               Dockerfiles, Railway config
+buckets.yaml                     six (type × market) buckets — Decision 013
+src/core/                        shared plumbing (config, db, models, logging, clock)
+src/shared/                      reusable engines (one library, many configs)
+  ├─ bucket.py                   Bucket loader; reads buckets.yaml
+  ├─ base_strategy.py            Strategy ABC
+  ├─ strategy_loader.py          discovers Strategy subclasses by folder
+  ├─ bucket_runner.py            8-step pipeline orchestrator per bucket
+  ├─ scanner/                    generic filter + ranker engine
+  ├─ regime/                     HMM Brain (features, model, store, brain, retrain)
+  ├─ allocator/                  Kelly math + caps + sizer with skip rules
+  └─ strategy_master/            CSV schema + loader
+src/strategies/<type>/<market>/  one folder per bucket
+  ├─ scanner.yaml | regime.yaml | allocator.yaml | strategy_master.csv
+  └─ strategies/                 one .py per Strategy subclass
+src/safety/                      breakers + kill switch
+src/brokers/                     broker adapters behind a common interface
+src/data_sources/                Binance / Delta / Dhan market data
+src/order_manager/               idempotent orders, reconciler
+src/dashboard/                   FastAPI + HTMX; /buckets six-card overview
+src/entrypoints/                 run_bot.py / run_dashboard.py / run_scheduler.py
+docs/                            PHASES.md, DECISIONS.md, runbook
+ops/                             Dockerfiles, Railway config
 ```

@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}{{ bucket.id }} — Trading Bot{% endblock %}
+
+{% block content %}
+<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:1.5rem">
+  <div>
+    <h1 style="margin:0">{{ bucket.id }}</h1>
+    <div style="color:#8b949e;font-size:0.85rem">
+      {{ bucket.trading_type|capitalize }} · {{ bucket.market|capitalize }} ·
+      {{ bucket.broker }} · max {{ bucket.leverage_max }}x · capital {{ bucket.capital_inr }}
+      {% if bucket.enabled %}
+        <span class="badge badge-green">live</span>
+      {% else %}
+        <span class="badge badge-yellow">disabled</span>
+      {% endif %}
+    </div>
+  </div>
+  <a href="/buckets" class="btn">← All buckets</a>
+</div>
+
+<div class="section" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem">
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Available</div>
+    <div style="font-size:1.4rem;font-weight:600">{{ state.available_inr }}</div>
+    <div style="color:#8b949e;font-size:0.75rem">locked: {{ state.locked_inr }}</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Regime</div>
+    {% if regime.label %}
+      <div style="font-size:1.4rem;font-weight:600;text-transform:capitalize">
+        {{ regime.label }}
+      </div>
+      <div style="color:#8b949e;font-size:0.75rem">
+        model {{ regime.model_version }} · {{ regime.age_min }}m ago
+      </div>
+    {% else %}
+      <div class="empty" style="padding:0">no prediction yet</div>
+    {% endif %}
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Start New Trade</div>
+    <form method="post" action="/buckets/{{ bucket.id }}/run" class="inline">
+      <button type="submit" class="btn btn-success" {% if not bucket.enabled %}disabled{% endif %}>
+        Request next-tick run
+      </button>
+    </form>
+    <div style="color:#8b949e;font-size:0.7rem;margin-top:0.4rem">
+      Logs an audit row. The bot processes it on the next loop tick.
+    </div>
+  </div>
+</div>
+
+<h2>Running Trades</h2>
+{% if running %}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Strategy</th><th>Side</th><th>Qty</th>
+        <th>Entry</th><th>Leverage</th><th>Opened</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in running %}
+      <tr>
+        <td><strong>{{ r.symbol }}</strong></td>
+        <td>{{ r.strategy_name }}</td>
+        <td>
+          {% if r.side == 'long' %}<span class="badge badge-green">{{ r.side }}</span>
+          {% else %}<span class="badge badge-red">{{ r.side }}</span>{% endif %}
+        </td>
+        <td>{{ r.quantity }}</td>
+        <td>{{ r.entry_price }}</td>
+        <td>{{ r.leverage }}x</td>
+        <td>{{ r.opened_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty">no open positions</div>
+{% endif %}
+
+<h2>Strategies — scanning, no live trade</h2>
+{% if scanning %}
+  <table>
+    <thead>
+      <tr><th>Name</th><th>TF</th><th>Regime gate</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {% for s in scanning %}
+      <tr>
+        <td><strong>{{ s.name }}</strong></td>
+        <td>{{ s.tf }}</td>
+        <td>{% for r in s.regime_gate %}<span class="badge badge-blue">{{ r }}</span> {% endfor %}</td>
+        <td>
+          {% if s.live %}
+            <span class="badge badge-green">trading</span>
+          {% else %}
+            <span class="badge badge-yellow">scanning</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty">no strategies registered in strategy_master.csv</div>
+{% endif %}
+
+<h2>Recent Trades</h2>
+{% if recent_trades %}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Strategy</th><th>Side</th><th>Qty</th>
+        <th>Price</th><th>Status</th><th>Submitted</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in recent_trades %}
+      <tr>
+        <td><strong>{{ t.symbol }}</strong></td>
+        <td>{{ t.strategy_name }}</td>
+        <td>{{ t.side }}</td>
+        <td>{{ t.quantity }}</td>
+        <td>{{ t.price }}</td>
+        <td>
+          {% if t.status == 'filled' %}<span class="badge badge-green">{{ t.status }}</span>
+          {% elif t.status in ('rejected','canceled') %}<span class="badge badge-red">{{ t.status }}</span>
+          {% else %}<span class="badge badge-yellow">{{ t.status }}</span>{% endif %}
+        </td>
+        <td>{{ t.submitted_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty">no trades yet</div>
+{% endif %}
+{% endblock %}

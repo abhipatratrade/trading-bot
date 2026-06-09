@@ -1,20 +1,23 @@
-"""Strategy params snapshot page."""
+"""Strategy params snapshot page — walks bucket configs.
+
+Replaces the legacy ``*/policy.yaml`` lookup with the new per-bucket layout:
+each bucket has ``scanner.yaml`` + ``regime.yaml`` + ``allocator.yaml`` +
+``strategy_master.csv``. We render them grouped by bucket for review.
+"""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import yaml
 from fastapi import APIRouter, Request
 
-router = APIRouter(prefix="/params", tags=["params"])
+from src.shared.bucket import load_buckets
 
-_STRATEGIES_DIR = Path(__file__).parents[2] / "strategies"
+router = APIRouter(prefix="/params", tags=["params"])
 
 
 @router.get("")
 def params_page(request: Request):
-    snapshots = _load_all_policies()
+    snapshots = _load_all_bucket_configs()
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request,
@@ -23,17 +26,26 @@ def params_page(request: Request):
     )
 
 
-def _load_all_policies() -> list[dict]:
-    """Walk strategy directories and load each policy.yaml."""
+def _load_all_bucket_configs() -> list[dict]:
     results: list[dict] = []
-    if not _STRATEGIES_DIR.exists():
-        return results
-    for policy_path in sorted(_STRATEGIES_DIR.glob("*/policy.yaml")):
-        strategy_name = policy_path.parent.name
+    for bucket in load_buckets():
+        bundle: dict[str, object] = {"bucket": bucket.id, "enabled": bucket.config.enabled}
+        for name, path in (
+            ("scanner", bucket.scanner_yaml_path),
+            ("regime", bucket.regime_yaml_path),
+            ("allocator", bucket.allocator_yaml_path),
+        ):
+            try:
+                bundle[name] = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                bundle[name] = {"_error": f"missing {path.name}"}
+            except Exception as e:
+                bundle[name] = {"_error": str(e)}
         try:
-            with open(policy_path) as f:
-                data = yaml.safe_load(f) or {}
-        except Exception:
-            data = {"_error": f"Could not parse {policy_path}"}
-        results.append({"name": strategy_name, "policy": data})
+            bundle["strategy_master"] = bucket.strategy_master_csv_path.read_text(
+                encoding="utf-8"
+            )
+        except FileNotFoundError:
+            bundle["strategy_master"] = ""
+        results.append({"name": bucket.id, "policy": bundle})
     return results

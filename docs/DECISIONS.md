@@ -191,3 +191,137 @@ is the bible pointer + locked-decisions quick ref + house rules.
 Rationale: User wants to resume work in new sessions without re-briefing.
 Consequences: Every session ends by ticking PHASES.md and committing.
 Decisions never live in chat memory alone — they're written here first.
+
+---
+
+## 013 — Architecture: (type × market) buckets with isolated capital
+Date: 2026-06-10
+Status: Accepted
+
+Decision: The system is partitioned into six independent buckets — one
+per (trading_type × market) pair: longterm-crypto, swing-crypto,
+scalp-crypto, gambling-crypto, longterm-indian, swing-indian. Each
+bucket has a fixed ₹50,000 INR capital pool tracked in the
+`bucket_state` Postgres table, its own folder under
+`src/strategies/<type>/<market>/`, its own broker, leverage cap, and
+configuration files (`scanner.yaml`, `regime.yaml`, `allocator.yaml`,
+`strategy_master.csv`). All six pre-funded up-front (₹3,00,000 total).
+
+Rationale: Matches the user's PPTX instructions
+(`C:\Users\User\Documents\Trading bot instructions.pptx`, slides 4-5)
+and Goal_Setting.txt portfolio percentages. Isolation between buckets
+means a blowup in one strategy class can't drain another. Per-bucket
+sizing simplifies Kelly accounting.
+
+Consequences:
+- Folder structure is `src/strategies/<type>/<market>/`.
+- `buckets.yaml` at repo root is the single source of truth for
+  capital + broker + leverage cap + enabled flag.
+- `BucketState` table tracks live capital vs locked margin.
+- Cross-bucket capital rebalancing is explicitly out of scope for v1.
+- Indian buckets ship disabled until the Dhan adapter lands (Phase 3).
+
+---
+
+## 014 — Per-bucket regime HMM at the bucket's TF
+Date: 2026-06-10
+Status: Accepted
+
+Decision: Each bucket gets its own Hidden Markov Model fit on a proxy
+symbol (BTCUSDT for crypto; NIFTY-equivalent for Indian later) at the
+bucket's own TF — 1D for longterm, 1H for swing, 5M for scalp/gambling.
+Three hidden states mapped to `bear` / `neutral` / `bull` by sorting on
+mean log return. Models live in the `regime_model` Postgres table
+(JSONB serialised hmmlearn params, no pickle, no filesystem).
+
+Rationale: PPTX slide 4(b) — regime TF matches strategy TF, not a single
+global regime. Three states are robust to limited crypto history; 5
+states (Crash/Euphoria) deferred until ≥ 3 months of live signal.
+
+Consequences:
+- Six retrain jobs (one per bucket), cadence per `regime.yaml`.
+- Scheduler service wires APScheduler crons keyed by bucket id.
+- `RegimeSnapshot` row written every inference; `REGIME_CHANGE` audit
+  event when the label flips.
+- 5-state model and Crash kill-switch coupling stay deferred.
+
+---
+
+## 015 — Kelly on bucket capital with insufficient-balance skip rule
+Date: 2026-06-10
+Status: Accepted
+
+Decision: Position sizing uses continuous Kelly (`f* = μ/σ²`), scaled
+by `fractional_kelly` (default 0.25) and the current regime's
+multiplier. The notional is computed against `bucket.capital_inr` (not
+aggregate equity). Per-symbol (μ, σ) come from the user's separate
+backtester and are committed to `allocator.yaml` in each bucket folder
+with a `backtest_ref` (per Decision 006).
+
+If `suggested_notional > bucket.available_balance_inr`, the trade is
+**skipped entirely** — no partial fill. Sized snapshot is written with
+`decision = SKIPPED_INSUFFICIENT`.
+
+Rationale: PPTX slide 4(d). Skipping under-sized trades preserves
+Kelly's edge profile (partial fills change the variance of returns and
+ruin the optimality). Backtester-fed stats keep param choices
+auditable; live rolling estimation is deferred to Phase 7.
+
+Consequences:
+- New `SizingDecision` enum + `sizing_snapshot` audit table.
+- Allocator is pure (no I/O); orchestration in `sizer.size_positions`.
+- Long-only for v1: μ ≤ 0 → SKIPPED_NEGATIVE_EDGE (no shorting).
+- Dedup gate inside the sizer: (bucket_id, strategy_name, symbol) open
+  → SKIPPED_DEDUP.
+
+---
+
+## 016 — Strategy Master is a CSV per bucket (OR-semantics regime gate)
+Date: 2026-06-10
+Status: Accepted
+
+Decision: Each bucket folder contains a `strategy_master.csv` file
+(plain CSV, git-tracked) listing every strategy with columns
+`strategy_name, tf, min_vol, trading_regime_1, trading_regime_2,
+trading_type`. Loaded and pydantic-validated on bucket startup; fail-fast
+on any schema/consistency violation.
+
+Regime-gate semantics are **OR**: a strategy trades if the current
+regime is in `{trading_regime_1, trading_regime_2}` (blanks ignored).
+Both blank ⇒ strategy is regime-agnostic.
+
+Rationale: PPTX slide 4(c) explicitly references "Excel header" but the
+user picked CSV-in-git when asked: opens in Excel naturally,
+git-diffable, no binary churn. OR-semantics match the natural reading
+of "Trading Regime 1 or 2".
+
+Consequences:
+- `src/shared/strategy_master/{schema,loader}.py` implement validation.
+- Strategy files are auto-discovered in `strategies/<type>/<market>/strategies/`
+  (one `Strategy` subclass per `.py`); the master CSV gates them.
+- AND / weighted variants stay out of scope for v1.
+
+---
+
+## 017 — Phase 1 soak restarts under the new bucket structure
+Date: 2026-06-10
+Status: Accepted
+
+Decision: The in-flight 14-day testnet soak (started 2026-05-03 on the
+GCP VM) is restarted from scratch after the bucket restructure. The old
+`src/strategies/crypto_longterm/` is removed; the same logic is ported
+as `src/strategies/longterm/crypto/strategies/top5_volume.py`. Existing
+DB rows are backfilled by migration 0002 (`bucket_id='longterm-crypto',
+strategy_name='top5_volume'`) so historical positions/trades carry the
+new identifiers.
+
+Rationale: User chose "Restructure immediately; restart soak" when
+asked. Cleaner single structure, modest cost (~5 days of soak data
+lost), avoids carrying two parallel runtime paths.
+
+Consequences:
+- The 14-day testnet soak clock resets at the next deploy.
+- Live capital deployment (₹50k on `longterm-crypto`) follows the new
+  soak window, not the original schedule.
+- Backfill is a one-shot at migration time; no parallel-path support
+  code lives in the codebase.

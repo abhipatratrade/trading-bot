@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Buckets — Trading Bot{% endblock %}
+
+{% block content %}
+<h1>Buckets</h1>
+<p style="color:#8b949e;font-size:0.85rem;margin-bottom:1.5rem">
+  Six (trading_type &times; market) buckets per Goal_Setting.txt + Decision 013.
+  Each has its own capital pool, broker, scanner, regime model, and Strategy
+  Master. Click a card for detail.
+</p>
+
+<style>
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
+  .col-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; margin-bottom: 0.5rem; }
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 0.9rem; text-decoration: none; color: var(--text); display: block; }
+  .card:hover { border-color: var(--accent); }
+  .card.disabled { opacity: 0.55; }
+  .card h3 { font-size: 0.95rem; margin-bottom: 0.4rem; display: flex; justify-content: space-between; align-items: center; }
+  .card .meta { font-size: 0.7rem; color: #8b949e; margin-bottom: 0.5rem; }
+  .card .row { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.2rem; }
+  .card .lab { color: #8b949e; }
+</style>
+
+<div class="grid">
+  <div>
+    <div class="col-title">Crypto (Delta India)</div>
+    <div class="card-grid">
+      {% for c in cards if c.market == 'crypto' %}
+        <a class="card {% if not c.enabled %}disabled{% endif %}" href="/buckets/{{ c.id }}">
+          <h3>
+            {{ c.trading_type|capitalize }}
+            {% if c.enabled %}
+              <span class="badge badge-green">live</span>
+            {% else %}
+              <span class="badge badge-yellow">off</span>
+            {% endif %}
+          </h3>
+          <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
+          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr }}</span></div>
+          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr }}</span></div>
+          <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
+          <div class="row"><span class="lab">Regime</span>
+            <span>
+              {% if c.regime %}
+                <span class="badge badge-blue">{{ c.regime }}</span>
+                <span class="lab">{{ c.regime_age_min }}m</span>
+              {% else %}
+                <span class="lab">—</span>
+              {% endif %}
+            </span>
+          </div>
+        </a>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div>
+    <div class="col-title">Indian (Dhan — Phase 3+)</div>
+    <div class="card-grid">
+      {% for c in cards if c.market == 'indian' %}
+        <a class="card {% if not c.enabled %}disabled{% endif %}" href="/buckets/{{ c.id }}">
+          <h3>
+            {{ c.trading_type|capitalize }}
+            {% if c.enabled %}
+              <span class="badge badge-green">live</span>
+            {% else %}
+              <span class="badge badge-yellow">off</span>
+            {% endif %}
+          </h3>
+          <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
+          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr }}</span></div>
+          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr }}</span></div>
+          <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
+          <div class="row"><span class="lab">Regime</span>
+            <span>
+              {% if c.regime %}
+                <span class="badge badge-blue">{{ c.regime }}</span>
+              {% else %}
+                <span class="lab">—</span>
+              {% endif %}
+            </span>
+          </div>
+        </a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endblock %}

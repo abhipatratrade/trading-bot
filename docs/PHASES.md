@@ -79,18 +79,36 @@ dashboard shows kill switch, scheduler runs nightly export. **No real strategy y
 ## Phase 1 — Crypto Long-term [priority 1]
 
 Strategy: 1D timeframe, 5x leverage, top-5 by Delta India 24h volume,
-equal-weight, daily rebalance.
+Kelly-sized against ₹50k bucket capital, optional regime multiplier.
 
-- [x] `src/strategies/crypto_longterm/policy.yaml` (v1, with backtest_ref)
-- [x] `src/strategies/crypto_longterm/runner.py`
-- [x] Volume scanner: rank Delta India perps by 24h notional, take top 5
-- [x] Filter: only symbols with a Binance equivalent (signal feed available)
-- [x] Daily rebalance loop: close non-universe, open new at equal weight × 5x
-- [x] Strategy-specific safety wrapper
-- [ ] **Run on testnet ≥ 14 days unattended before going live**
+### 1a — Bucket framework (Decisions 013-017)
+- [x] `buckets.yaml` at repo root
+- [x] Migration 0002 — new tables + column adds + seed bucket_state
+- [x] `src/shared/`: bucket, base_strategy, strategy_loader,
+      strategy_master (schema+loader), scanner engine, allocator
+      (kelly+caps+sizer), regime (features+HMM+regimes+store+brain+retrain),
+      bucket_runner
+- [x] Six bucket folders with yaml/csv stubs (`longterm-crypto` fully
+      populated; others disabled stubs)
+- [x] `top5_volume.py` Strategy subclass under `longterm/crypto/strategies/`
+- [x] Old `src/strategies/crypto_longterm/` + legacy volume_scanner removed
+- [x] `run_bot.py` iterates all enabled buckets each tick
+- [x] `run_scheduler.py` registers per-bucket regime retrain jobs
+- [x] Dashboard: `/buckets` 6-card overview + per-bucket detail page
+- [x] Unit tests for shared modules (36 passing)
+
+### 1b — Soak restart on new structure (Decision 017)
+- [ ] Run migration 0002 against GCP Postgres
+- [ ] Redeploy bot to GCP VM
+- [ ] **Run on testnet ≥ 14 days unattended on the new structure**
+- [ ] Train initial HMM on BTCUSDT 1D and flip `regime.enabled: true` in
+      `longterm/crypto/regime.yaml`
+- [ ] Update `allocator.yaml` μ/σ values from backtester output + new
+      `backtest_ref`
 - [ ] Go live with ₹50,000 capital
 
-**Phase 1 exit criterion**: 14 testnet days clean + first live week clean.
+**Phase 1 exit criterion**: 14 testnet days clean (under new structure) +
+first live week clean.
 
 ---
 
@@ -132,3 +150,4 @@ Append a one-liner per session for traceability.
 - 2026-05-01 — Phase 0.9 done: Railway deployed — dashboard live at dashboard-production-71e0.up.railway.app, scheduler online, Postgres migrated. Phase 0 COMPLETE.
 - 2026-05-02 — Phase 1 code complete: policy.yaml + schema validator, volume scanner (top-5 by Delta 24h volume, Binance-filtered), daily rebalance runner (close exits → open entries at equal-weight × 5x), strategy-specific breaker wrapper, bot entrypoint with startup reconciliation + symbol mapping refresh. Ready for testnet deployment.
 - 2026-05-03 — Bot deployed to GCP VM (35.184.66.247, static IP, e2-micro, us-central1-f). Railway bot-worker deleted. First testnet rebalance ran: opened BTCUSD, ETHUSD, SOLUSD, XRPUSD. Telegram alerts working. 14-day testnet soak started. Decision 012: switched stocks broker from Zerodha to Dhan (free API, 30-day tokens).
+- 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
