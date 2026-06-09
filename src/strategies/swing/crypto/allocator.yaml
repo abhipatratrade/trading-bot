@@ -1,12 +1,39 @@
-# Phase 2 stub. Populate from backtester output before enabling.
+# Position-size config for swing-crypto.
+#
+# Industry-standard placeholder μ/σ for 1-hour log returns, derived from
+# public realized-vol studies of major crypto perps:
+#   sigma_1h = sigma_annual / sqrt(8760 hours)
+#   mu_1h    = mu_annual    / 8760
+#
+# Assumed annualized: BTC 70% vol / 40% return → Sharpe ~0.57 (conservative).
+# Higher-vol alts scale up; lower-vol majors scale down.
+#
+# These are sized for the EMA 9/15 crossover entry. Replace with real
+# backtester output before Phase 2 goes live — Decision 006 requires a
+# backtest_ref on every change.
+
 fractional_kelly: 0.25
-per_symbol_cap: 0.20
-aggregate_cap: 1.00
+per_symbol_cap: 0.20      # max 20% of bucket capital in any single name
+aggregate_cap: 1.00       # don't deploy more than the bucket's capital
+
 regime_multipliers:
   bear: 0.00
   neutral: 0.40
   bull: 1.00
+
+# Used when a candidate symbol is not in the stats table below.
 default_for_unknown:
-  mu_per_period: 0.0000
-  sigma_per_period: 0.0100
-stats: {}
+  mu_per_period: 0.00003   # ~26% annualized — modest assumption
+  sigma_per_period: 0.012  # ~112% annualized — covers most alts
+
+stats:
+  BTCUSD:  { mu_per_period: 0.0000457, sigma_per_period: 0.00747 }
+  ETHUSD:  { mu_per_period: 0.0000514, sigma_per_period: 0.00855 }
+  SOLUSD:  { mu_per_period: 0.0000685, sigma_per_period: 0.01175 }
+  XRPUSD:  { mu_per_period: 0.0000342, sigma_per_period: 0.00855 }
+  BNBUSD:  { mu_per_period: 0.0000400, sigma_per_period: 0.00641 }
+  DOGEUSD: { mu_per_period: 0.0000228, sigma_per_period: 0.01281 }
+  ADAUSD:  { mu_per_period: 0.0000228, sigma_per_period: 0.00961 }
+  AVAXUSD: { mu_per_period: 0.0000514, sigma_per_period: 0.01067 }
+  LINKUSD: { mu_per_period: 0.0000457, sigma_per_period: 0.00961 }
+  MATICUSD: { mu_per_period: 0.0000342, sigma_per_period: 0.01067 }

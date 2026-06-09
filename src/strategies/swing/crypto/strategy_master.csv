@@ -1,1 +1,2 @@
 strategy_name,tf,min_vol,trading_regime_1,trading_regime_2,trading_type
+ema_9_15,1h,5000000,bull,neutral,swing

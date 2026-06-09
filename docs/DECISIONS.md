@@ -325,3 +325,36 @@ Consequences:
   soak window, not the original schedule.
 - Backfill is a one-shot at migration time; no parallel-path support
   code lives in the codebase.
+
+---
+
+## 018 — Kelly insufficiency check uses required margin, not notional
+Date: 2026-06-10
+Status: Accepted
+Clarifies: 015
+
+Decision: The Kelly-vs-balance check in `shared.allocator.sizer` compares
+**required margin** (not leveraged notional) against
+`bucket.available_balance_inr`:
+
+    required_margin = capital × kelly_used × regime_multiplier
+    notional        = required_margin × leverage_max
+    if required_margin > available → SKIPPED_INSUFFICIENT
+
+Rationale: Decision 015's wording said "notional > available → skip",
+but at typical Kelly weights (Kelly fraction × per-symbol cap ≈ 0.1-0.3)
+combined with leverage ≥ 5x this would cancel every leveraged trade —
+margin would be tiny while notional > capital is the *normal* case for
+leveraged perps. The PPTX rule "less balance than Kelly suggests → do
+not enter" reads more naturally as a margin check, since that is the
+actual cash at risk per Kelly's edge calculation.
+
+Consequences:
+- `SizingSnapshot.suggested_notional_inr` continues to record the full
+  leveraged notional (what the broker sees).
+- `available_balance_inr` is now compared to margin, not notional.
+- Backtester reproducibility: the same check (margin > available)
+  must be used in the separate backtester repo.
+- This is a behaviour change vs the previously-committed sizer; old
+  testnet runs would have skipped most leveraged candidates. Phase 1
+  exit criterion still requires 14 clean testnet days post-change.

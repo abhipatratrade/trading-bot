@@ -1,16 +1,22 @@
 """
 Position-size allocator.
 
-Per PPTX slide 4(d) + Decision 015, sizing is:
+Per PPTX slide 4(d) + Decision 015 (clarification 018), sizing is:
 
-    suggested_notional_inr = bucket.capital_inr
-                              * kelly_fraction(μ, σ)
-                              * fractional_kelly
-                              * regime_multiplier
-                              * leverage
+    required_margin_inr   = bucket.capital_inr
+                            * kelly_fraction(μ, σ)
+                            * fractional_kelly
+                            * regime_multiplier
+    suggested_notional_inr = required_margin_inr * leverage
 
-If ``suggested_notional_inr > bucket.available_balance_inr``, skip the
-trade entirely (do not partially-fill). The insufficient-balance rule is
+The PPTX rule "if we have less balance than Kelly suggests, do not
+enter" is interpreted as **margin** vs available — the natural
+risk-based reading for leveraged perps. Without this clarification the
+check ``notional > available`` would cancel any leverage above 1.0x at
+typical Kelly weights, which is not what the user intended.
+
+If ``required_margin_inr > bucket.available_balance_inr``, skip the
+trade entirely (do not partially-fill). The insufficient-margin rule is
 intentional: Kelly tells you the right size; under-deploying ruins the
 edge profile, so we'd rather sit out and wait for capital to free up.
 
@@ -192,7 +198,10 @@ def size_positions(
             continue
 
         weight = capped.get(sym, Decimal("0"))
-        suggested_notional = capital * weight * leverage
+        # required_margin uses raw weight × capital (no leverage).
+        # suggested_notional is the leveraged-up exposure that actually hits the book.
+        required_margin = capital * weight
+        suggested_notional = required_margin * leverage
 
         if weight <= 0:
             results[sym] = SizingResult(
@@ -205,14 +214,16 @@ def size_positions(
             )
             continue
 
-        if suggested_notional > available_inr:
+        if required_margin > available_inr:
             results[sym] = SizingResult(
                 symbol=sym,
                 decision=SizingDecision.SKIPPED_INSUFFICIENT,
                 suggested_notional_inr=suggested_notional,
                 mu=stats.mu_per_period,
                 sigma=stats.sigma_per_period,
-                reason=f"suggested {suggested_notional} > available {available_inr}",
+                reason=(
+                    f"required margin {required_margin} > available {available_inr}"
+                ),
             )
             continue
 
