@@ -1,0 +1,8 @@
+﻿# Stub. Populate before enabling in buckets.yaml.
+universe_size: 5
+filters:
+  - name: min_24h_volume_usd
+    params: { threshold: 500000 }
+ranker:
+  name: volume_24h_desc
+  params: {}

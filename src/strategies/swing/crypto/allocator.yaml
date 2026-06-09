@@ -1,0 +1,12 @@
+# Phase 2 stub. Populate from backtester output before enabling.
+fractional_kelly: 0.25
+per_symbol_cap: 0.20
+aggregate_cap: 1.00
+regime_multipliers:
+  bear: 0.00
+  neutral: 0.40
+  bull: 1.00
+default_for_unknown:
+  mu_per_period: 0.0000
+  sigma_per_period: 0.0100
+stats: {}

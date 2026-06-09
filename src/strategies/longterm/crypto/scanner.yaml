@@ -1,0 +1,14 @@
+# Universe selection for longterm-crypto.
+# Phase 1: top 5 perps on Delta India by 24h notional volume,
+# constrained to symbols also listed on Binance (signal feed).
+
+universe_size: 5
+
+filters:
+  - name: min_24h_volume_usd
+    params:
+      threshold: 1000000        # 1M USD, matches legacy crypto_longterm
+
+ranker:
+  name: volume_24h_desc
+  params: {}

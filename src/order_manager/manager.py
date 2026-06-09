@@ -102,6 +102,8 @@ class OrderManager:
         time_in_force: TimeInForce = TimeInForce.GTC,
         reduce_only: bool = False,
         intent_id: str = "",
+        bucket_id: str | None = None,
+        strategy_name: str | None = None,
     ) -> PlacementResult:
         now = self._clock.now()
         client_oid = make_client_order_id(
@@ -140,6 +142,8 @@ class OrderManager:
         # 3. Persist PENDING trade
         trade = Trade(
             strategy_id=strategy_id,
+            bucket_id=bucket_id,
+            strategy_name=strategy_name,
             broker=self._broker_name,
             symbol=symbol,
             side=OrderSide(side),

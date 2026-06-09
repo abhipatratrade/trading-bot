@@ -1,0 +1,14 @@
+# Brain config for longterm-crypto.
+# 3-state HMM on BTCUSDT daily bars (Decisions 014, 015).
+#
+# enabled=false during the initial soak: the bot runs equal-weight Kelly
+# without a regime multiplier, matching the pre-restructure behaviour.
+# Flip to true once a model has been trained (see
+# src.shared.regime.retrain_job).
+
+enabled: false
+proxy_symbol: BTCUSDT
+tf: 1d
+training_window_days: 1100        # ~3 years of daily bars
+inference_lookback_bars: 200      # bars used at predict time
+retrain_cadence: weekly           # Mon 02:00 UTC via run_scheduler

@@ -1,0 +1,45 @@
+# Top-level bucket registry.
+#
+# Decision 013 — each (trading_type × market) pair gets a fixed INR capital
+# pool. Six buckets total; Indian buckets are disabled until Decision 012's
+# Dhan adapter lands in Phase 3.
+#
+# The bucket_state Postgres table is seeded with these values by migration
+# 0002 and updated live by the reconciler.
+
+buckets:
+  longterm-crypto:
+    capital_inr: 50000
+    broker: delta_india
+    leverage_max: 5
+    enabled: true
+
+  swing-crypto:
+    capital_inr: 50000
+    broker: delta_india
+    leverage_max: 10
+    enabled: false   # Phase 2
+
+  scalp-crypto:
+    capital_inr: 50000
+    broker: delta_india
+    leverage_max: 25
+    enabled: false   # Phase 5
+
+  gambling-crypto:
+    capital_inr: 50000
+    broker: delta_india
+    leverage_max: 100
+    enabled: false   # Phase 6
+
+  longterm-indian:
+    capital_inr: 50000
+    broker: dhan
+    leverage_max: 1
+    enabled: false   # Phase 3 — needs Dhan adapter
+
+  swing-indian:
+    capital_inr: 50000
+    broker: dhan
+    leverage_max: 4
+    enabled: false   # Phase 4

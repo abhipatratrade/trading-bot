@@ -1,0 +1,8 @@
+# Phase 2 stub — enabled in buckets.yaml when ready.
+universe_size: 10
+filters:
+  - name: min_24h_volume_usd
+    params: { threshold: 5000000 }
+ranker:
+  name: volume_24h_desc
+  params: {}

@@ -15,7 +15,11 @@ Tables:
     strategy_param_change — every load of a strategy's policy.yaml
     daily_universe        — selected symbols per day per strategy
     scanner_snapshot      — full scanner evaluation row per symbol per day
-    symbol_mapping        — Delta India ↔ Binance ↔ Kite symbol crosswalk
+    symbol_mapping        — Delta India ↔ Binance ↔ Dhan symbol crosswalk
+    regime_model          — persisted HMM artifact per bucket
+    regime_snapshot       — per-bucket regime predictions over time
+    sizing_snapshot       — every allocator decision (placed or skipped)
+    bucket_state          — per-bucket capital & available balance
 """
 
 from __future__ import annotations
@@ -50,7 +54,8 @@ from src.core.db import Base
 # ---------------------------------------------------------------------------
 class BrokerName(StrEnum):
     DELTA_INDIA = "delta_india"
-    ZERODHA = "zerodha"
+    ZERODHA = "zerodha"   # legacy; Indian stocks now use DHAN (Decision 012)
+    DHAN = "dhan"
 
 
 class OrderSide(StrEnum):
@@ -90,6 +95,9 @@ class AuditEventType(StrEnum):
     SCANNER_RUN = "scanner_run"
     UNIVERSE_CHANGE = "universe_change"
     REGIME_CHANGE = "regime_change"
+    REGIME_MODEL_RETRAINED = "regime_model_retrained"
+    SIZING_DECISION = "sizing_decision"
+    STRATEGY_GATE_BLOCKED = "strategy_gate_blocked"
     ORDER_PLACED = "order_placed"
     ORDER_CANCELED = "order_canceled"
     ORDER_FILLED = "order_filled"
@@ -100,6 +108,26 @@ class AuditEventType(StrEnum):
     BREAKER_TRIPPED = "breaker_tripped"
     KILL_SWITCH_FLIPPED = "kill_switch_flipped"
     DRIFT_ALERT = "drift_alert"
+
+
+class MarketRegime(StrEnum):
+    """Three-state HMM regime label (Decision 014)."""
+
+    BEAR = "bear"
+    NEUTRAL = "neutral"
+    BULL = "bull"
+
+
+class SizingDecision(StrEnum):
+    """Outcome of an allocator call. One row per (strategy, symbol) attempt."""
+
+    PLACED = "placed"
+    SKIPPED_INSUFFICIENT = "skipped_insufficient"  # Kelly notional > available balance
+    SKIPPED_DEDUP = "skipped_dedup"                # (strategy, tf, symbol) already open
+    SKIPPED_NEGATIVE_EDGE = "skipped_negative_edge"  # μ ≤ 0 → Kelly = 0
+    SKIPPED_REGIME_GATE = "skipped_regime_gate"    # current regime ∉ strategy's allowed slots
+    SKIPPED_SCANNER = "skipped_scanner"            # symbol fell out of universe filter
+    SKIPPED_OTHER = "skipped_other"
 
 
 # Common decimal type — 28 digits total, 12 after the point.
@@ -191,11 +219,16 @@ class Trade(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("client_order_id", name="uq_trade_client_order_id"),
         Index("ix_trade_strategy_symbol", "strategy_id", "symbol"),
+        Index("ix_trade_bucket_symbol", "bucket_id", "symbol"),
         Index("ix_trade_status", "status"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     strategy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # New bucket fields (Decision 013): bucket_id is the (type × market) id,
+    # strategy_name is the file-name of the strategy that placed this trade.
+    bucket_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     broker: Mapped[BrokerName] = mapped_column(
         SAEnum(BrokerName, name="broker_name"), nullable=False
     )
@@ -234,10 +267,17 @@ class Position(Base, TimestampMixin):
         UniqueConstraint(
             "strategy_id", "broker", "symbol", name="uq_position_key"
         ),
+        Index("ix_position_bucket_symbol", "bucket_id", "symbol"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     strategy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # New bucket fields (Decision 013). The dedup gate uses
+    # (bucket_id, strategy_name, tf, symbol) to decide whether to skip a new
+    # entry. tf is read from the strategy_master CSV at runtime; we don't
+    # persist it on Position to avoid duplication.
+    bucket_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     broker: Mapped[BrokerName] = mapped_column(
         SAEnum(BrokerName, name="broker_name"), nullable=False
     )
@@ -363,6 +403,136 @@ class SymbolMapping(Base, TimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+# ---------------------------------------------------------------------------
+# Regime (Brain) — Decision 014
+# ---------------------------------------------------------------------------
+class RegimeModel(Base, TimestampMixin):
+    """Persisted HMM artifact per (type × market) bucket.
+
+    The model_blob JSONB column stores the serialised HMM params produced by
+    ``RegimeModel.to_dict()`` — start probabilities, transition matrix,
+    means, covariances, label mapping. Avoids pickle and a binary store.
+    """
+
+    __tablename__ = "regime_model"
+    __table_args__ = (
+        UniqueConstraint("bucket_id", "version", name="uq_regime_model_key"),
+        Index("ix_regime_model_bucket_trained", "bucket_id", "trained_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    trained_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    n_states: Mapped[int] = mapped_column(Integer, nullable=False)
+    feature_columns: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    model_blob: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class RegimeSnapshot(Base):
+    """Per-bucket regime prediction over time. One row per inference."""
+
+    __tablename__ = "regime_snapshot"
+    __table_args__ = (
+        Index("ix_regime_snapshot_bucket_ts", "bucket_id", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    regime: Mapped[MarketRegime] = mapped_column(
+        SAEnum(MarketRegime, name="market_regime"), nullable=False
+    )
+    state_probabilities: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Sizing (Allocator) — Decision 015
+# ---------------------------------------------------------------------------
+class SizingSnapshot(Base):
+    """One audit row per allocator call (placed or skipped).
+
+    Captures the *full* sizing decision: Kelly inputs, bucket capital,
+    regime multiplier, available balance, outcome. This is the forensic
+    record for "why didn't strategy X take a trade today?".
+    """
+
+    __tablename__ = "sizing_snapshot"
+    __table_args__ = (
+        Index(
+            "ix_sizing_snapshot_bucket_strategy_ts",
+            "bucket_id",
+            "strategy_name",
+            "ts",
+        ),
+        Index("ix_sizing_snapshot_decision", "decision"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    regime: Mapped[MarketRegime | None] = mapped_column(
+        SAEnum(MarketRegime, name="market_regime"), nullable=True
+    )
+    regime_multiplier: Mapped[Decimal | None] = mapped_column(
+        Numeric(8, 4), nullable=True
+    )
+    fractional_kelly: Mapped[Decimal | None] = mapped_column(
+        Numeric(8, 4), nullable=True
+    )
+    kelly_inputs: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    suggested_notional_inr: Mapped[Decimal | None] = mapped_column(
+        Money, nullable=True
+    )
+    available_balance_inr: Mapped[Decimal | None] = mapped_column(
+        Money, nullable=True
+    )
+    contracts: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    mark_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    decision: Mapped[SizingDecision] = mapped_column(
+        SAEnum(SizingDecision, name="sizing_decision"), nullable=False
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Per-bucket capital — Decision 013
+# ---------------------------------------------------------------------------
+class BucketState(Base, TimestampMixin):
+    """Current capital + available balance per bucket.
+
+    capital_inr is the fixed bucket allocation (₹50k by default).
+    locked_margin_inr is what's currently tied up in open positions for this
+    bucket. available_balance_inr = capital_inr - locked_margin_inr.
+    Updated by the reconciler.
+    """
+
+    __tablename__ = "bucket_state"
+    __table_args__ = (
+        UniqueConstraint("bucket_id", name="uq_bucket_state_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    capital_inr: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    available_balance_inr: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    locked_margin_inr: Mapped[Decimal] = mapped_column(
+        Money, nullable=False, default=Decimal("0")
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
 # Re-export for convenience: ``from src.core.models import *`` grabs everything.
 __all__ = [
     "BrokerName",
@@ -371,6 +541,8 @@ __all__ = [
     "OrderStatus",
     "KillSwitchScope",
     "AuditEventType",
+    "MarketRegime",
+    "SizingDecision",
     "KillSwitch",
     "AuditLog",
     "Trade",
@@ -379,4 +551,8 @@ __all__ = [
     "DailyUniverse",
     "ScannerSnapshot",
     "SymbolMapping",
+    "RegimeModel",
+    "RegimeSnapshot",
+    "SizingSnapshot",
+    "BucketState",
 ]

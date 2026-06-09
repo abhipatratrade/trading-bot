@@ -1,0 +1,27 @@
+# Position-size config for longterm-crypto.
+# Per-symbol (mu, sigma) come from the backtester output and should always
+# carry a backtest_ref when updated (Decision 006).
+#
+# v1 starting values are conservative placeholders — pencil-and-paper
+# estimates from long-run BTC/ETH daily log returns. Replace with real
+# backtester output before going live (Phase 1 exit criterion).
+
+fractional_kelly: 0.25
+per_symbol_cap: 0.30
+aggregate_cap: 1.00
+
+regime_multipliers:
+  bear: 0.00
+  neutral: 0.50
+  bull: 1.00
+
+default_for_unknown:
+  mu_per_period: 0.0000
+  sigma_per_period: 0.0400
+
+stats:
+  BTCUSD:  { mu_per_period: 0.0008, sigma_per_period: 0.0250 }
+  ETHUSD:  { mu_per_period: 0.0012, sigma_per_period: 0.0320 }
+  SOLUSD:  { mu_per_period: 0.0015, sigma_per_period: 0.0450 }
+  XRPUSD:  { mu_per_period: 0.0006, sigma_per_period: 0.0380 }
+  BNBUSD:  { mu_per_period: 0.0010, sigma_per_period: 0.0300 }

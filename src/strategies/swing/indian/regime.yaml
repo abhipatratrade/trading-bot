@@ -1,0 +1,7 @@
+﻿# Stub.
+enabled: false
+proxy_symbol: BTCUSDT
+tf: 1h
+training_window_days: 90
+inference_lookback_bars: 200
+retrain_cadence: manual

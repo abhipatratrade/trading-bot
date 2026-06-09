@@ -1,12 +1,13 @@
 """
-Bot worker entrypoint — boots strategies, runs the main loop.
+Bot worker entrypoint — boots BucketRunner per (type × market) bucket.
 
 Lifecycle:
-  1. Load config, validate policy.yaml files.
-  2. Init broker + data source clients.
+  1. Load settings + buckets.yaml.
+  2. Init broker + data source clients (per bucket's broker).
   3. Run reconciler once at startup.
-  4. Enter main loop: tick each strategy, sleep, repeat.
-  5. On shutdown: close connections gracefully.
+  4. Refresh symbol mappings.
+  5. Enter main loop: tick every enabled bucket, sleep, repeat.
+  6. On shutdown: close connections gracefully.
 
 Usage:
     python -m src.entrypoints.run_bot
@@ -17,6 +18,7 @@ from __future__ import annotations
 import signal
 import time
 
+from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
 from src.core.alerts import send_alert
 from src.core.clock import RealClock
@@ -26,11 +28,16 @@ from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
-from src.data_sources.symbol_loader import DEFAULT_CSV, fetch_mappings, load_csv, load_to_db
+from src.data_sources.symbol_loader import (
+    DEFAULT_CSV,
+    fetch_mappings,
+    load_csv,
+    load_to_db,
+)
 from src.order_manager.manager import OrderManager
 from src.order_manager.reconciler import Reconciler
-from src.strategies.crypto_longterm.params import load_and_audit
-from src.strategies.crypto_longterm.runner import CryptoLongtermRunner
+from src.shared.bucket import Market, load_buckets
+from src.shared.bucket_runner import BucketRunner
 
 TICK_INTERVAL_SECONDS = 60
 
@@ -51,32 +58,36 @@ def main() -> None:
     settings = get_settings()
     clock = RealClock()
 
-    _log.info(
-        "bot_starting",
-        trading_mode=settings.trading_mode.value,
-    )
+    _log.info("bot_starting", trading_mode=settings.trading_mode.value)
 
-    # Log outbound IP on every startup — needed to update Delta IP whitelist after redeploys
+    # Log outbound IP for Delta whitelist.
     try:
         import httpx as _httpx
+
         _ip = _httpx.get("https://api.ipify.org", timeout=5).text.strip()
-        _log.info("RAILWAY_OUTBOUND_IP", ip=_ip)
+        _log.info("OUTBOUND_IP", ip=_ip)
     except Exception:
         _log.warning("outbound_ip_check_failed")
 
-    # -- Init clients --
-    broker = DeltaIndiaClient(settings)
-    data_source = DeltaIndiaData(settings)
-    order_manager = OrderManager(broker, BrokerName.DELTA_INDIA, clock)
-    reconciler = Reconciler(broker, BrokerName.DELTA_INDIA)
+    # ── Clients ─────────────────────────────────────────────────────────
+    delta_client = DeltaIndiaClient(settings)
+    delta_data = DeltaIndiaData(settings)
 
-    # -- Refresh symbol mappings --
-    # Binance Futures API is geo-blocked in some Railway regions (HTTP 451).
-    # Fall back to the committed CSV so the scanner always has data.
+    brokers: dict[BrokerName, Broker] = {BrokerName.DELTA_INDIA: delta_client}
+    order_managers: dict[BrokerName, OrderManager] = {
+        BrokerName.DELTA_INDIA: OrderManager(
+            delta_client, BrokerName.DELTA_INDIA, clock
+        ),
+    }
+    # Dhan adapter lands in Phase 3 — Indian buckets stay disabled until then.
+
+    reconciler = Reconciler(delta_client, BrokerName.DELTA_INDIA)
+
+    # ── Symbol mappings ─────────────────────────────────────────────────
     _log.info("refreshing_symbol_mappings")
     try:
         binance_data = BinanceData(settings)
-        mappings = fetch_mappings(binance_data, data_source)
+        mappings = fetch_mappings(binance_data, delta_data)
         count = load_to_db(mappings)
         _log.info("symbol_mappings_refreshed", count=count)
         binance_data.close()
@@ -86,25 +97,59 @@ def main() -> None:
             try:
                 rows = load_csv(DEFAULT_CSV)
                 count = load_to_db(rows)
-                _log.info("symbol_mappings_loaded_from_csv", count=count, path=str(DEFAULT_CSV))
+                _log.info(
+                    "symbol_mappings_loaded_from_csv",
+                    count=count,
+                    path=str(DEFAULT_CSV),
+                )
             except Exception:
                 _log.error("symbol_mapping_csv_load_failed", exc_info=True)
         else:
             _log.error("symbol_mapping_csv_not_found", path=str(DEFAULT_CSV))
 
-    # -- Load strategy config --
-    policy = load_and_audit()
+    # ── Buckets ─────────────────────────────────────────────────────────
+    all_buckets = load_buckets()
+    runners: list[BucketRunner] = []
+    for bucket in all_buckets:
+        if not bucket.config.enabled:
+            _log.info("bucket_skipped_disabled", bucket_id=bucket.id)
+            continue
+        # For now, only crypto buckets have a data source (Delta India).
+        # Indian buckets will need a Dhan data source in Phase 3.
+        if bucket.market != Market.CRYPTO:
+            _log.warning(
+                "bucket_skipped_no_data_source",
+                bucket_id=bucket.id,
+                market=bucket.market.value,
+            )
+            continue
+        try:
+            runner = BucketRunner(
+                bucket=bucket,
+                brokers=brokers,
+                data=delta_data,
+                order_managers=order_managers,
+                clock=clock,
+            )
+        except Exception:
+            _log.error(
+                "bucket_init_failed", bucket_id=bucket.id, exc_info=True
+            )
+            send_alert(f"[bot] bucket {bucket.id} failed to init — see logs")
+            continue
+        runners.append(runner)
+        _log.info(
+            "bucket_initialised",
+            bucket_id=bucket.id,
+            strategies=list(runner.strategies.keys()),
+        )
 
-    # -- Build strategy runners --
-    crypto_lt = CryptoLongtermRunner(
-        policy=policy,
-        broker=broker,
-        data_source=data_source,
-        order_manager=order_manager,
-        clock=clock,
-    )
+    if not runners:
+        _log.error("no_enabled_buckets")
+        send_alert("[bot] No enabled buckets — nothing to do")
+        return
 
-    # -- Startup reconciliation --
+    # ── Startup reconcile ───────────────────────────────────────────────
     _log.info("startup_reconcile")
     try:
         report = reconciler.run()
@@ -118,7 +163,8 @@ def main() -> None:
     except Exception:
         _log.error("startup_reconcile_failed", exc_info=True)
 
-    # -- Audit bot startup --
+    # ── Audit + alert startup ───────────────────────────────────────────
+    bucket_ids = [r.bucket.id for r in runners]
     with session_scope() as session:
         session.add(
             AuditLog(
@@ -126,33 +172,42 @@ def main() -> None:
                 message=f"Bot started (mode={settings.trading_mode.value})",
                 payload={
                     "trading_mode": settings.trading_mode.value,
-                    "strategies": [policy.strategy_id],
+                    "buckets": bucket_ids,
                 },
             )
         )
-
     send_alert(
         f"Bot started (mode={settings.trading_mode.value})\n"
-        f"Strategies: [{policy.strategy_id}]"
+        f"Buckets: {bucket_ids}"
     )
 
-    # -- Signal handlers --
+    # ── Signal handlers ─────────────────────────────────────────────────
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # -- Main loop --
-    _log.info("main_loop_starting", tick_interval=TICK_INTERVAL_SECONDS)
-
+    # ── Main loop ───────────────────────────────────────────────────────
+    _log.info(
+        "main_loop_starting",
+        tick_interval=TICK_INTERVAL_SECONDS,
+        buckets=bucket_ids,
+    )
     while not _shutdown:
-        try:
-            crypto_lt.tick()
-        except KeyboardInterrupt:
+        for runner in runners:
+            try:
+                runner.run_once()
+            except KeyboardInterrupt:
+                _shutdown = True
+                break
+            except Exception:
+                _log.error(
+                    "bucket_tick_error",
+                    bucket_id=runner.bucket.id,
+                    exc_info=True,
+                )
+                send_alert(f"[bot] tick error in {runner.bucket.id}")
+        if _shutdown:
             break
-        except Exception:
-            _log.error("tick_error", exc_info=True)
-            send_alert(f"[bot] Tick error — check logs")
 
-        # Periodic reconciliation (every 5 min = 5 ticks at 60s)
         global _tick_count
         _tick_count += 1
         if _tick_count % 5 == 0:
@@ -161,13 +216,12 @@ def main() -> None:
             except Exception:
                 _log.error("periodic_reconcile_failed", exc_info=True)
 
-        # Sleep in small increments so shutdown signal is responsive
         for _ in range(TICK_INTERVAL_SECONDS):
             if _shutdown:
                 break
             time.sleep(1)
 
-    # -- Shutdown --
+    # ── Shutdown ────────────────────────────────────────────────────────
     _log.info("bot_shutting_down")
     with session_scope() as session:
         session.add(
@@ -176,12 +230,11 @@ def main() -> None:
                 message="Bot shutting down (signal received)",
             )
         )
-
     send_alert("Bot shutting down")
-    broker.close()
-    data_source.close()
+    delta_client.close()
+    delta_data.close()
     _log.info("bot_stopped")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
