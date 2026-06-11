@@ -15,14 +15,36 @@ runner only need ``fit``, ``predict_latest``, and ``to_dict`` /
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
-from hmmlearn.hmm import GaussianHMM
 
 from src.core.models import MarketRegime
 from src.shared.regime.regimes import label_states_by_mean_return
+
+# hmmlearn is heavy (scipy + native build) and is only needed when actually
+# fitting / loading a model. Importing it lazily lets modules that *transit*
+# through this file (e.g. the scheduler service registering retrain jobs,
+# the dashboard rendering bucket pages) start up cleanly on environments
+# where hmmlearn isn't installed — they only break if they actually try
+# to run regime code. See Railway scheduler crash 2026-06-12.
+if TYPE_CHECKING:
+    from hmmlearn.hmm import GaussianHMM
+
+
+def _import_gaussian_hmm() -> type["GaussianHMM"]:
+    """Import hmmlearn on first use. Raises ImportError with a clear message
+    if the dependency is missing in this environment."""
+    try:
+        from hmmlearn.hmm import GaussianHMM as _GaussianHMM
+    except ImportError as e:  # pragma: no cover  — environmental
+        raise ImportError(
+            "hmmlearn is not installed. Run `pip install hmmlearn scipy` "
+            "(needed only by the regime-retrain job, not the dashboard / "
+            "scheduler boot path)."
+        ) from e
+    return _GaussianHMM
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +64,7 @@ class RegimeModel:
 
     def __init__(self, feature_columns: list[str]) -> None:
         self.feature_columns = list(feature_columns)
-        self._hmm: GaussianHMM | None = None
+        self._hmm: "GaussianHMM | None" = None
         self._labels: list[MarketRegime] | None = None
 
     # ------------------------------------------------------------------ fit
@@ -50,6 +72,7 @@ class RegimeModel:
         """Fit the HMM on a feature DataFrame and resolve state→label map."""
         self._validate_columns(features)
         X = features[self.feature_columns].to_numpy(dtype=float)
+        GaussianHMM = _import_gaussian_hmm()
         hmm = GaussianHMM(
             n_components=self.n_states,
             covariance_type=self.covariance_type,
@@ -111,6 +134,7 @@ class RegimeModel:
         feature_columns = list(blob["feature_columns"])
         m = cls(feature_columns)
         n_states = int(blob["n_states"])
+        GaussianHMM = _import_gaussian_hmm()
         hmm = GaussianHMM(
             n_components=n_states,
             covariance_type=blob.get("covariance_type", cls.covariance_type),
