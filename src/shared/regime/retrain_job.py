@@ -31,7 +31,7 @@ from src.core.clock import RealClock
 from src.core.db import session_scope
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog
-from src.data_sources.binance import BinancePublicData
+from src.data_sources.binance import BinanceData
 from src.shared.bucket import Market, load_bucket
 from src.shared.regime.brain import load_regime_config
 from src.shared.regime.features import compute_features
@@ -52,7 +52,7 @@ def retrain_bucket(bucket_id: str) -> str:
             "Indian-market HMM lands in Phase 3 (Dhan data adapter)."
         )
 
-    data = BinancePublicData()
+    data = BinanceData()
     try:
         # Pull enough bars to cover the requested window.
         # Binance caps at 1500 klines per request — for daily/hourly TFs that
