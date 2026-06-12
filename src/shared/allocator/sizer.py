@@ -37,6 +37,8 @@ import yaml
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from datetime import UTC, datetime, timedelta
+
 from src.core.db import session_scope
 from src.core.logging import get_logger
 from src.core.models import (
@@ -44,10 +46,12 @@ from src.core.models import (
     AuditLog,
     BucketState,
     MarketRegime,
+    OrderStatus,
     Position,
     PositionSide,
     SizingDecision,
     SizingSnapshot,
+    Trade,
 )
 from src.shared.allocator.caps import apply_aggregate_cap, apply_per_symbol_cap
 from src.shared.allocator.kelly import fractional_kelly as scale_kelly
@@ -55,6 +59,12 @@ from src.shared.allocator.kelly import kelly_fraction
 from src.shared.bucket import Bucket
 
 _log = get_logger("shared.allocator.sizer")
+
+# Window over which an already-placed-and-not-rejected Trade for
+# (bucket, strategy, symbol) blocks new orders. 23 hours matches the
+# longterm-crypto daily rebalance cadence (one trade per day per symbol).
+# A future enhancement will scale this off the strategy's TF.
+_DEDUP_TRADE_WINDOW_HOURS: int = 23
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +203,35 @@ def size_positions(
                 Position.quantity > 0,
             )
         ).all()
-        held = {r[0] for r in held_rows}
+        held_positions = {r[0] for r in held_rows}
+
+        # Also dedup against any active Trade in the last DEDUP_TRADE_WINDOW
+        # hours. Position rows are only created by the reconciler (every 5
+        # min in run_bot.py). Between order placement and the next reconcile
+        # sweep, the dedup gate would otherwise miss positions we just
+        # opened, causing the bot to fire a duplicate order every tick.
+        # See journal logs 2026-06-12T17:25-17:26 for the bug this fixes.
+        cutoff = datetime.now(tz=UTC) - timedelta(
+            hours=_DEDUP_TRADE_WINDOW_HOURS
+        )
+        active_trade_rows = session.execute(
+            select(Trade.symbol).where(
+                Trade.bucket_id == bucket.id,
+                Trade.strategy_name == strategy_name,
+                Trade.status.in_(
+                    [
+                        OrderStatus.PENDING,
+                        OrderStatus.OPEN,
+                        OrderStatus.PARTIAL,
+                        OrderStatus.FILLED,
+                    ]
+                ),
+                Trade.created_at > cutoff,
+            ).distinct()
+        ).all()
+        recent_open_symbols = {r[0] for r in active_trade_rows}
+
+        held = held_positions | recent_open_symbols
 
     regime_mult = (
         config.regime_multipliers.get(regime, Decimal("0"))
