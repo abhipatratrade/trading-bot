@@ -121,31 +121,80 @@ class Reconciler:
                     )
                     self._log.warning("position_closed_on_exchange", **diff)
 
-            # Case 2: Exchange has position, DB doesn't → orphan
+            # Case 2: Exchange has position, DB doesn't → IMPORT IT.
+            # Without this, the bot's dedup gate in shared.allocator.sizer
+            # never sees the position and keeps placing new orders every
+            # tick. Bucket attribution comes from the most-recent filled
+            # Trade for the symbol; truly external positions stay
+            # unattributed and we just emit a warning.
             for sym, ex_pos in exchange_by_symbol.items():
-                if sym not in db_symbols:
-                    diff = {
-                        "type": "orphan_position",
-                        "symbol": sym,
-                        "exchange_side": ex_pos.side,
-                        "exchange_size": str(ex_pos.size),
-                    }
-                    report.diffs.append(diff)
-                    report.orphan_positions += 1
-                    session.add(
-                        AuditLog(
-                            event_type=AuditEventType.RECONCILE_DIFF,
-                            message=f"Orphan position {sym} found on exchange, not in DB",
-                            payload=diff,
-                        )
+                if sym in db_symbols:
+                    continue
+                latest_trade = self._latest_filled_trade(session, sym)
+                strategy_id = latest_trade.strategy_id if latest_trade else "unknown"
+                bucket_id = latest_trade.bucket_id if latest_trade else None
+                strategy_name = (
+                    latest_trade.strategy_name if latest_trade else None
+                )
+                side = _exchange_side_to_position(ex_pos.side)
+                diff = {
+                    "type": "orphan_position_imported",
+                    "symbol": sym,
+                    "exchange_side": ex_pos.side,
+                    "exchange_size": str(ex_pos.size),
+                    "bucket_id": bucket_id,
+                    "strategy_name": strategy_name,
+                    "strategy_id": strategy_id,
+                    "source_trade_id": latest_trade.id if latest_trade else None,
+                }
+                report.diffs.append(diff)
+                report.orphan_positions += 1
+                session.add(
+                    Position(
+                        strategy_id=strategy_id,
+                        bucket_id=bucket_id,
+                        strategy_name=strategy_name,
+                        broker=self._broker_name,
+                        symbol=sym,
+                        side=side,
+                        quantity=ex_pos.size,
+                        entry_price=ex_pos.entry_price,
+                        leverage=ex_pos.leverage,
+                        liquidation_price=ex_pos.liquidation_price,
+                        opened_at=self._clock.now(),
                     )
-                    self._log.warning("orphan_position", **diff)
+                )
+                session.add(
+                    AuditLog(
+                        strategy_id=strategy_id,
+                        event_type=AuditEventType.RECONCILE_DIFF,
+                        message=f"Orphan position {sym} imported from exchange",
+                        payload=diff,
+                    )
+                )
+                self._log.warning("orphan_position_imported", **diff)
 
-            # Case 3: Both have position → verify size matches
+            # Case 3: Both have position → verify size matches AND backfill
+            # bucket_id / strategy_name if they were never set (rows created
+            # under the legacy schema, or by an old code path).
             for db_pos in db_positions:
                 ex_pos = exchange_by_symbol.get(db_pos.symbol)
                 if ex_pos is None:
                     continue
+
+                if db_pos.bucket_id is None or db_pos.strategy_name is None:
+                    latest_trade = self._latest_filled_trade(
+                        session, db_pos.symbol
+                    )
+                    if latest_trade is not None:
+                        if db_pos.bucket_id is None and latest_trade.bucket_id:
+                            db_pos.bucket_id = latest_trade.bucket_id
+                        if (
+                            db_pos.strategy_name is None
+                            and latest_trade.strategy_name
+                        ):
+                            db_pos.strategy_name = latest_trade.strategy_name
+
                 if abs(db_pos.quantity - ex_pos.size) > Decimal("0.0001"):
                     diff = {
                         "type": "position_size_mismatch",
@@ -168,6 +217,23 @@ class Reconciler:
                         )
                     )
                     self._log.warning("position_size_mismatch", **diff)
+
+    def _latest_filled_trade(self, session, symbol: str) -> "Trade | None":
+        """Most-recent FILLED Trade for this symbol on this broker.
+
+        Used to attribute orphan positions back to the bucket / strategy
+        that originally opened them.
+        """
+        return session.execute(
+            select(Trade)
+            .where(
+                Trade.broker == self._broker_name,
+                Trade.symbol == symbol,
+                Trade.status == OrderStatus.FILLED,
+            )
+            .order_by(Trade.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
 
     # ── Order reconciliation ────────────────────────────────────────
 
@@ -236,3 +302,19 @@ def _map_status(status_str: str) -> OrderStatus:
         "filled": OrderStatus.FILLED,
         "canceled": OrderStatus.CANCELED,
     }.get(status_str, OrderStatus.UNKNOWN)
+
+
+def _exchange_side_to_position(side: str) -> PositionSide:
+    """Map the broker's free-form side string to our enum.
+
+    Delta India and most perp venues report ``"long"`` / ``"short"`` /
+    ``"flat"``; some return ``"buy"`` / ``"sell"`` from the order side.
+    Anything we can't classify becomes FLAT so we don't silently
+    misattribute a position.
+    """
+    s = (side or "").lower()
+    if s in ("long", "buy"):
+        return PositionSide.LONG
+    if s in ("short", "sell"):
+        return PositionSide.SHORT
+    return PositionSide.FLAT
