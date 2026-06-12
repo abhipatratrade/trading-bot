@@ -7,7 +7,11 @@
 # backtester output before going live (Phase 1 exit criterion).
 
 fractional_kelly: 0.25
-per_symbol_cap: 0.30
+# Lowered from 0.30 → 0.10 on 2026-06-12 so per-order notional fits under
+# Delta India testnet's standard per-symbol risk tier at 5x leverage
+# (~$890 → ~$295 notional). Raise back when testnet funds support a
+# higher tier, or when going live with a properly-sized account.
+per_symbol_cap: 0.10
 aggregate_cap: 1.00
 
 regime_multipliers:
