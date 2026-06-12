@@ -34,7 +34,10 @@ from pathlib import Path
 from src.core.models import MarketRegime, SizingDecision
 from src.data_sources.base import FundingRate, MarketData, OHLCVBar, Ticker
 from src.shared.allocator.kelly import fractional_kelly, kelly_fraction
-from src.shared.allocator.sizer import load_allocator_config
+from src.shared.allocator.sizer import (
+    load_allocator_config,
+    notional_inr_to_contracts,
+)
 from src.shared.bucket import load_bucket
 from src.shared.regime.brain import load_regime_config
 from src.shared.scanner.engine import load_scanner_config
@@ -200,10 +203,14 @@ def main() -> int:
     regime_mult = alloc_cfg.regime_multipliers.get(MarketRegime.BULL, Decimal("1"))
     print(f"  regime_multiplier  = {regime_mult} (bull)")
 
+    print(
+        f"  fx_inr_per_usd     = {alloc_cfg.fx_inr_per_usd}"
+    )
+
     print()
     print(
-        f"  {'symbol':<10} {'mu':>10} {'sigma':>10} {'k_full':>10} "
-        f"{'k_used':>10} {'weight':>8} {'margin':>11} {'notional':>13} {'decision'}"
+        f"  {'symbol':<10} {'weight':>7} {'margin':>10} {'notional':>11} "
+        f"{'cs':>6} {'$/contract':>11} {'contracts':>10} {'decision'}"
     )
 
     available = Decimal(bucket.config.capital_inr)
@@ -228,10 +235,27 @@ def main() -> int:
         margin = bucket.config.capital_inr * capped
         notional = margin * bucket.config.leverage_max
 
+        # FX + contract-size-aware contract count.
+        mark_price = universe_prices.get(e.symbol, Decimal("0"))
+        contract_size = alloc_cfg.contract_sizes.get(
+            e.symbol, alloc_cfg.default_contract_size
+        )
+        price_per_contract_inr = (
+            mark_price * contract_size * alloc_cfg.fx_inr_per_usd
+        )
+        contracts = notional_inr_to_contracts(
+            notional_inr=notional,
+            mark_price_usd=mark_price,
+            symbol=e.symbol,
+            config=alloc_cfg,
+        )
+
         if capped <= 0:
             decision = SizingDecision.SKIPPED_NEGATIVE_EDGE
         elif margin > available:
             decision = SizingDecision.SKIPPED_INSUFFICIENT
+        elif contracts < 1:
+            decision = SizingDecision.SKIPPED_OTHER
         else:
             decision = SizingDecision.PLACED
             placed += 1
@@ -240,10 +264,10 @@ def main() -> int:
 
         skipped[decision] = skipped.get(decision, 0) + 1
         print(
-            f"  {e.symbol:<10} {float(stats.mu_per_period):>10.6f} "
-            f"{float(stats.sigma_per_period):>10.6f} {float(k_full):>10.4f} "
-            f"{float(k_used):>10.4f} {float(capped):>8.4f} "
-            f"{float(margin):>11.2f} {float(notional):>13.2f} {decision.value}"
+            f"  {e.symbol:<10} {float(capped):>7.4f} "
+            f"{float(margin):>10.2f} {float(notional):>11.2f} "
+            f"{float(contract_size):>6} {float(price_per_contract_inr):>11.2f} "
+            f"{float(contracts):>10} {decision.value}"
         )
 
     print()

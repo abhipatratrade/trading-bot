@@ -25,3 +25,24 @@ stats:
   SOLUSD:  { mu_per_period: 0.0015, sigma_per_period: 0.0450 }
   XRPUSD:  { mu_per_period: 0.0006, sigma_per_period: 0.0380 }
   BNBUSD:  { mu_per_period: 0.0010, sigma_per_period: 0.0300 }
+
+# USD/INR rate used to convert bucket capital (INR) into broker quote
+# currency (USD on Delta India). Worth refreshing periodically; the
+# sizer reads this at strategy load time.
+fx_inr_per_usd: 84.0
+
+# Delta India perpetual contract sizes (units of base asset per contract).
+# Verify against the Delta India product spec before going live; values
+# below are common-knowledge defaults at the time of writing.
+default_contract_size: 1
+contract_sizes:
+  BTCUSD:  0.001
+  ETHUSD:  0.01
+  SOLUSD:  0.1
+  XRPUSD:  10
+  BNBUSD:  0.01
+  DOGEUSD: 100
+  ADAUSD:  10
+  AVAXUSD: 0.1
+  LINKUSD: 0.1
+  MATICUSD: 10

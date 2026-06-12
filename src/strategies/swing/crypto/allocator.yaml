@@ -37,3 +37,19 @@ stats:
   AVAXUSD: { mu_per_period: 0.0000514, sigma_per_period: 0.01067 }
   LINKUSD: { mu_per_period: 0.0000457, sigma_per_period: 0.00961 }
   MATICUSD: { mu_per_period: 0.0000342, sigma_per_period: 0.01067 }
+
+# See src/strategies/longterm/crypto/allocator.yaml for an explanation
+# of these two blocks. Same Delta India contract-size table.
+fx_inr_per_usd: 84.0
+default_contract_size: 1
+contract_sizes:
+  BTCUSD:  0.001
+  ETHUSD:  0.01
+  SOLUSD:  0.1
+  XRPUSD:  10
+  BNBUSD:  0.01
+  DOGEUSD: 100
+  ADAUSD:  10
+  AVAXUSD: 0.1
+  LINKUSD: 0.1
+  MATICUSD: 10

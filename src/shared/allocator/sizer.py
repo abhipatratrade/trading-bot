@@ -79,11 +79,56 @@ class AllocatorConfig(BaseModel):
     )
     stats: dict[str, KellySymbolStats] = Field(default_factory=dict)
 
+    # FX + contract sizing — required for correct contracts math when the
+    # bucket capital is in one currency (INR) and the broker quotes prices
+    # in another (USD per BTC on Delta India). Each perp also has a
+    # contract size (e.g. BTCUSD = 0.001 BTC per contract).
+    #
+    # contracts = floor(notional_inr / (fx_inr_per_usd × mark_price_usd × contract_size))
+    #
+    # Default fx = 1.0 means "treat capital and mark price in the same
+    # unit", which is the legacy behaviour. Real deployments should set
+    # an honest USD/INR rate (~84 at time of writing).
+    fx_inr_per_usd: Decimal = Field(gt=0, default=Decimal("1"))
+    contract_sizes: dict[str, Decimal] = Field(default_factory=dict)
+    default_contract_size: Decimal = Field(gt=0, default=Decimal("1"))
+
 
 def load_allocator_config(path: Path) -> AllocatorConfig:
     """Load and validate ``allocator.yaml`` for one bucket. Fail-fast."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     return AllocatorConfig.model_validate(raw)
+
+
+def notional_inr_to_contracts(
+    *,
+    notional_inr: Decimal,
+    mark_price_usd: Decimal,
+    symbol: str,
+    config: AllocatorConfig,
+) -> Decimal:
+    """Convert an INR-denominated target notional into a whole-contract count.
+
+    Pure function. The pricing identity used is:
+
+        price_per_contract_inr = mark_price_usd × contract_size × fx_inr_per_usd
+
+    so a single contract on (say) BTCUSD with mark_price=$63,500 and
+    contract_size=0.001 BTC costs ₹5,334 of notional at FX=84. Dividing
+    the bucket-allocated notional by that gives the number of contracts
+    the broker should receive.
+
+    Returns 0 if any input is non-positive (caller decides what to do).
+    """
+    if notional_inr <= 0 or mark_price_usd <= 0:
+        return Decimal("0")
+    contract_size = config.contract_sizes.get(symbol, config.default_contract_size)
+    price_per_contract_inr = mark_price_usd * contract_size * config.fx_inr_per_usd
+    if price_per_contract_inr <= 0:
+        return Decimal("0")
+    return (notional_inr / price_per_contract_inr).quantize(
+        Decimal("1"), rounding=ROUND_DOWN
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +282,14 @@ def size_positions(
             )
             continue
 
-        contracts = (suggested_notional / price).quantize(
-            Decimal("1"), rounding=ROUND_DOWN
+        # FX- and contract-size-aware conversion. The arg name
+        # `mark_prices_inr` is legacy; values are actually the broker's
+        # raw mark price (USD per underlying on Delta India).
+        contracts = notional_inr_to_contracts(
+            notional_inr=suggested_notional,
+            mark_price_usd=price,
+            symbol=sym,
+            config=config,
         )
         if contracts < 1:
             results[sym] = SizingResult(
