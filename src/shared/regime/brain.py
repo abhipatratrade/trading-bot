@@ -116,10 +116,30 @@ def predict_regime(
         return None
     version, model = loaded
 
-    # Pull recent OHLCV for the proxy symbol and convert to DataFrame.
-    raw_bars = data.get_ohlcv(
-        config.proxy_symbol, config.tf, limit=config.inference_lookback_bars
-    )
+    # Pull recent OHLCV for the proxy symbol. We always use Binance for
+    # inference data to match retrain_job's training source — the bot's
+    # ``data`` argument is the broker's market-data adapter (Delta India
+    # for crypto buckets) which lists ``BTCUSD`` not ``BTCUSDT`` and so
+    # silently fails on Binance-format proxy symbols. The legacy ``data``
+    # arg is kept for signature compatibility but not used for OHLCV fetch.
+    from src.data_sources.binance import BinanceData
+
+    binance = BinanceData()
+    try:
+        raw_bars = binance.get_ohlcv(
+            config.proxy_symbol, config.tf, limit=config.inference_lookback_bars
+        )
+    except Exception:
+        _log.warning(
+            "regime_inference_fetch_failed",
+            bucket_id=bucket_id,
+            symbol=config.proxy_symbol,
+            exc_info=True,
+        )
+        raw_bars = None
+    finally:
+        binance.close()
+
     if not raw_bars:
         _log.warning(
             "regime_features_unavailable",
