@@ -116,17 +116,14 @@ def predict_regime(
         return None
     version, model = loaded
 
-    # Pull recent OHLCV for the proxy symbol. We always use Binance for
-    # inference data to match retrain_job's training source — the bot's
-    # ``data`` argument is the broker's market-data adapter (Delta India
-    # for crypto buckets) which lists ``BTCUSD`` not ``BTCUSDT`` and so
-    # silently fails on Binance-format proxy symbols. The legacy ``data``
-    # arg is kept for signature compatibility but not used for OHLCV fetch.
-    from src.data_sources.binance import BinanceData
-
-    binance = BinanceData()
+    # Pull recent OHLCV for the proxy symbol via the caller-injected
+    # market-data adapter. For crypto buckets that's Delta India (which
+    # works from the GCP bot-worker; Binance is HTTP-451 geoblocked
+    # from this VM). The retrain job uses the same adapter, so training
+    # and inference stay symbol-consistent — proxy_symbol must be in the
+    # adapter's format (e.g. ``BTCUSD`` for Delta India).
     try:
-        raw_bars = binance.get_ohlcv(
+        raw_bars = data.get_ohlcv(
             config.proxy_symbol, config.tf, limit=config.inference_lookback_bars
         )
     except Exception:
@@ -137,8 +134,6 @@ def predict_regime(
             exc_info=True,
         )
         raw_bars = None
-    finally:
-        binance.close()
 
     if not raw_bars:
         _log.warning(

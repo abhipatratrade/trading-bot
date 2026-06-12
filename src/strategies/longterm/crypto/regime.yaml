@@ -7,7 +7,7 @@
 # when Brain reports bear.
 
 enabled: true
-proxy_symbol: BTCUSDT
+proxy_symbol: BTCUSD       # Delta India format; brain.py + retrain_job both use Delta
 tf: 1d
 training_window_days: 1100        # ~3 years of daily bars
 inference_lookback_bars: 200      # bars used at predict time
