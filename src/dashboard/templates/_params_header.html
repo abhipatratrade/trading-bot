@@ -1,0 +1,23 @@
+{# Shared header for params_allocation / params_trading / params_scanner. #}
+<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:1.5rem">
+  <div>
+    <h1 style="margin:0">{{ bucket.id }}</h1>
+    <div style="color:#8b949e;font-size:0.85rem">
+      {{ bucket.trading_type|capitalize }} · {{ bucket.market|capitalize }} ·
+      {{ bucket.broker }} · max {{ bucket.leverage_max }}x · capital {{ bucket.capital_inr }}
+      {% if bucket.enabled %}
+        <span class="badge badge-green">live</span>
+      {% else %}
+        <span class="badge badge-yellow">off</span>
+      {% endif %}
+    </div>
+  </div>
+  <a href="/params" class="btn">← All params</a>
+</div>
+
+<div style="display:flex;gap:0.5rem;margin-bottom:1.5rem;font-size:0.85rem">
+  <a href="/params/allocation/{{ bucket.id }}" class="btn">Allocation</a>
+  <a href="/params/trading/{{ bucket.id }}" class="btn">Trading</a>
+  <a href="/params/scanner/{{ bucket.id }}" class="btn">Scanner</a>
+  <a href="/buckets/{{ bucket.id }}" class="btn" style="margin-left:auto">Live status →</a>
+</div>

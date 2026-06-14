@@ -1,20 +1,43 @@
 {% extends "base.html" %}
-{% block title %}Dashboard — Strategy Params{% endblock %}
+{% block title %}Strategy Params — Trading Bot{% endblock %}
 {% block content %}
 <h1>Strategy Parameters</h1>
-<p style="font-size:0.85rem; color:#8b949e; margin-bottom:1rem;">
-    Read-only snapshot of each strategy's <code>policy.yaml</code>.
-    Changes require a git commit with a <code>backtest_ref</code>.
+<p style="font-size:0.85rem;color:#8b949e;margin-bottom:1.5rem">
+  Three views per bucket. Configs are read-only — edit by committing to
+  the relevant YAML or CSV in git and redeploying.
 </p>
 
-{% if strategies %}
-    {% for s in strategies %}
-    <div class="section">
-        <h2>{{ s.name }}</h2>
-        <pre>{{ s.policy | tojson(indent=2) }}</pre>
+<style>
+  .pcard { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .pcard h3 { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; font-size: 1rem; }
+  .pcard .meta { color: #8b949e; font-size: 0.75rem; margin-bottom: 0.8rem; }
+  .pcard .links { display: flex; gap: 0.5rem; }
+  .pcard .links a { flex: 1; text-align: center; padding: 0.5rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; color: var(--text); text-decoration: none; font-size: 0.8rem; }
+  .pcard .links a:hover { border-color: var(--accent); color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+</style>
+
+<div class="grid">
+  {% for c in cards %}
+  <div class="pcard">
+    <h3>
+      {{ c.id }}
+      {% if c.enabled %}
+        <span class="badge badge-green">live</span>
+      {% else %}
+        <span class="badge badge-yellow">off</span>
+      {% endif %}
+    </h3>
+    <div class="meta">
+      {{ c.trading_type|capitalize }} · {{ c.market|capitalize }} ·
+      {{ c.broker }} · max {{ c.leverage_max }}x · capital {{ c.capital_inr }}
     </div>
-    {% endfor %}
-{% else %}
-<p class="empty">No strategy policy files found in src/strategies/*/policy.yaml.</p>
-{% endif %}
+    <div class="links">
+      <a href="/params/allocation/{{ c.id }}">Allocation</a>
+      <a href="/params/trading/{{ c.id }}">Trading</a>
+      <a href="/params/scanner/{{ c.id }}">Scanner</a>
+    </div>
+  </div>
+  {% endfor %}
+</div>
 {% endblock %}

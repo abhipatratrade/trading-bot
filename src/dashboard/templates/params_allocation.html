@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}{{ bucket.id }} — Allocation{% endblock %}
+{% block content %}
+
+{% include "_params_header.html" %}
+
+<h2>Allocation</h2>
+<p style="font-size:0.85rem;color:#8b949e;margin-bottom:1rem">
+  How the sizer turns a candidate symbol into a contract count: Kelly
+  weight × caps × regime multiplier × leverage, then converted to
+  contracts via FX and contract-size tables.
+</p>
+
+{% if error %}
+  <div class="empty">{{ error }}</div>
+{% elif cfg %}
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Kelly &amp; caps</h3>
+  <table>
+    <tr><th>fractional_kelly</th><td>{{ cfg.fractional_kelly }}</td><td style="color:#8b949e">fraction of full Kelly applied; 0.25 = quarter Kelly</td></tr>
+    <tr><th>per_symbol_cap</th><td>{{ cfg.per_symbol_cap }}</td><td style="color:#8b949e">hard ceiling on weight per single symbol</td></tr>
+    <tr><th>aggregate_cap</th><td>{{ cfg.aggregate_cap }}</td><td style="color:#8b949e">hard ceiling on the sum of weights</td></tr>
+  </table>
+</div>
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Regime multipliers</h3>
+  <p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.5rem">
+    Sizer multiplies the Kelly weight by this based on Brain's current label.
+  </p>
+  <table>
+    <tr><th>Regime</th><th>Multiplier</th></tr>
+    {% for k, v in cfg.regime_multipliers.items() %}
+    <tr><td><span class="badge badge-blue">{{ k }}</span></td><td>{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Currency &amp; contract sizes</h3>
+  <table>
+    <tr><th>fx_inr_per_usd</th><td>{{ cfg.fx_inr_per_usd }}</td><td style="color:#8b949e">converts bucket capital (INR) → broker quote currency (USD on Delta India)</td></tr>
+    <tr><th>default_contract_size</th><td>{{ cfg.default_contract_size }}</td><td style="color:#8b949e">used when a symbol isn't in the table</td></tr>
+  </table>
+  {% if cfg.contract_sizes %}
+  <table style="margin-top:0.5rem">
+    <thead><tr><th>Symbol</th><th>Base asset / contract</th></tr></thead>
+    <tbody>
+      {% for sym, sz in cfg.contract_sizes.items() %}
+      <tr><td><strong>{{ sym }}</strong></td><td>{{ sz }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Per-symbol Kelly stats</h3>
+  <p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.5rem">
+    Source these from the backtester. Sizer plugs them into <code>f* = μ/σ²</code>.
+  </p>
+  {% if cfg.stats %}
+  <table>
+    <thead><tr><th>Symbol</th><th>μ (per period)</th><th>σ (per period)</th></tr></thead>
+    <tbody>
+      {% for sym, s in cfg.stats.items() %}
+      <tr><td><strong>{{ sym }}</strong></td><td>{{ s.mu_per_period }}</td><td>{{ s.sigma_per_period }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty" style="padding:0.5rem">no stats; sizer uses default_for_unknown</div>
+  {% endif %}
+
+  {% if cfg.default_for_unknown %}
+  <div style="margin-top:0.75rem;font-size:0.8rem;color:#8b949e">
+    Default for unknown symbol: μ = {{ cfg.default_for_unknown.mu_per_period }},
+    σ = {{ cfg.default_for_unknown.sigma_per_period }}
+  </div>
+  {% endif %}
+</div>
+
+{% else %}
+  <div class="empty">no allocator config</div>
+{% endif %}
+
+{% endblock %}

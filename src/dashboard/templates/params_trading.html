@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}{{ bucket.id }} — Trading{% endblock %}
+{% block content %}
+
+{% include "_params_header.html" %}
+
+<h2>Trading logic</h2>
+<p style="font-size:0.85rem;color:#8b949e;margin-bottom:1rem">
+  The buy/sell rules for this bucket. The Strategy Master CSV gates which
+  strategies can fire on the current regime. Strategy classes describe the
+  entry signal they emit.
+</p>
+
+<h3 style="margin-top:1.5rem">Strategy Master</h3>
+<p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.5rem">
+  Per-strategy gate: each row says "this strategy is eligible to trade
+  in regime <em>regime_1</em> OR <em>regime_2</em>."
+</p>
+{% if master_err %}
+  <div class="empty">{{ master_err }}</div>
+{% elif master_rows %}
+  <table>
+    <thead>
+      <tr>
+        <th>Strategy</th>
+        <th>TF</th>
+        <th>Min vol</th>
+        <th>Regime gate</th>
+        <th>Type</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in master_rows %}
+      <tr>
+        <td><strong>{{ r.strategy_name }}</strong></td>
+        <td>{{ r.tf }}</td>
+        <td>{{ r.min_vol }}</td>
+        <td>
+          {% for g in r.regime_gate %}
+            <span class="badge badge-blue">{{ g }}</span>
+          {% endfor %}
+        </td>
+        <td>{{ r.trading_type }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty">no strategies registered in strategy_master.csv</div>
+{% endif %}
+
+<h3 style="margin-top:1.5rem">Strategy classes</h3>
+<p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.5rem">
+  Discovered Strategy subclasses under
+  <code>src/strategies/{{ bucket.trading_type }}/{{ bucket.market }}/strategies/</code>.
+</p>
+{% if discovered_err %}
+  <div class="empty">{{ discovered_err }}</div>
+{% elif strategies %}
+  {% for s in strategies %}
+  <div class="section">
+    <h3 style="display:flex;justify-content:space-between;align-items:center;font-size:1rem">
+      <span><code>{{ s.filename }}</code> → <strong>{{ s.name }}</strong></span>
+      <span class="badge badge-blue">{{ s.tf }}</span>
+    </h3>
+    <div style="color:#8b949e;font-size:0.75rem;margin-bottom:0.5rem">
+      trading_type = {{ s.trading_type }}
+    </div>
+    <pre style="font-size:0.85rem">{{ s.docstring }}</pre>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="empty">no Strategy subclasses discovered</div>
+{% endif %}
+
+{% endblock %}

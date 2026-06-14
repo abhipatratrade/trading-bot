@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}{{ bucket.id }} — Scanner{% endblock %}
+{% block content %}
+
+{% include "_params_header.html" %}
+
+<h2>Scanner</h2>
+<p style="font-size:0.85rem;color:#8b949e;margin-bottom:1rem">
+  Decides which symbols are eligible candidates each tick. Filters run
+  in order; survivors are ranked; the top
+  <code>universe_size</code> become the universe.
+</p>
+
+{% if error %}
+  <div class="empty">{{ error }}</div>
+{% elif cfg %}
+
+<div class="section">
+  <table>
+    <tr>
+      <th>universe_size</th>
+      <td>{{ cfg.universe_size }}</td>
+      <td style="color:#8b949e">how many symbols pass through to strategies</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Filters</h3>
+  <p style="font-size:0.8rem;color:#8b949e;margin-bottom:0.5rem">
+    Applied in order. Any failure short-circuits — symbol is dropped.
+  </p>
+  {% if cfg.filters %}
+    <table>
+      <thead><tr><th>#</th><th>Filter</th><th>Params</th></tr></thead>
+      <tbody>
+        {% for f in cfg.filters %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td><code>{{ f.name }}</code></td>
+          <td>
+            {% if f.params %}
+              <code>{{ f.params|tojson }}</code>
+            {% else %}
+              <span style="color:#8b949e">(none)</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty" style="padding:0.5rem">no filters — every eligible symbol passes through</div>
+  {% endif %}
+</div>
+
+<div class="section">
+  <h3 style="margin-bottom:0.5rem">Ranker</h3>
+  <table>
+    <tr><th>name</th><td><code>{{ cfg.ranker.name }}</code></td></tr>
+    {% if cfg.ranker.params %}
+    <tr><th>params</th><td><code>{{ cfg.ranker.params|tojson }}</code></td></tr>
+    {% endif %}
+  </table>
+</div>
+
+{% else %}
+  <div class="empty">no scanner config</div>
+{% endif %}
+
+{% endblock %}
