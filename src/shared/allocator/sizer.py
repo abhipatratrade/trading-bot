@@ -163,7 +163,7 @@ def size_positions(
     strategy_name: str,
     candidates: list[str],
     mark_prices_inr: dict[str, Decimal],
-    regime: MarketRegime | None,
+    regimes: dict[str, MarketRegime | None],
     config: AllocatorConfig,
 ) -> dict[str, SizingResult]:
     """Compute per-symbol sizing for one strategy in one bucket.
@@ -174,7 +174,11 @@ def size_positions(
         candidates: symbols the scanner + master gate let through.
         mark_prices_inr: most recent mark price per candidate, in INR
             (already converted from USD if needed).
-        regime: current bucket regime, or None if regime is disabled.
+        regimes: per-symbol regime label, or None when no Brain
+            prediction is available for that symbol. The sizer looks up
+            the multiplier per symbol from
+            ``config.regime_multipliers``; symbols missing from the
+            dict are treated as None (no regime → multiplier 1.0).
         config: validated ``allocator.yaml`` for this bucket.
 
     Returns:
@@ -233,15 +237,21 @@ def size_positions(
 
         held = held_positions | recent_open_symbols
 
-    regime_mult = (
-        config.regime_multipliers.get(regime, Decimal("0"))
-        if regime is not None
-        else Decimal("1")
-    )
+    def _regime_mult_for(sym: str) -> Decimal:
+        """Per-symbol regime multiplier from the caller-supplied dict.
+
+        Missing entries (no Brain prediction for that symbol) get
+        multiplier 1.0 — the sizer doesn't penalise unknown regime.
+        """
+        r = regimes.get(sym)
+        if r is None:
+            return Decimal("1")
+        return config.regime_multipliers.get(r, Decimal("0"))
 
     # ---- compute raw weights ---------------------------------------------
     raw_weights: dict[str, Decimal] = {}
     kelly_inputs: dict[str, KellySymbolStats] = {}
+    per_symbol_regime_mult: dict[str, Decimal] = {}
     for sym in candidates:
         if sym in held:
             continue  # dedup-gated; recorded later
@@ -251,7 +261,9 @@ def size_positions(
         kelly_inputs[sym] = stats
         full = kelly_fraction(stats.mu_per_period, stats.sigma_per_period)
         scaled = scale_kelly(full, config.fractional_kelly)
-        raw_weights[sym] = scaled * regime_mult
+        rmult = _regime_mult_for(sym)
+        per_symbol_regime_mult[sym] = rmult
+        raw_weights[sym] = scaled * rmult
 
     # ---- apply caps ------------------------------------------------------
     capped = apply_per_symbol_cap(raw_weights, config.per_symbol_cap)
@@ -348,16 +360,20 @@ def size_positions(
         )
 
     # ---- persist audit ----------------------------------------------------
+    # SizingSnapshot.regime is now per-symbol (the regime label that was
+    # used to size this particular candidate). regime_multiplier likewise.
     with session_scope() as session:
         for sym, res in results.items():
             stats = kelly_inputs.get(sym)
+            sym_regime = regimes.get(sym)
+            sym_mult = per_symbol_regime_mult.get(sym, Decimal("1"))
             session.add(
                 SizingSnapshot(
                     bucket_id=bucket.id,
                     strategy_name=strategy_name,
                     symbol=sym,
-                    regime=regime,
-                    regime_multiplier=regime_mult,
+                    regime=sym_regime,
+                    regime_multiplier=sym_mult,
                     fractional_kelly=config.fractional_kelly,
                     kelly_inputs=(
                         {
@@ -387,8 +403,9 @@ def size_positions(
                 payload={
                     "bucket_id": bucket.id,
                     "strategy_name": strategy_name,
-                    "regime": regime.value if regime else None,
-                    "regime_multiplier": str(regime_mult),
+                    "regimes": {
+                        s: (r.value if r else None) for s, r in regimes.items()
+                    },
                     "decisions": {s: r.decision.value for s, r in results.items()},
                 },
             )
@@ -398,7 +415,7 @@ def size_positions(
         "sizing_complete",
         bucket_id=bucket.id,
         strategy_name=strategy_name,
-        regime=regime.value if regime else None,
+        regimes={s: (r.value if r else None) for s, r in regimes.items()},
         placed=sum(1 for r in results.values() if r.decision == SizingDecision.PLACED),
         candidates=len(candidates),
     )

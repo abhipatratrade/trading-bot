@@ -26,12 +26,21 @@
   </div>
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Regime</div>
-    {% if regime.label %}
-      <div style="font-size:1.4rem;font-weight:600;text-transform:capitalize">
-        {{ regime.label }}
-      </div>
-      <div style="color:#8b949e;font-size:0.75rem">
-        model {{ regime.model_version }} · {{ regime.age_min }}m ago
+    {% if regimes %}
+      {% set market_row = regimes|selectattr('is_market')|first %}
+      {% if market_row %}
+        <div style="font-size:1.4rem;font-weight:600;text-transform:capitalize">
+          {{ market_row.label }}
+          <span style="font-size:0.7rem;color:#8b949e;font-weight:400">(market)</span>
+        </div>
+        <div style="color:#8b949e;font-size:0.75rem">
+          {{ market_row.model_version }} · {{ market_row.age_min }}m ago
+        </div>
+      {% else %}
+        <div style="font-size:0.85rem;color:#8b949e">per-coin only — no market label</div>
+      {% endif %}
+      <div style="font-size:0.75rem;color:#8b949e;margin-top:0.3rem">
+        {{ regimes|length }} prediction(s) recorded
       </div>
     {% else %}
       <div class="empty" style="padding:0">no prediction yet</div>
@@ -49,6 +58,51 @@
     </div>
   </div>
 </div>
+
+<h2>Regime per symbol</h2>
+{% if regimes %}
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Label</th>
+        <th>Model version</th>
+        <th>Age</th>
+        <th>State probabilities</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in regimes %}
+      <tr>
+        <td>
+          <strong>{{ r.symbol }}</strong>
+          {% if r.is_market %}
+            <span class="badge badge-yellow">fallback</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if r.label == 'bull' %}
+            <span class="badge badge-green">{{ r.label }}</span>
+          {% elif r.label == 'bear' %}
+            <span class="badge badge-red">{{ r.label }}</span>
+          {% else %}
+            <span class="badge badge-blue">{{ r.label }}</span>
+          {% endif %}
+        </td>
+        <td style="font-size:0.75rem;color:#8b949e">{{ r.model_version }}</td>
+        <td>{{ r.age_min }}m</td>
+        <td style="font-size:0.75rem">
+          {% for k, v in r.probabilities.items() %}
+            <span style="margin-right:0.4rem">{{ k }}: {{ "%.2f"|format(v) }}</span>
+          {% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <div class="empty">no regime snapshots yet — the bot writes one per (bucket, symbol) on each tick when the regime is enabled</div>
+{% endif %}
 
 <h2>Running Trades</h2>
 {% if running %}

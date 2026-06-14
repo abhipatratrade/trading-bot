@@ -1,14 +1,31 @@
 # Brain config for longterm-crypto.
-# 3-state HMM on BTCUSDT daily bars (Decisions 014, 015).
 #
-# Enabled 2026-06-13 after the first model train (v20260612_184705) on
-# 1100 days of BTCUSDT daily klines. Regime multipliers in allocator.yaml
-# are bear=0, neutral=0.5, bull=1.0 — bot will stop opening new positions
-# when Brain reports bear.
+# Per-(bucket, symbol) HMMs. The retrain job trains:
+#   1. A broad-market fallback model on `proxy_symbol` (BTCUSD) stored
+#      under the reserved sentinel symbol `_market_`. Used when a coin
+#      doesn't have its own model yet.
+#   2. One model per entry in `symbols` below, fitted to that coin's own
+#      OHLCV. The training tier (3-state-full / 3-state-diag /
+#      2-state-diag) is auto-picked from the bar count.
+#
+# Regime multipliers (allocator.yaml): bear=0, neutral=0.5, bull=1.0.
+# A symbol whose Brain says BEAR gets a 0 multiplier on the next tick.
 
 enabled: true
-proxy_symbol: BTCUSD       # Delta India format; brain.py + retrain_job both use Delta
+proxy_symbol: BTCUSD             # Delta India format; used for the _market_ model
 tf: 1d
-training_window_days: 1100        # ~3 years of daily bars
+training_window_days: 1100        # ~3 years of daily bars (Delta India's history)
 inference_lookback_bars: 200      # bars used at predict time
 retrain_cadence: weekly           # Mon 02:00 UTC via run_scheduler
+fallback_to_market: true          # under-data symbols defer to the _market_ model
+
+# Coins to train per-coin models for. When this list is empty, only the
+# `_market_` fallback gets trained — every coin then uses the broad
+# market regime (same behaviour as the pre-restructure single-HMM bot).
+# Add symbols here matching the scanner's universe.
+symbols:
+  - BTCUSD
+  - ETHUSD
+  - SOLUSD
+  - XRPUSD
+  - BNBUSD

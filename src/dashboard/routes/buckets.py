@@ -177,16 +177,19 @@ def bucket_detail(bucket_id: str, request: Request):
             for t in trades
         ]
 
-        # Bucket state + regime
+        # Bucket state + per-symbol regime (one row per (bucket, symbol)).
+        # We pull the most-recent snapshot per symbol, ordered by ts desc.
         state = session.execute(
             select(BucketState).where(BucketState.bucket_id == bucket_id)
         ).scalar_one_or_none()
-        regime = session.execute(
+        regime_rows = session.execute(
             select(RegimeSnapshot)
             .where(RegimeSnapshot.bucket_id == bucket_id)
             .order_by(desc(RegimeSnapshot.ts))
-            .limit(1)
-        ).scalar_one_or_none()
+        ).scalars().all()
+        regimes_by_symbol: dict[str, RegimeSnapshot] = {}
+        for r in regime_rows:
+            regimes_by_symbol.setdefault(r.symbol, r)
 
     scanning: list[dict[str, object]] = []
     for name in discovered:
@@ -222,14 +225,7 @@ def bucket_detail(bucket_id: str, request: Request):
                 "available_inr": str(state.available_balance_inr) if state else "—",
                 "locked_inr": str(state.locked_margin_inr) if state else "—",
             },
-            "regime": {
-                "label": regime.regime.value if regime else None,
-                "age_min": _age_minutes(regime.ts) if regime else None,
-                "model_version": regime.model_version if regime else None,
-                "probabilities": (
-                    regime.state_probabilities if regime else None
-                ),
-            },
+            "regimes": _regimes_table(regimes_by_symbol),
             "running": running,
             "scanning": scanning,
             "recent_trades": recent_trades,
@@ -268,6 +264,33 @@ def _find_bucket(bucket_id: str):
         if b.id == bucket_id:
             return b
     return None
+
+
+def _regimes_table(
+    regimes_by_symbol: dict[str, RegimeSnapshot],
+) -> list[dict[str, object]]:
+    """Sort regime snapshots into a stable view: market row first, then
+    per-coin rows alphabetised."""
+    from src.shared.regime.store import MARKET_SENTINEL
+
+    rows: list[dict[str, object]] = []
+    market = regimes_by_symbol.get(MARKET_SENTINEL)
+    if market is not None:
+        rows.append(_regime_row(market, is_market=True))
+    for sym in sorted(s for s in regimes_by_symbol if s != MARKET_SENTINEL):
+        rows.append(_regime_row(regimes_by_symbol[sym], is_market=False))
+    return rows
+
+
+def _regime_row(snap: RegimeSnapshot, *, is_market: bool) -> dict[str, object]:
+    return {
+        "symbol": "(market)" if is_market else snap.symbol,
+        "is_market": is_market,
+        "label": snap.regime.value,
+        "model_version": snap.model_version,
+        "age_min": _age_minutes(snap.ts),
+        "probabilities": snap.state_probabilities,
+    }
 
 
 # Decimal import kept for future P/L calculations on the running-trades table.

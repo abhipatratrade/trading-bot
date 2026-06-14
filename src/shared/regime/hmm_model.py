@@ -55,15 +55,34 @@ class RegimePrediction:
 
 
 class RegimeModel:
-    """Fit + predict + serialise a Gaussian HMM with 3 hidden states."""
+    """Fit + predict + serialise a Gaussian HMM.
 
-    n_states: int = 3
-    covariance_type: str = "full"
+    ``n_states`` and ``covariance_type`` are picked at construction by
+    the retrain job's tiered selector — fewer parameters for symbols
+    with less history. See ``shared/regime/retrain_job.py:pick_tier``.
+    """
+
     random_state: int = 7
     n_iter: int = 200
 
-    def __init__(self, feature_columns: list[str]) -> None:
+    def __init__(
+        self,
+        feature_columns: list[str],
+        *,
+        n_states: int = 3,
+        covariance_type: str = "full",
+    ) -> None:
+        if n_states not in (2, 3):
+            raise ValueError(
+                f"RegimeModel supports 2 or 3 states; got {n_states}"
+            )
+        if covariance_type not in ("full", "diag", "spherical", "tied"):
+            raise ValueError(
+                f"unsupported covariance_type: {covariance_type!r}"
+            )
         self.feature_columns = list(feature_columns)
+        self.n_states = n_states
+        self.covariance_type = covariance_type
         self._hmm: "GaussianHMM | None" = None
         self._labels: list[MarketRegime] | None = None
 
@@ -132,12 +151,17 @@ class RegimeModel:
     def from_dict(cls, blob: dict[str, Any]) -> "RegimeModel":
         """Rebuild from a ``to_dict`` payload."""
         feature_columns = list(blob["feature_columns"])
-        m = cls(feature_columns)
         n_states = int(blob["n_states"])
+        covariance_type = blob.get("covariance_type", "full")
+        m = cls(
+            feature_columns,
+            n_states=n_states,
+            covariance_type=covariance_type,
+        )
         GaussianHMM = _import_gaussian_hmm()
         hmm = GaussianHMM(
             n_components=n_states,
-            covariance_type=blob.get("covariance_type", cls.covariance_type),
+            covariance_type=covariance_type,
             n_iter=cls.n_iter,
             random_state=cls.random_state,
             init_params="",  # we set the params manually below
@@ -150,7 +174,6 @@ class RegimeModel:
         hmm.n_features = hmm.means_.shape[1]
         m._hmm = hmm
         m._labels = [MarketRegime(v) for v in blob["labels"]]
-        m.n_states = n_states
         return m
 
     # ------------------------------------------------------------- internal

@@ -2,14 +2,16 @@
 Persist and retrieve fitted HMM artifacts via Postgres JSONB.
 
 ``regime_model`` row layout:
-    (bucket_id, version) UNIQUE
+    (bucket_id, symbol, version) UNIQUE
     model_blob JSONB     — output of RegimeModel.to_dict()
     feature_columns JSONB
     n_states INT
     trained_at TIMESTAMPTZ
 
-The latest version per bucket is the row with the most recent
-``trained_at``. ``brain.predict_regime`` calls ``load_latest_for_bucket``.
+Each bucket has one model per symbol it trades. The reserved sentinel
+``symbol=MARKET_SENTINEL`` ("_market_") holds the broad-market BTC
+model used as a fallback for coins with too little history to train
+their own. ``brain.predict_regime`` calls ``load_latest_for_symbol``.
 """
 
 from __future__ import annotations
@@ -23,11 +25,14 @@ from sqlalchemy.orm import Session
 from src.core.models import RegimeModel as RegimeModelRow
 from src.shared.regime.hmm_model import RegimeModel
 
+MARKET_SENTINEL: str = "_market_"
+
 
 def save_model(
     session: Session,
     *,
     bucket_id: str,
+    symbol: str,
     version: str,
     trained_at: datetime,
     model: RegimeModel,
@@ -37,6 +42,7 @@ def save_model(
     blob = model.to_dict()
     row = RegimeModelRow(
         bucket_id=bucket_id,
+        symbol=symbol,
         version=version,
         trained_at=trained_at,
         n_states=model.n_states,
@@ -48,13 +54,17 @@ def save_model(
     return row
 
 
-def load_latest_for_bucket(
-    session: Session, bucket_id: str
+def load_latest_for_symbol(
+    session: Session, bucket_id: str, symbol: str
 ) -> tuple[str, RegimeModel] | None:
-    """Return (version, deserialised model) for the most-recent fit, or None."""
+    """Return (version, deserialised model) for the most-recent fit on
+    (bucket_id, symbol). None if no model has been trained yet."""
     row = session.execute(
         select(RegimeModelRow)
-        .where(RegimeModelRow.bucket_id == bucket_id)
+        .where(
+            RegimeModelRow.bucket_id == bucket_id,
+            RegimeModelRow.symbol == symbol,
+        )
         .order_by(RegimeModelRow.trained_at.desc())
         .limit(1)
     ).scalar_one_or_none()

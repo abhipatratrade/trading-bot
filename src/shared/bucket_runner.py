@@ -51,6 +51,7 @@ from src.shared.allocator.sizer import (
 )
 from src.shared.bucket import Bucket
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
+from src.shared.regime.store import MARKET_SENTINEL
 from src.shared.scanner.engine import (
     ScannerConfig,
     load_scanner_config,
@@ -152,15 +153,23 @@ class BucketRunner:
         )
 
         # 4. Regime
-        regime_pred = predict_regime(
+        # Broad-market label drives the per-strategy regime gate
+        # (whether the strategy concept applies in the current market).
+        market_pred = predict_regime(
             bucket_id=self.bucket.id,
+            symbol=MARKET_SENTINEL,
             config=self.regime_config,
             data=self._data,
             clock=self._clock,
         )
-        current_regime = regime_pred.regime if regime_pred else None
+        market_regime: MarketRegime | None = (
+            market_pred.regime if market_pred else None
+        )
 
         # 5+6+7: per-strategy gate, dedup (in sizer), Kelly
+        # Per-symbol regimes are computed lazily inside the per-strategy
+        # loop only for the candidates that actually enter the sizer —
+        # avoids predicting for symbols the strategy doesn't want anyway.
         placed = 0
         skipped_counts: dict[SizingDecision, int] = {}
         eligible: list[str] = []
@@ -175,10 +184,10 @@ class BucketRunner:
                 )
                 continue
 
-            if current_regime is not None and not row.passes_regime_gate(
-                current_regime
+            if market_regime is not None and not row.passes_regime_gate(
+                market_regime
             ):
-                blocked[strat_name] = f"regime gate: current={current_regime.value}"
+                blocked[strat_name] = f"regime gate: market={market_regime.value}"
                 _log_strategy_blocked(
                     self.bucket.id, strat_name, blocked[strat_name]
                 )
@@ -193,12 +202,26 @@ class BucketRunner:
             symbols = [ec.symbol for ec in entry_candidates]
             mark_prices = self._collect_mark_prices(symbols)
 
+            # Per-symbol regimes for the sizer (one HMM call per
+            # candidate; the brain caches per inference window so
+            # subsequent ticks within the same bar are no-ops).
+            regimes: dict[str, MarketRegime | None] = {}
+            for sym in symbols:
+                pred = predict_regime(
+                    bucket_id=self.bucket.id,
+                    symbol=sym,
+                    config=self.regime_config,
+                    data=self._data,
+                    clock=self._clock,
+                )
+                regimes[sym] = pred.regime if pred else None
+
             results = size_positions(
                 bucket=self.bucket,
                 strategy_name=strat_name,
                 candidates=symbols,
                 mark_prices_inr=mark_prices,
-                regime=current_regime,
+                regimes=regimes,
                 config=self.allocator_config,
             )
 
@@ -232,7 +255,7 @@ class BucketRunner:
             eligible_strategies=eligible,
             blocked_strategies=blocked,
             universe=scan.universe,
-            regime=current_regime,
+            regime=market_regime,
         )
 
     # ── Internals ──────────────────────────────────────────────────────

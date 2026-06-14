@@ -56,7 +56,21 @@ class TestStateLabels:
         assert labels[2] == MarketRegime.NEUTRAL
         assert labels[0] == MarketRegime.BULL
 
-    def test_non_three_state_raises(self) -> None:
-        means = np.array([[0.0, 0.0], [0.001, 0.0]])
-        with pytest.raises(ValueError, match="n_states must be 3"):
+    def test_two_state_monotone(self) -> None:
+        # 2-state tier produces bear (lowest mean) + bull (highest); no neutral.
+        means = np.array(
+            [
+                [0.002, 0.02, 0.0],
+                [-0.003, 0.04, 0.0],
+            ]
+        )
+        labels = label_states_by_mean_return(means)
+        assert labels == [MarketRegime.BULL, MarketRegime.BEAR]
+
+    def test_n_states_outside_2_or_3_raises(self) -> None:
+        means = np.array([[0.0, 0.0]])
+        with pytest.raises(ValueError, match="n_states must be 2 or 3"):
             label_states_by_mean_return(means)
+        means4 = np.zeros((4, 3))
+        with pytest.raises(ValueError, match="n_states must be 2 or 3"):
+            label_states_by_mean_return(means4)

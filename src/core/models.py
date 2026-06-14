@@ -407,21 +407,34 @@ class SymbolMapping(Base, TimestampMixin):
 # Regime (Brain) — Decision 014
 # ---------------------------------------------------------------------------
 class RegimeModel(Base, TimestampMixin):
-    """Persisted HMM artifact per (type × market) bucket.
+    """Persisted HMM artifact per (bucket × symbol).
 
     The model_blob JSONB column stores the serialised HMM params produced by
     ``RegimeModel.to_dict()`` — start probabilities, transition matrix,
     means, covariances, label mapping. Avoids pickle and a binary store.
+
+    ``symbol`` is one row per coin the bot trades in the bucket. The
+    reserved sentinel ``symbol='_market_'`` holds the broad-market BTC
+    model used as a fallback for coins with too little history to train
+    their own (see ``shared/regime/retrain_job.py``).
     """
 
     __tablename__ = "regime_model"
     __table_args__ = (
-        UniqueConstraint("bucket_id", "version", name="uq_regime_model_key"),
-        Index("ix_regime_model_bucket_trained", "bucket_id", "trained_at"),
+        UniqueConstraint(
+            "bucket_id", "symbol", "version", name="uq_regime_model_key"
+        ),
+        Index(
+            "ix_regime_model_bucket_symbol_trained",
+            "bucket_id",
+            "symbol",
+            "trained_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     version: Mapped[str] = mapped_column(String(64), nullable=False)
     trained_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -433,11 +446,21 @@ class RegimeModel(Base, TimestampMixin):
 
 
 class RegimeSnapshot(Base):
-    """Per-bucket regime prediction over time. One row per inference."""
+    """Per-(bucket, symbol) regime prediction over time.
+
+    One row per Brain inference. ``symbol='_market_'`` rows track the
+    broad-market BTC regime separately so it can be used as a fallback
+    for symbols whose per-coin model is missing or too low-data.
+    """
 
     __tablename__ = "regime_snapshot"
     __table_args__ = (
-        Index("ix_regime_snapshot_bucket_ts", "bucket_id", "ts"),
+        Index(
+            "ix_regime_snapshot_bucket_symbol_ts",
+            "bucket_id",
+            "symbol",
+            "ts",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -445,6 +468,7 @@ class RegimeSnapshot(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     bucket_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     regime: Mapped[MarketRegime] = mapped_column(
         SAEnum(MarketRegime, name="market_regime"), nullable=False
     )
