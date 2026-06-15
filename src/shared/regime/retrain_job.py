@@ -19,9 +19,11 @@ The bot continues to use the previously-saved model until
 ``brain.predict_regime`` runs next and finds a newer ``trained_at`` —
 retrains are non-blocking.
 
-Data source: Delta India LIVE. After the GCP VM migrates to
-``asia-south1`` (Mumbai), this can switch back to Binance (more
-history for liquid alts). Tracked in the plan as the prerequisite.
+Data source: Binance Futures public klines. We translate each
+Delta-format ``bucket_symbol`` (e.g. BTCUSD) to its Binance equivalent
+(BTCUSDT) via the ``symbol_mapping`` table. Binance has ~6 years of
+daily history vs Delta India's ~1090 days — see the per-coin regime
+plan for context.
 """
 
 from __future__ import annotations
@@ -29,24 +31,19 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-import httpx
 import pandas as pd
+from sqlalchemy import select
 
 from src.core.clock import RealClock
 from src.core.db import session_scope
 from src.core.logging import configure_logging, get_logger
-from src.core.models import AuditEventType, AuditLog
-from src.data_sources.delta_india import DeltaIndiaData
+from src.core.models import AuditEventType, AuditLog, SymbolMapping
+from src.data_sources.binance import BinanceData
 from src.shared.bucket import Market, load_bucket
 from src.shared.regime.brain import RegimeConfig, load_regime_config
 from src.shared.regime.features import compute_features
 from src.shared.regime.hmm_model import RegimeModel
 from src.shared.regime.store import MARKET_SENTINEL, save_model
-
-# Delta India testnet only retains ~75 days of BTCUSD history. The LIVE
-# endpoint has ~3 years of history and is unauthenticated (public
-# market-data only), so it's safe to use regardless of TRADING_MODE.
-_DELTA_LIVE_BASE_URL = "https://api.india.delta.exchange"
 
 _MIN_TRAIN_BARS: int = 150
 _TIER_FULL_MIN: int = 700
@@ -104,29 +101,31 @@ def pick_tier(n_bars: int) -> TrainTier | None:
 
 
 # ---------------------------------------------------------------------------
-# Data fetch (Delta India LIVE)
+# Data fetch (Binance Futures public klines)
 # ---------------------------------------------------------------------------
-def _open_delta_live() -> DeltaIndiaData:
-    """A DeltaIndiaData client pointed at the LIVE base URL.
+def _fetch_bars(data: BinanceData, symbol: str, tf: str, limit: int):
+    """Fetch OHLCV. Returns [] on errors (caller skips the symbol).
 
-    Caller must call ``.close()``.
+    ``limit`` is capped at 1500 by Binance per request; the bot's
+    default training window (1100 daily bars) fits in one call.
     """
-    data = DeltaIndiaData()
-    data._http = httpx.Client(
-        base_url=_DELTA_LIVE_BASE_URL,
-        timeout=20.0,
-        headers={"User-Agent": "trading-bot-retrain/0.1.0"},
-    )
-    return data
-
-
-def _fetch_bars(data: DeltaIndiaData, symbol: str, tf: str, limit: int):
-    """Fetch OHLCV. Returns [] on errors (caller skips the symbol)."""
     try:
-        return data.get_ohlcv(symbol, tf, limit=limit)
+        return data.get_ohlcv(symbol, tf, limit=min(limit, 1500))
     except Exception:
         _log.warning("retrain_fetch_failed", symbol=symbol, exc_info=True)
         return []
+
+
+def _delta_to_binance(delta_symbol: str) -> str | None:
+    """Translate a Delta India symbol (e.g. BTCUSD) to its Binance
+    Futures equivalent (e.g. BTCUSDT) via ``symbol_mapping``."""
+    with session_scope() as session:
+        row = session.execute(
+            select(SymbolMapping).where(
+                SymbolMapping.delta_symbol == delta_symbol
+            )
+        ).scalar_one_or_none()
+        return row.binance_symbol if row and row.binance_symbol else None
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +147,7 @@ def _retrain_one(
     bucket_symbol: str,
     fetch_symbol: str,
     cfg: RegimeConfig,
-    data: DeltaIndiaData,
+    data: BinanceData,
 ) -> RetrainResult:
     """Train and persist one regime model for (bucket_id, bucket_symbol).
 
@@ -269,14 +268,35 @@ def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
         )
 
     # Always train the broad-market fallback under MARKET_SENTINEL.
-    # Per-coin models live under their own symbol.
+    # Per-coin models live under their own symbol. Delta-format symbols
+    # in regime.yaml (e.g. BTCUSD) are translated to Binance symbols
+    # (e.g. BTCUSDT) for the OHLCV fetch; storage still keys on the
+    # Delta-format ``bucket_symbol`` so ``brain.predict_regime`` finds
+    # the right model at inference time.
     symbols_to_train: list[tuple[str, str]] = []   # (bucket_symbol, fetch_symbol)
-    symbols_to_train.append((MARKET_SENTINEL, cfg.proxy_symbol))
+    market_fetch = _delta_to_binance(cfg.proxy_symbol)
+    if market_fetch is None:
+        _log.warning(
+            "regime_train_missing_binance_mapping",
+            bucket_id=bucket_id,
+            delta_symbol=cfg.proxy_symbol,
+            note="market fallback model will be skipped",
+        )
+    else:
+        symbols_to_train.append((MARKET_SENTINEL, market_fetch))
     for sym in cfg.symbols:
-        symbols_to_train.append((sym, sym))
+        fetch = _delta_to_binance(sym)
+        if fetch is None:
+            _log.warning(
+                "regime_train_missing_binance_mapping",
+                bucket_id=bucket_id,
+                delta_symbol=sym,
+            )
+            continue
+        symbols_to_train.append((sym, fetch))
 
     results: list[RetrainResult] = []
-    data = _open_delta_live()
+    data = BinanceData()
     try:
         for bucket_symbol, fetch_symbol in symbols_to_train:
             results.append(
