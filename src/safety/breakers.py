@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from src.brokers.base import Broker
+from src.core.alerts import send_alert
 from src.core.logging import get_logger
 
 _log = get_logger("safety.breakers")
@@ -73,6 +74,11 @@ def check_daily_drawdown(
             unrealised=str(total_unrealised),
             equity=str(total_equity),
         )
+        send_alert(
+            f"BREAKER TRIPPED: daily_drawdown\n"
+            f"drawdown={drawdown_pct:.2f}% (threshold {max_drawdown_pct}%)\n"
+            f"unrealised={total_unrealised} on equity={total_equity}"
+        )
 
     return BreakerResult(
         name="daily_drawdown",
@@ -123,6 +129,13 @@ def check_liquidation_distance(
             violations=violations,
             threshold=str(min_distance_pct),
         )
+        send_alert(
+            f"BREAKER TRIPPED: liquidation_distance (threshold {min_distance_pct}%)\n"
+            + "\n".join(
+                f"- {v['symbol']}: entry={v['entry_price']} liq={v['liquidation_price']} dist={v['distance_pct']}%"
+                for v in violations
+            )
+        )
 
     return BreakerResult(
         name="liquidation_distance",
@@ -167,6 +180,13 @@ def check_funding_extreme(
             "breaker_funding_extreme_tripped",
             violations=violations,
             threshold=str(max_funding_rate),
+        )
+        send_alert(
+            f"BREAKER TRIPPED: funding_extreme (threshold {max_funding_rate})\n"
+            + "\n".join(
+                f"- {v['symbol']}: rate={v['funding_rate']}"
+                for v in violations
+            )
         )
 
     return BreakerResult(

@@ -20,7 +20,7 @@ import time
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
-from src.core.alerts import send_alert
+from src.core.alerts import send_alert, send_alert_dedup
 from src.core.clock import RealClock
 from src.core.config import get_settings
 from src.core.db import session_scope
@@ -93,6 +93,7 @@ def main() -> None:
         binance_data.close()
     except Exception:
         _log.warning("symbol_mapping_api_failed_using_csv", exc_info=True)
+        send_alert("[bot] Symbol mapping refresh FAILED — falling back to CSV")
         if DEFAULT_CSV.exists():
             try:
                 rows = load_csv(DEFAULT_CSV)
@@ -104,8 +105,14 @@ def main() -> None:
                 )
             except Exception:
                 _log.error("symbol_mapping_csv_load_failed", exc_info=True)
+                send_alert(
+                    "[bot] Symbol mapping CSV fallback ALSO FAILED — see logs"
+                )
         else:
             _log.error("symbol_mapping_csv_not_found", path=str(DEFAULT_CSV))
+            send_alert(
+                f"[bot] Symbol mapping CSV missing at {DEFAULT_CSV} — no mappings loaded"
+            )
 
     # ── Buckets ─────────────────────────────────────────────────────────
     all_buckets = load_buckets()
@@ -204,7 +211,10 @@ def main() -> None:
                     bucket_id=runner.bucket.id,
                     exc_info=True,
                 )
-                send_alert(f"[bot] tick error in {runner.bucket.id}")
+                send_alert_dedup(
+                    f"tick_error:{runner.bucket.id}",
+                    f"[bot] tick error in {runner.bucket.id}",
+                )
         if _shutdown:
             break
 

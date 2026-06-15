@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.brokers.base import Broker
+from src.core.alerts import send_alert
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -73,6 +74,13 @@ class Reconciler:
                 positions_updated=report.positions_updated,
                 orders_updated=report.orders_updated,
             )
+            send_alert(
+                f"[reconciler] {len(report.diffs)} drift(s) detected: "
+                f"{report.positions_updated} pos updated, "
+                f"{report.positions_closed} pos closed, "
+                f"{report.orphan_positions} orphan(s) imported, "
+                f"{report.orders_updated} order(s) updated"
+            )
         else:
             self._log.info("reconcile_clean")
         return report
@@ -120,6 +128,10 @@ class Reconciler:
                         )
                     )
                     self._log.warning("position_closed_on_exchange", **diff)
+                    send_alert(
+                        f"[reconciler] Position CLOSED externally: {db_pos.symbol} "
+                        f"(was {db_pos.side.value} {db_pos.quantity})"
+                    )
 
             # Case 2: Exchange has position, DB doesn't → IMPORT IT.
             # Without this, the bot's dedup gate in shared.allocator.sizer

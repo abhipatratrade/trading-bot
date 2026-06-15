@@ -30,7 +30,7 @@ from decimal import Decimal
 from typing import Mapping
 
 from src.brokers.base import Broker, OrderType
-from src.core.alerts import send_alert
+from src.core.alerts import send_alert_dedup
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -307,8 +307,9 @@ class BucketRunner:
                 symbol=symbol,
                 exc_info=True,
             )
-            send_alert(
-                f"[{self.bucket.id}] FAILED to open {symbol} via {strat_name}"
+            send_alert_dedup(
+                f"open_failed:{self.bucket.id}:{symbol}",
+                f"[{self.bucket.id}] FAILED to open {symbol} via {strat_name}",
             )
 
 

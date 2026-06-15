@@ -29,6 +29,7 @@ import yaml
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from src.core.alerts import send_alert
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -241,6 +242,11 @@ def predict_regime(
                     },
                 )
             )
+            if prev is not None:
+                send_alert(
+                    f"[{bucket_id}] {used_symbol} regime: "
+                    f"{prev.regime.value} -> {pred.regime.value}"
+                )
 
     _cache[cache_key] = pred
     _log.info(

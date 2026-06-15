@@ -24,6 +24,7 @@ from src.brokers.base import (
     OrderType,
     TimeInForce,
 )
+from src.core.alerts import send_alert
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -222,6 +223,14 @@ class OrderManager:
             trade_id=trade_id,
             exchange_order_id=result.exchange_order_id,
             status=mapped_status.value,
+        )
+
+        scope = bucket_id or strategy_id
+        tag = "EXIT" if reduce_only else "ORDER"
+        price_str = str(limit_price) if limit_price is not None else "market"
+        send_alert(
+            f"[{scope}] {tag} {side.upper()} {size} {symbol} @ {price_str} "
+            f"[{mapped_status.value}]"
         )
 
         return PlacementResult(

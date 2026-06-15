@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
+from src.core.alerts import send_alert
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -104,6 +105,11 @@ def engage(
         reason=reason,
         engaged_by=engaged_by,
     )
+    send_alert(
+        f"KILL SWITCH ENGAGED ({scope.value}"
+        f"{f', {strategy_id}' if strategy_id else ''})\n"
+        f"By: {engaged_by}\nReason: {reason}"
+    )
 
 
 def disengage(
@@ -148,4 +154,8 @@ def disengage(
         scope=scope.value,
         strategy_id=strategy_id,
         disengaged_by=disengaged_by,
+    )
+    send_alert(
+        f"Kill switch DISENGAGED ({scope.value}"
+        f"{f', {strategy_id}' if strategy_id else ''})\nBy: {disengaged_by}"
     )
