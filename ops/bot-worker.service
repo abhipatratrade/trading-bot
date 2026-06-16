@@ -13,8 +13,7 @@
 
 [Unit]
 Description=Trading Bot Worker
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
@@ -23,6 +22,7 @@ WorkingDirectory=/home/kohinoor_abhi/trading-bot
 ExecStart=/home/kohinoor_abhi/trading-bot/.venv/bin/python -m src.entrypoints.run_bot
 Restart=on-failure
 RestartSec=10
+EnvironmentFile=/home/kohinoor_abhi/.env
 
 [Install]
 WantedBy=multi-user.target

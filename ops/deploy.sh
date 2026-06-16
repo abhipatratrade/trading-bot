@@ -23,6 +23,10 @@ PY="$REPO/.venv/bin/python"
 PIP="$REPO/.venv/bin/pip"
 SERVICE=bot-worker.service
 BRANCH=main
+# The bot's secrets live here (same EnvironmentFile the systemd unit uses).
+# We source it so notify()'s send_alert() sees TELEGRAM_* — otherwise the
+# deploy alerts silently no-op.
+ENV_FILE=/home/kohinoor_abhi/.env
 
 # Paths whose change requires a bot restart. Dashboard/docs/ops changes
 # alone do not (Railway serves the dashboard; the timer reloads itself).
@@ -30,6 +34,14 @@ RESTART_PATHS='^(src/(strategies|shared|core|safety|order_manager|data_sources|b
 DEP_PATHS='^(requirements\.txt|pyproject\.toml)$'
 
 cd "$REPO" || { echo "repo not found: $REPO" >&2; exit 1; }
+
+# Load the bot's env so send_alert() (and any other Settings read) works.
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
 
 # Send a Telegram alert through the bot's own plumbing. Best-effort.
 notify() {
