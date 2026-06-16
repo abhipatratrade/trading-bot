@@ -1,0 +1,22 @@
+# Auto-deploy runner — fired every ~60s by bot-deploy.timer.
+#
+# Type=oneshot means a still-running deploy (e.g. a slow pip install) is
+# never overlapped by the next timer tick. Runs as the repo owner so
+# `git pull` and the venv work without permission gymnastics; the single
+# privileged action (systemctl restart bot-worker) is granted via a
+# narrow sudoers rule in /etc/sudoers.d/bot-deploy.
+#
+# Install:
+#   sudo cp ops/bot-deploy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+
+[Unit]
+Description=Trading bot auto-deploy (git pull + conditional restart)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kohinoor_abhi
+WorkingDirectory=/home/kohinoor_abhi/trading-bot
+ExecStart=/home/kohinoor_abhi/trading-bot/ops/deploy.sh

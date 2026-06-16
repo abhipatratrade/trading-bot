@@ -1,0 +1,4 @@
+# Files that run on Linux must keep LF endings regardless of contributor OS.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf

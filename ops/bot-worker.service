@@ -1,0 +1,28 @@
+# Canonical bot-worker unit, version-controlled for reproducibility.
+#
+# This is the service the auto-deploy restarts. It historically lived only
+# on the VM; keeping a copy in git means the service definition survives a
+# VM rebuild. NOTE: the auto-deploy does NOT apply changes to this file
+# automatically (that needs `systemctl daemon-reload`). If you edit this,
+# re-copy it to the VM by hand:
+#   sudo cp ops/bot-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl restart bot-worker.service
+#
+# Secrets are read from the .env file in WorkingDirectory by pydantic
+# Settings — they are NOT listed here.
+
+[Unit]
+Description=Trading Bot Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kohinoor_abhi
+WorkingDirectory=/home/kohinoor_abhi/trading-bot
+ExecStart=/home/kohinoor_abhi/trading-bot/.venv/bin/python -m src.entrypoints.run_bot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

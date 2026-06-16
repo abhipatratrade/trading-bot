@@ -1,0 +1,20 @@
+# Fires bot-deploy.service ~every 60s to poll origin/main for new commits.
+#
+# Install + enable:
+#   sudo cp ops/bot-deploy.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bot-deploy.timer
+#
+# Emergency stop (halts auto-deploy; manual git pull still works):
+#   sudo systemctl stop bot-deploy.timer
+
+[Unit]
+Description=Poll origin/main every 60s and auto-deploy the bot
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
