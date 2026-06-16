@@ -80,13 +80,22 @@ def export_trades(target_date: datetime | None = None) -> Path | None:
 
 
 def upload_to_gdrive(local_path: Path) -> bool:
-    """Upload a file to Google Drive if configured.  Returns True on success."""
+    """Upload a file to Google Drive if configured.  Returns True on success.
+
+    ``GDRIVE_SERVICE_ACCOUNT_JSON`` accepts either form:
+      - a filesystem path to a JSON key file
+      - the JSON key contents inline (starts with ``{``)
+    The inline form is the practical choice on Railway/containers where
+    no key file is mounted.
+    """
     settings = get_settings()
     if not settings.gdrive_enabled:
         _log.info("gdrive_disabled")
         return False
 
     try:
+        import json
+
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
@@ -94,11 +103,19 @@ def upload_to_gdrive(local_path: Path) -> bool:
         _log.warning("gdrive_deps_missing")
         return False
 
+    scopes = ["https://www.googleapis.com/auth/drive.file"]
+    value = settings.gdrive_service_account_json or ""
+
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            settings.gdrive_service_account_json,
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-        )
+        if value.lstrip().startswith("{"):
+            info = json.loads(value)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=scopes
+            )
+        else:
+            creds = service_account.Credentials.from_service_account_file(
+                value, scopes=scopes
+            )
         service = build("drive", "v3", credentials=creds)
 
         file_metadata = {
