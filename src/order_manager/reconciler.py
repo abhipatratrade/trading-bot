@@ -133,7 +133,10 @@ class Reconciler:
                         f"(was {db_pos.side.value} {db_pos.quantity})"
                     )
 
-            # Case 2: Exchange has position, DB doesn't → IMPORT IT.
+            # Case 2: Exchange has position, DB has no NON-FLAT row → IMPORT IT.
+            # A FLAT row may still exist from a prior close; uq_position_key
+            # is on (strategy_id, broker, symbol) so plain INSERT collides.
+            # Upsert: reopen the FLAT row if it exists, otherwise insert.
             # Without this, the bot's dedup gate in shared.allocator.sizer
             # never sees the position and keeps placing new orders every
             # tick. Bucket attribution comes from the most-recent filled
@@ -149,8 +152,19 @@ class Reconciler:
                     latest_trade.strategy_name if latest_trade else None
                 )
                 side = _exchange_side_to_position(ex_pos.side)
+                existing_flat = session.execute(
+                    select(Position).where(
+                        Position.strategy_id == strategy_id,
+                        Position.broker == self._broker_name,
+                        Position.symbol == sym,
+                    )
+                ).scalar_one_or_none()
                 diff = {
-                    "type": "orphan_position_imported",
+                    "type": (
+                        "orphan_position_reopened"
+                        if existing_flat is not None
+                        else "orphan_position_imported"
+                    ),
                     "symbol": sym,
                     "exchange_side": ex_pos.side,
                     "exchange_size": str(ex_pos.size),
@@ -161,21 +175,34 @@ class Reconciler:
                 }
                 report.diffs.append(diff)
                 report.orphan_positions += 1
-                session.add(
-                    Position(
-                        strategy_id=strategy_id,
-                        bucket_id=bucket_id,
-                        strategy_name=strategy_name,
-                        broker=self._broker_name,
-                        symbol=sym,
-                        side=side,
-                        quantity=ex_pos.size,
-                        entry_price=ex_pos.entry_price,
-                        leverage=ex_pos.leverage,
-                        liquidation_price=ex_pos.liquidation_price,
-                        opened_at=self._clock.now(),
+                if existing_flat is not None:
+                    existing_flat.bucket_id = bucket_id or existing_flat.bucket_id
+                    existing_flat.strategy_name = (
+                        strategy_name or existing_flat.strategy_name
                     )
-                )
+                    existing_flat.side = side
+                    existing_flat.quantity = ex_pos.size
+                    existing_flat.entry_price = ex_pos.entry_price
+                    existing_flat.leverage = ex_pos.leverage
+                    existing_flat.liquidation_price = ex_pos.liquidation_price
+                    existing_flat.opened_at = self._clock.now()
+                    existing_flat.closed_at = None
+                else:
+                    session.add(
+                        Position(
+                            strategy_id=strategy_id,
+                            bucket_id=bucket_id,
+                            strategy_name=strategy_name,
+                            broker=self._broker_name,
+                            symbol=sym,
+                            side=side,
+                            quantity=ex_pos.size,
+                            entry_price=ex_pos.entry_price,
+                            leverage=ex_pos.leverage,
+                            liquidation_price=ex_pos.liquidation_price,
+                            opened_at=self._clock.now(),
+                        )
+                    )
                 session.add(
                     AuditLog(
                         strategy_id=strategy_id,

@@ -29,8 +29,14 @@ def _nightly_export() -> None:
     try:
         path = export_trades()
         if path:
-            upload_to_gdrive(path)
-            send_alert(f"Nightly export done: {path.name}")
+            uploaded = upload_to_gdrive(path)
+            if uploaded:
+                send_alert(f"Nightly export done + uploaded to GDrive: {path.name}")
+            else:
+                send_alert(
+                    f"Nightly export done LOCAL ONLY (GDrive upload skipped/failed): "
+                    f"{path.name}"
+                )
         else:
             _log.info("nightly_export_no_trades")
     except Exception:
