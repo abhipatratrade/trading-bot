@@ -37,8 +37,8 @@
             {% endif %}
           </h3>
           <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
-          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr }}</span></div>
-          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr }}</span></div>
+          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr|num3 }}</span></div>
+          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr|num3 }}</span></div>
           <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
           <div class="row"><span class="lab">Regime</span>
             <span>
@@ -69,8 +69,8 @@
             {% endif %}
           </h3>
           <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
-          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr }}</span></div>
-          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr }}</span></div>
+          <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr|num3 }}</span></div>
+          <div class="row"><span class="lab">Available</span><span>{{ c.available_inr|num3 }}</span></div>
           <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
           <div class="row"><span class="lab">Regime</span>
             <span>

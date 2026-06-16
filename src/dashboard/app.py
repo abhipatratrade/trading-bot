@@ -22,10 +22,21 @@ _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
+def _num3(value: object) -> str:
+    """Render Decimal/float/int with 3 decimal places. ``None`` → em-dash."""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):.3f}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Trading Bot Dashboard", docs_url=None, redoc_url=None)
 
     templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+    templates.env.filters["num3"] = _num3
     app.state.templates = templates
 
     @app.exception_handler(Exception)

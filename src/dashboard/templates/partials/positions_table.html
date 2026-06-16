@@ -19,10 +19,10 @@
             <td>{{ p.broker }}</td>
             <td>{{ p.symbol }}</td>
             <td><span class="badge {% if p.side == 'long' %}badge-green{% else %}badge-red{% endif %}">{{ p.side }}</span></td>
-            <td>{{ p.quantity }}</td>
-            <td>{{ p.entry_price }}</td>
-            <td>{{ p.leverage }}</td>
-            <td>{{ p.liquidation_price }}</td>
+            <td>{{ p.quantity|num3 }}</td>
+            <td>{{ p.entry_price|num3 }}</td>
+            <td>{{ p.leverage|num3 }}</td>
+            <td>{{ p.liquidation_price|num3 }}</td>
         </tr>
         {% endfor %}
     </tbody>

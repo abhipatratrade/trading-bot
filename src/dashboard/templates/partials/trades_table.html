@@ -17,8 +17,8 @@
             <td>{{ t.strategy_id }}</td>
             <td>{{ t.symbol }}</td>
             <td><span class="badge {% if t.side == 'buy' %}badge-green{% else %}badge-red{% endif %}">{{ t.side }}</span></td>
-            <td>{{ t.quantity }}</td>
-            <td>{{ t.price }}</td>
+            <td>{{ t.quantity|num3 }}</td>
+            <td>{{ t.price|num3 }}</td>
             <td>
                 {% if t.status == 'filled' %}
                     <span class="badge badge-green">{{ t.status }}</span>

@@ -7,7 +7,7 @@
     <h1 style="margin:0">{{ bucket.id }}</h1>
     <div style="color:#8b949e;font-size:0.85rem">
       {{ bucket.trading_type|capitalize }} · {{ bucket.market|capitalize }} ·
-      {{ bucket.broker }} · max {{ bucket.leverage_max }}x · capital {{ bucket.capital_inr }}
+      {{ bucket.broker }} · max {{ bucket.leverage_max }}x · capital {{ bucket.capital_inr|num3 }}
       {% if bucket.enabled %}
         <span class="badge badge-green">live</span>
       {% else %}
@@ -21,8 +21,8 @@
 <div class="section" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem">
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Available</div>
-    <div style="font-size:1.4rem;font-weight:600">{{ state.available_inr }}</div>
-    <div style="color:#8b949e;font-size:0.75rem">locked: {{ state.locked_inr }}</div>
+    <div style="font-size:1.4rem;font-weight:600">{{ state.available_inr|num3 }}</div>
+    <div style="color:#8b949e;font-size:0.75rem">locked: {{ state.locked_inr|num3 }}</div>
   </div>
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Regime</div>
@@ -122,9 +122,9 @@
           {% if r.side == 'long' %}<span class="badge badge-green">{{ r.side }}</span>
           {% else %}<span class="badge badge-red">{{ r.side }}</span>{% endif %}
         </td>
-        <td>{{ r.quantity }}</td>
-        <td>{{ r.entry_price }}</td>
-        <td>{{ r.leverage }}x</td>
+        <td>{{ r.quantity|num3 }}</td>
+        <td>{{ r.entry_price|num3 }}</td>
+        <td>{{ r.leverage|num3 }}x</td>
         <td>{{ r.opened_at }}</td>
       </tr>
       {% endfor %}
@@ -176,8 +176,8 @@
         <td><strong>{{ t.symbol }}</strong></td>
         <td>{{ t.strategy_name }}</td>
         <td>{{ t.side }}</td>
-        <td>{{ t.quantity }}</td>
-        <td>{{ t.price }}</td>
+        <td>{{ t.quantity|num3 }}</td>
+        <td>{{ t.price|num3 }}</td>
         <td>
           {% if t.status == 'filled' %}<span class="badge badge-green">{{ t.status }}</span>
           {% elif t.status in ('rejected','canceled') %}<span class="badge badge-red">{{ t.status }}</span>
