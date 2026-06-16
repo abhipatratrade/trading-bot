@@ -1,6 +1,7 @@
 # Universe selection for longterm-crypto.
 # Phase 1: top 5 perps on Delta India by 24h notional volume,
 # constrained to symbols also listed on Binance (signal feed).
+# (auto-deploy smoke test 2026-06-16 — no behavioural change)
 
 universe_size: 5
 
