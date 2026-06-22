@@ -60,13 +60,29 @@ class DeltaIndiaClient(Broker):
             result = client.place_order(request)
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """Construct a Delta India client.
+
+        Pass explicit ``api_key`` / ``api_secret`` / ``base_url`` to target a
+        specific sub-account (Decision 019). When omitted, credentials fall
+        back to the active-mode ``Settings`` properties (the original single
+        "default" account) so smoke scripts and tests keep working.
+        """
         self._settings = settings or get_settings()
         self._log = get_logger("brokers.delta_india")
-        self._api_key = self._settings.delta_api_key.get_secret_value()
-        self._api_secret = self._settings.delta_api_secret.get_secret_value()
+        self._api_key = api_key or self._settings.delta_api_key.get_secret_value()
+        self._api_secret = (
+            api_secret or self._settings.delta_api_secret.get_secret_value()
+        )
         self._http = httpx.Client(
-            base_url=self._settings.delta_base_url,
+            base_url=base_url or self._settings.delta_base_url,
             timeout=10.0,
             headers={"User-Agent": "trading-bot/0.1.0"},
         )

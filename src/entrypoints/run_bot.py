@@ -69,19 +69,10 @@ def main() -> None:
     except Exception:
         _log.warning("outbound_ip_check_failed")
 
-    # ── Clients ─────────────────────────────────────────────────────────
-    delta_client = DeltaIndiaClient(settings)
+    # ── Shared market data ──────────────────────────────────────────────
+    # Public Delta market data is account-agnostic — one shared instance.
+    # Execution clients are built per sub-account below, after buckets load.
     delta_data = DeltaIndiaData(settings)
-
-    brokers: dict[BrokerName, Broker] = {BrokerName.DELTA_INDIA: delta_client}
-    order_managers: dict[BrokerName, OrderManager] = {
-        BrokerName.DELTA_INDIA: OrderManager(
-            delta_client, BrokerName.DELTA_INDIA, clock
-        ),
-    }
-    # Dhan adapter lands in Phase 3 — Indian buckets stay disabled until then.
-
-    reconciler = Reconciler(delta_client, BrokerName.DELTA_INDIA)
 
     # ── Symbol mappings ─────────────────────────────────────────────────
     _log.info("refreshing_symbol_mappings")
@@ -116,6 +107,46 @@ def main() -> None:
 
     # ── Buckets ─────────────────────────────────────────────────────────
     all_buckets = load_buckets()
+
+    # ── Per-account execution clients (Decision 019) ────────────────────
+    # Each crypto bucket trades on its own Delta India sub-account so
+    # positions, leverage, and margin are isolated. Build one client +
+    # OrderManager + Reconciler per distinct account_ref among enabled
+    # crypto buckets; each reconciler is scoped to its account's bucket(s).
+    accounts: dict[str, list[str]] = {}
+    for bucket in all_buckets:
+        if not bucket.config.enabled or bucket.market != Market.CRYPTO:
+            continue
+        if bucket.config.broker != BrokerName.DELTA_INDIA:
+            continue
+        accounts.setdefault(bucket.config.account_ref, []).append(bucket.id)
+
+    brokers: dict[str, Broker] = {}
+    order_managers: dict[str, OrderManager] = {}
+    reconcilers: dict[str, Reconciler] = {}
+    for ref, ref_bucket_ids in accounts.items():
+        try:
+            creds = settings.delta_account(ref)  # fail-fast (House Rule #6)
+        except ValueError:
+            _log.error("delta_account_creds_missing", account_ref=ref, exc_info=True)
+            send_alert(
+                f"[bot] Missing Delta credentials for account_ref={ref!r} "
+                f"(buckets {ref_bucket_ids}) — bot cannot start"
+            )
+            raise
+        client = DeltaIndiaClient(
+            settings,
+            api_key=creds.api_key,
+            api_secret=creds.api_secret,
+            base_url=creds.base_url,
+        )
+        brokers[ref] = client
+        order_managers[ref] = OrderManager(client, BrokerName.DELTA_INDIA, clock)
+        reconcilers[ref] = Reconciler(
+            client, BrokerName.DELTA_INDIA, clock, bucket_ids=ref_bucket_ids
+        )
+        _log.info("delta_account_ready", account_ref=ref, buckets=ref_bucket_ids)
+
     runners: list[BucketRunner] = []
     for bucket in all_buckets:
         if not bucket.config.enabled:
@@ -156,19 +187,21 @@ def main() -> None:
         send_alert("[bot] No enabled buckets — nothing to do")
         return
 
-    # ── Startup reconcile ───────────────────────────────────────────────
+    # ── Startup reconcile (one pass per sub-account) ────────────────────
     _log.info("startup_reconcile")
-    try:
-        report = reconciler.run()
-        _log.info(
-            "startup_reconcile_done",
-            positions_updated=report.positions_updated,
-            positions_closed=report.positions_closed,
-            orphan_positions=report.orphan_positions,
-            orders_updated=report.orders_updated,
-        )
-    except Exception:
-        _log.error("startup_reconcile_failed", exc_info=True)
+    for ref, rec in reconcilers.items():
+        try:
+            report = rec.run()
+            _log.info(
+                "startup_reconcile_done",
+                account_ref=ref,
+                positions_updated=report.positions_updated,
+                positions_closed=report.positions_closed,
+                orphan_positions=report.orphan_positions,
+                orders_updated=report.orders_updated,
+            )
+        except Exception:
+            _log.error("startup_reconcile_failed", account_ref=ref, exc_info=True)
 
     # ── Audit + alert startup ───────────────────────────────────────────
     bucket_ids = [r.bucket.id for r in runners]
@@ -221,10 +254,13 @@ def main() -> None:
         global _tick_count
         _tick_count += 1
         if _tick_count % 5 == 0:
-            try:
-                reconciler.run()
-            except Exception:
-                _log.error("periodic_reconcile_failed", exc_info=True)
+            for ref, rec in reconcilers.items():
+                try:
+                    rec.run()
+                except Exception:
+                    _log.error(
+                        "periodic_reconcile_failed", account_ref=ref, exc_info=True
+                    )
 
         for _ in range(TICK_INTERVAL_SECONDS):
             if _shutdown:
@@ -241,7 +277,11 @@ def main() -> None:
             )
         )
     send_alert("Bot shutting down")
-    delta_client.close()
+    for client in brokers.values():
+        try:
+            client.close()
+        except Exception:
+            _log.warning("client_close_failed", exc_info=True)
     delta_data.close()
     _log.info("bot_stopped")
 

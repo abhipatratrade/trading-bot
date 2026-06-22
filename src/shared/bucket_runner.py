@@ -37,7 +37,6 @@ from src.core.logging import get_logger
 from src.core.models import (
     AuditEventType,
     AuditLog,
-    BrokerName,
     MarketRegime,
     SizingDecision,
 )
@@ -87,9 +86,9 @@ class BucketRunner:
         self,
         *,
         bucket: Bucket,
-        brokers: Mapping[BrokerName, Broker],
+        brokers: Mapping[str, Broker],
         data: MarketData,
-        order_managers: Mapping[BrokerName, OrderManager],
+        order_managers: Mapping[str, OrderManager],
         clock: Clock | None = None,
     ) -> None:
         self.bucket = bucket
@@ -129,13 +128,14 @@ class BucketRunner:
             _log.info("bucket_kill_switch_skip", bucket_id=self.bucket.id)
             return _empty_summary(self.bucket.id)
 
-        broker = self._brokers.get(self.bucket.config.broker)
-        order_manager = self._oms.get(self.bucket.config.broker)
+        account_ref = self.bucket.config.account_ref
+        broker = self._brokers.get(account_ref)
+        order_manager = self._oms.get(account_ref)
         if broker is None or order_manager is None:
             _log.warning(
                 "bucket_broker_unavailable",
                 bucket_id=self.bucket.id,
-                wanted=self.bucket.config.broker.value,
+                wanted=account_ref,
             )
             return _empty_summary(self.bucket.id)
 

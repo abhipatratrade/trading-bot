@@ -55,11 +55,29 @@ class Reconciler:
         broker: Broker,
         broker_name: BrokerName,
         clock: Clock | None = None,
+        bucket_ids: list[str] | None = None,
     ) -> None:
         self._broker = broker
         self._broker_name = broker_name
         self._clock = clock or RealClock()
         self._log = get_logger("order_manager.reconciler")
+        # Decision 019: with one sub-account per bucket, every reconciler is
+        # scoped to the bucket(s) on its account so it never sweeps another
+        # bucket's rows. ``None`` keeps the legacy broker-wide behaviour
+        # (used by single-account smoke scripts / tests).
+        self._bucket_ids = bucket_ids
+
+    def _scope_positions(self) -> list[Any]:
+        """Extra WHERE clauses restricting Position rows to this account's buckets."""
+        if self._bucket_ids is None:
+            return []
+        return [Position.bucket_id.in_(self._bucket_ids)]
+
+    def _scope_trades(self) -> list[Any]:
+        """Extra WHERE clauses restricting Trade rows to this account's buckets."""
+        if self._bucket_ids is None:
+            return []
+        return [Trade.bucket_id.in_(self._bucket_ids)]
 
     def run(self) -> ReconcileReport:
         """Full reconciliation pass: positions then orders."""
@@ -94,12 +112,14 @@ class Reconciler:
         }
 
         with session_scope() as session:
-            # All non-flat DB positions for this broker
+            # All non-flat DB positions for this broker, scoped to the
+            # bucket(s) on this sub-account (Decision 019).
             db_positions = list(
                 session.execute(
                     select(Position).where(
                         Position.broker == self._broker_name,
                         Position.side != PositionSide.FLAT,
+                        *self._scope_positions(),
                     )
                 ).scalars()
             )
@@ -269,6 +289,7 @@ class Reconciler:
                 Trade.broker == self._broker_name,
                 Trade.symbol == symbol,
                 Trade.status == OrderStatus.FILLED,
+                *self._scope_trades(),
             )
             .order_by(Trade.created_at.desc())
             .limit(1)
@@ -289,6 +310,7 @@ class Reconciler:
                             OrderStatus.PENDING,
                             OrderStatus.OPEN,
                         ]),
+                        *self._scope_trades(),
                     )
                 ).scalars()
             )

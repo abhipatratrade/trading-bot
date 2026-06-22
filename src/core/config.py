@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +26,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class TradingMode(StrEnum):
     TESTNET = "testnet"
     LIVE = "live"
+
+
+class DeltaAccount(NamedTuple):
+    """Resolved Delta India credentials for one (sub-)account + mode."""
+
+    api_key: str
+    api_secret: str
+    base_url: str
+    ws_url: str
 
 
 class LogFormat(StrEnum):
@@ -62,6 +71,26 @@ class Settings(BaseSettings):
     delta_live_api_secret: SecretStr | None = None
     delta_live_base_url: str = "https://api.india.delta.exchange"
     delta_live_ws_url: str = "wss://socket.india.delta.exchange"
+
+    # -- Delta India sub-accounts (Decision 019) ----------------------------
+    # One sub-account per crypto bucket so positions/leverage/margin are
+    # isolated per bucket. ``account_ref: default`` (longterm-crypto) reuses
+    # the keys above; the named accounts below are added per phase. base_url
+    # / ws_url are shared (same exchange) and resolved from the active mode.
+    delta_swing_testnet_api_key: SecretStr | None = None
+    delta_swing_testnet_api_secret: SecretStr | None = None
+    delta_swing_live_api_key: SecretStr | None = None
+    delta_swing_live_api_secret: SecretStr | None = None
+
+    delta_scalp_testnet_api_key: SecretStr | None = None
+    delta_scalp_testnet_api_secret: SecretStr | None = None
+    delta_scalp_live_api_key: SecretStr | None = None
+    delta_scalp_live_api_secret: SecretStr | None = None
+
+    delta_gamble_testnet_api_key: SecretStr | None = None
+    delta_gamble_testnet_api_secret: SecretStr | None = None
+    delta_gamble_live_api_key: SecretStr | None = None
+    delta_gamble_live_api_secret: SecretStr | None = None
 
     # -- Binance (public market data only) ----------------------------------
     binance_rest_url: str = "https://fapi.binance.com"
@@ -156,6 +185,37 @@ class Settings(BaseSettings):
             self.delta_testnet_ws_url
             if self.trading_mode == TradingMode.TESTNET
             else self.delta_live_ws_url
+        )
+
+    def delta_account(self, account_ref: str) -> DeltaAccount:
+        """Resolve credentials for a Delta India (sub-)account in the active mode.
+
+        ``account_ref == "default"`` returns the top-level keys (the original
+        single account — used by longterm-crypto). Named refs resolve to
+        ``delta_<ref>_<mode>_api_key`` / ``_api_secret`` fields. Raises
+        ``ValueError`` (fail-fast, House Rule #6) if the keys for an account
+        the bot actually needs are missing for the current mode.
+        """
+        mode = "testnet" if self.trading_mode == TradingMode.TESTNET else "live"
+        if account_ref == "default":
+            key_attr = f"delta_{mode}_api_key"
+            secret_attr = f"delta_{mode}_api_secret"
+        else:
+            key_attr = f"delta_{account_ref}_{mode}_api_key"
+            secret_attr = f"delta_{account_ref}_{mode}_api_secret"
+
+        key: SecretStr | None = getattr(self, key_attr, None)
+        secret: SecretStr | None = getattr(self, secret_attr, None)
+        if key is None or secret is None:
+            raise ValueError(
+                f"Missing Delta credentials for account_ref={account_ref!r} "
+                f"(mode={mode}); set {key_attr.upper()} and {secret_attr.upper()}"
+            )
+        return DeltaAccount(
+            api_key=key.get_secret_value(),
+            api_secret=secret.get_secret_value(),
+            base_url=self.delta_base_url,
+            ws_url=self.delta_ws_url,
         )
 
     @property

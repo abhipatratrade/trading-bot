@@ -37,6 +37,44 @@ def test_longterm_crypto_resolves() -> None:
     assert b.strategy_master_csv_path.is_file()
 
 
+def test_account_refs_isolated_per_crypto_bucket() -> None:
+    """Decision 019: each crypto bucket maps to its own sub-account; the
+    longterm bucket reuses the original 'default' account."""
+    buckets = {b.id: b for b in load_buckets()}
+    assert buckets["longterm-crypto"].config.account_ref == "default"
+    crypto_refs = {
+        buckets[bid].config.account_ref
+        for bid in (
+            "longterm-crypto",
+            "swing-crypto",
+            "scalp-crypto",
+            "gambling-crypto",
+        )
+    }
+    # Four crypto buckets → four distinct accounts (no shared netting).
+    assert len(crypto_refs) == 4
+
+
+def test_account_ref_defaults_when_absent(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "buckets.yaml"
+    yaml_path.write_text(
+        "buckets:\n"
+        "  longterm-crypto:\n"
+        "    capital_inr: 50000\n"
+        "    broker: delta_india\n"
+        "    leverage_max: 5\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    buckets = {
+        b.id: b
+        for b in load_buckets(
+            buckets_yaml=yaml_path, strategies_root=tmp_path / "strategies"
+        )
+    }
+    assert buckets["longterm-crypto"].config.account_ref == "default"
+
+
 def test_missing_folder_raises(tmp_path: Path) -> None:
     yaml_path = tmp_path / "buckets.yaml"
     yaml_path.write_text(

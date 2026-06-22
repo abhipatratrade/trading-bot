@@ -7,30 +7,38 @@
 # The bucket_state Postgres table is seeded with these values by migration
 # 0002 and updated live by the reconciler.
 
+# Decision 019 — each crypto bucket trades on its own Delta India sub-account
+# (account_ref → DELTA_<REF>_<MODE>_API_KEY/_SECRET). ``default`` reuses the
+# original keys (the account longterm-crypto is already soaking on). New
+# sub-accounts are provisioned per phase as each bucket comes online.
 buckets:
   longterm-crypto:
     capital_inr: 50000
     broker: delta_india
     leverage_max: 5
     enabled: true
+    account_ref: default
 
   swing-crypto:
     capital_inr: 50000
     broker: delta_india
     leverage_max: 10
     enabled: false   # Phase 2
+    account_ref: swing
 
   scalp-crypto:
     capital_inr: 50000
     broker: delta_india
     leverage_max: 25
     enabled: false   # Phase 5
+    account_ref: scalp
 
   gambling-crypto:
     capital_inr: 50000
     broker: delta_india
     leverage_max: 100
     enabled: false   # Phase 6
+    account_ref: gamble
 
   longterm-indian:
     capital_inr: 50000

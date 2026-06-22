@@ -56,6 +56,10 @@ class BucketConfig(BaseModel):
     broker: BrokerName
     leverage_max: Decimal = Field(ge=1)
     enabled: bool = True
+    # Which broker (sub-)account this bucket trades on (Decision 019). Crypto
+    # buckets each get their own Delta India sub-account so positions,
+    # leverage, and margin are isolated. ``default`` reuses the original keys.
+    account_ref: str = "default"
 
 
 class BucketsConfig(BaseModel):

@@ -358,3 +358,57 @@ Consequences:
 - This is a behaviour change vs the previously-committed sizer; old
   testnet runs would have skipped most leveraged candidates. Phase 1
   exit criterion still requires 14 clean testnet days post-change.
+
+---
+
+## 019 — One Delta India sub-account per crypto bucket
+Date: 2026-06-17
+Status: Accepted
+Refines: 013
+
+Decision: Each crypto bucket trades on its **own Delta India sub-account**
+(separate API key/secret), instead of all crypto buckets sharing one
+account. A bucket's `account_ref` in `buckets.yaml` selects its credential
+set (`DELTA_<REF>_<MODE>_API_KEY/_SECRET`); `account_ref: default` reuses the
+original top-level keys.
+
+Rationale: A perp exchange nets positions **per symbol per account**. With a
+shared account, two buckets trading the same coin (e.g. BTC in longterm and
+swing) collapse into one exchange position, which breaks Decision 013's
+per-bucket isolation in three ways:
+1. **Leverage collision (hard blocker):** leverage is per-symbol per-account,
+   so the 5x/10x/25x/100x ladder is unsatisfiable on one account — the last
+   `set_leverage` wins.
+2. **Cross-bucket interference / shared liquidation:** opposing or
+   same-direction signals net together; a 100x gambling position can
+   liquidate the longterm position because they are one position.
+3. **Reconciler can't attribute** a netted position to the owning bucket.
+
+A sub-account per bucket maps "isolated capital" 1:1 onto "isolated account":
+own netted position, own per-symbol leverage, own margin pool.
+
+Scope / mechanics:
+- Confined to the execution-wiring layer. `run_bot` builds one
+  `DeltaIndiaClient` + `OrderManager` + `Reconciler` per distinct
+  `account_ref` among enabled crypto buckets; `BucketRunner` resolves its
+  broker/OM by `account_ref`. Strategy/scanner/regime/allocator logic is
+  unchanged.
+- **Reconciler scoping:** each per-account reconciler restricts its DB
+  queries to `Position.bucket_id` / `Trade.bucket_id` in its account's
+  bucket(s), so it never sweeps another bucket's rows. The cross-bucket
+  orphan-attribution heuristic collapses (an orphan on a sub-account belongs
+  to that bucket).
+- **No DB migration:** `Trade`/`Position` already carry `bucket_id`; `broker`
+  stays `DELTA_INDIA` for all sub-accounts (same exchange).
+- Public market data (`DeltaIndiaData`, Binance) stays a single shared
+  instance — only execution is per-account.
+
+Consequences:
+- The **current account becomes `longterm-crypto`'s sub-account** (`default`)
+  — no disruption to the in-progress soak. New sub-accounts are provisioned
+  per phase (swing P2, scalp P5, gamble P6), each whitelisting the VM IP and
+  funded separately.
+- `Settings.delta_account(ref)` fails fast at startup if an enabled bucket's
+  credentials are missing for the active mode (House Rule #6).
+- The Indian/Dhan buckets face the same netting issue within Dhan; that is a
+  separate, later application of this decision in Phase 3+.
