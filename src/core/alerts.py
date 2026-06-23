@@ -6,16 +6,28 @@ Usage::
     from src.core.alerts import send_alert
     send_alert("Order filled: BUY 10 BTCUSD @ 65000")
 
-For noisy repeating failures use ``send_alert_dedup`` so the same
-(key, message) pair stops pinging after a few hits::
+For noisy repeating failures use ``send_alert_dedup``: it sends at most
+``max_count`` pings per ``window_seconds`` for a given key, then re-arms
+once the window elapses — so a transient error that recurs later is not
+silently swallowed::
 
     send_alert_dedup(
         f"tick_error:{bucket_id}",
         f"[bot] tick error in {bucket_id}",
     )
+
+When the underlying condition clears, call ``note_alert_recovery`` with
+the same key to emit a one-off "recovered" ping and reset the counter::
+
+    note_alert_recovery(
+        f"tick_error:{bucket_id}",
+        f"[bot] {bucket_id} recovered",
+    )
 """
 
 from __future__ import annotations
+
+import time
 
 import httpx
 
@@ -25,7 +37,15 @@ from src.core.logging import get_logger
 _log = get_logger("core.alerts")
 
 _DEFAULT_DEDUP_MAX = 3
-_dedup_counters: dict[str, int] = {}
+_DEFAULT_DEDUP_WINDOW_SECONDS = 3600.0
+
+# key -> (count_in_current_window, window_start_monotonic). The window is
+# what makes suppression self-healing: once it elapses the key re-arms,
+# so an error that stops and recurs later still pages. The old purely
+# count-based counter went permanently quiet after ``max_count`` hits
+# until the process restarted (journal 2026-06-23: a transient tick
+# error silenced its own channel for ~6h).
+_dedup_state: dict[str, tuple[int, float]] = {}
 
 
 def send_alert(message: str) -> bool:
@@ -54,30 +74,55 @@ def send_alert(message: str) -> bool:
 
 
 def send_alert_dedup(
-    key: str, message: str, max_count: int = _DEFAULT_DEDUP_MAX
+    key: str,
+    message: str,
+    max_count: int = _DEFAULT_DEDUP_MAX,
+    window_seconds: float = _DEFAULT_DEDUP_WINDOW_SECONDS,
 ) -> bool:
-    """Send an alert but suppress further pings once ``key`` hits ``max_count``.
+    """Send an alert, capped at ``max_count`` pings per ``window_seconds``.
 
-    The counter lives in-process and resets only on restart. Calls 1..N-1
-    send the bare message; the Nth (default 3rd) appends a one-line
-    "further alerts suppressed" notice so the user knows the channel for
-    that key is going quiet. Calls N+1 and beyond are dropped silently.
+    Within a window, calls 1..N-1 send the bare message and the Nth
+    appends a one-line "suppressed for up to Xm" notice; calls N+1 and
+    beyond are dropped. Once ``window_seconds`` elapses since the window
+    opened, the key re-arms automatically — so a recurring-but-transient
+    error keeps paging (bounded to ``max_count`` per window) instead of
+    going permanently silent until restart.
     """
-    count = _dedup_counters.get(key, 0) + 1
-    _dedup_counters[key] = count
+    now = time.monotonic()
+    count, window_start = _dedup_state.get(key, (0, now))
+    if now - window_start >= window_seconds:
+        count, window_start = 0, now
+    count += 1
+    _dedup_state[key] = (count, window_start)
 
     if count > max_count:
         return False
     if count == max_count:
+        minutes = max(1, int(window_seconds // 60))
         message = (
-            f"{message}\n(further alerts for this key suppressed until restart)"
+            f"{message}\n(further alerts for this key suppressed for up "
+            f"to {minutes}m)"
         )
+    return send_alert(message)
+
+
+def note_alert_recovery(key: str, message: str) -> bool:
+    """Signal that ``key``'s condition has cleared.
+
+    If the key fired at least once in the current window, send a one-off
+    recovery ``message`` and reset its state so the next failure pages
+    immediately. No-op (returns False) when the key was already quiet, so
+    it is cheap to call on every success.
+    """
+    if key not in _dedup_state:
+        return False
+    del _dedup_state[key]
     return send_alert(message)
 
 
 def reset_alert_dedup(key: str | None = None) -> None:
     """Clear one or all dedup counters. Test helper."""
     if key is None:
-        _dedup_counters.clear()
+        _dedup_state.clear()
     else:
-        _dedup_counters.pop(key, None)
+        _dedup_state.pop(key, None)

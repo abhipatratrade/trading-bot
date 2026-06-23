@@ -20,7 +20,7 @@ import time
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
-from src.core.alerts import send_alert, send_alert_dedup
+from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
 from src.core.clock import RealClock
 from src.core.config import get_settings
 from src.core.db import session_scope
@@ -235,6 +235,12 @@ def main() -> None:
         for runner in runners:
             try:
                 runner.run_once()
+                # If this bucket had been paging tick errors, tell the
+                # user it's healthy again (and re-arm the dedup channel).
+                note_alert_recovery(
+                    f"tick_error:{runner.bucket.id}",
+                    f"[bot] {runner.bucket.id} recovered — ticks succeeding again",
+                )
             except KeyboardInterrupt:
                 _shutdown = True
                 break
