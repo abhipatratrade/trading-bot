@@ -25,6 +25,47 @@ _CSV_COLUMNS = [
     "listed_on_delta",
 ]
 
+# Curated Delta<->Binance mappings for coins that exist on Delta India
+# mainnet but are absent from the (much smaller) testnet product list.
+# Without these the live fetch leaves ``delta_symbol`` blank when the bot
+# points at testnet, so the per-coin regime retrain can't translate the
+# symbol and skips it (logs ``regime_train_missing_binance_mapping``).
+# Override only fills blanks, so a mainnet fetch that already populated
+# the mapping always wins. ``listed_on_delta`` is left to the live fetch,
+# so the trading scanner still won't pick a symbol the venue can't fill.
+_TRAINING_MAPPING_OVERRIDES: dict[str, dict[str, str]] = {
+    # canonical (base asset): {delta_symbol, binance_symbol}
+    "BNB": {"delta_symbol": "BNBUSD", "binance_symbol": "BNBUSDT"},
+}
+
+
+def _apply_training_overrides(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Backfill curated mappings (see ``_TRAINING_MAPPING_OVERRIDES``).
+
+    Mutates and returns ``rows``. Only fills blank fields, so a live
+    mainnet fetch that already populated the mapping is never overwritten.
+    """
+    by_base = {r["canonical_symbol"]: r for r in rows}
+    for base, ov in _TRAINING_MAPPING_OVERRIDES.items():
+        row = by_base.get(base)
+        if row is None:
+            row = {
+                "canonical_symbol": base,
+                "binance_symbol": "",
+                "delta_symbol": "",
+                "listed_on_binance": False,
+                "listed_on_delta": False,
+            }
+            rows.append(row)
+        if not row["delta_symbol"]:
+            row["delta_symbol"] = ov["delta_symbol"]
+        if not row["binance_symbol"]:
+            row["binance_symbol"] = ov["binance_symbol"]
+            row["listed_on_binance"] = True
+    return rows
+
 
 def fetch_mappings(
     binance: BinanceData | None = None,
@@ -75,6 +116,8 @@ def fetch_mappings(
             }
         )
 
+    _apply_training_overrides(rows)
+
     both = sum(1 for r in rows if r["listed_on_binance"] and r["listed_on_delta"])
     log.info(
         "mappings_fetched",
@@ -105,7 +148,7 @@ def load_csv(path: Path = DEFAULT_CSV) -> list[dict[str, Any]]:
     for r in rows:
         r["listed_on_binance"] = r["listed_on_binance"] == "True"
         r["listed_on_delta"] = r["listed_on_delta"] == "True"
-    return rows
+    return _apply_training_overrides(rows)
 
 
 def load_to_db(rows: list[dict[str, Any]]) -> int:

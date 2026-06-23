@@ -1,0 +1,26 @@
+# VM-side regime-model retrain (Decision 020).
+#
+# The retrain trains HMMs on Binance Futures klines. Binance geo-blocks
+# Railway's region, so the job MUST run from the Mumbai VM (where Binance
+# is reachable — the bot's own symbol-mapping fetch proves it). This
+# replaces the APScheduler retrain that used to run in the Railway
+# scheduler and silently fetch_failed every week.
+#
+# Driven by regime-retrain.timer. ``--due`` retrains only buckets whose
+# regime.yaml retrain_cadence is due today (weekly -> Mondays UTC).
+#
+# NOT auto-applied by the deploy timer. After editing, re-copy by hand:
+#   sudo cp ops/regime-retrain.service ops/regime-retrain.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now regime-retrain.timer
+
+[Unit]
+Description=Regime model retrain (VM-side; Binance geo-blocks Railway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kohinoor_abhi
+WorkingDirectory=/home/kohinoor_abhi/trading-bot
+ExecStart=/home/kohinoor_abhi/trading-bot/.venv/bin/python -m src.shared.regime.retrain_job --due
+EnvironmentFile=/home/kohinoor_abhi/.env

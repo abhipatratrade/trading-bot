@@ -30,16 +30,18 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 
 import pandas as pd
 from sqlalchemy import select
 
+from src.core.alerts import send_alert
 from src.core.clock import RealClock
 from src.core.db import session_scope
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, SymbolMapping
 from src.data_sources.binance import BinanceData
-from src.shared.bucket import Market, load_bucket
+from src.shared.bucket import Market, load_bucket, load_buckets
 from src.shared.regime.brain import RegimeConfig, load_regime_config
 from src.shared.regime.features import compute_features
 from src.shared.regime.hmm_model import RegimeModel
@@ -324,23 +326,104 @@ def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Scheduling — which buckets to retrain
+# ---------------------------------------------------------------------------
+# Per Decision 020 the retrain runs on the Mumbai VM (a systemd timer),
+# not the Railway scheduler: Binance Futures geo-blocks Railway's region,
+# so every Railway-side retrain fetch_failed. The VM reaches Binance fine.
+def _cadence_due_today(cadence: str, now: datetime) -> bool:
+    """Whether a bucket with ``cadence`` should retrain on ``now`` (UTC)."""
+    if cadence == "daily":
+        return True
+    if cadence == "weekly":
+        return now.weekday() == 0  # Monday
+    return False  # "manual" / unknown → never auto-runs
+
+
+def retrain_enabled_buckets(*, due_only: bool) -> dict[str, list[RetrainResult]]:
+    """Retrain every enabled crypto bucket whose regime brain is enabled.
+
+    When ``due_only`` is True a bucket retrains only if its
+    ``retrain_cadence`` is due today (daily always; weekly on Mondays;
+    manual never) — so a single daily timer honours per-bucket cadence.
+    """
+    now = RealClock().now()
+    out: dict[str, list[RetrainResult]] = {}
+    for bucket in load_buckets():
+        if not bucket.config.enabled or bucket.market != Market.CRYPTO:
+            continue
+        try:
+            cfg = load_regime_config(bucket.regime_yaml_path)
+        except FileNotFoundError:
+            continue
+        if not cfg.enabled:
+            continue
+        if due_only and not _cadence_due_today(cfg.retrain_cadence, now):
+            _log.info(
+                "regime_retrain_not_due",
+                bucket_id=bucket.id,
+                cadence=cfg.retrain_cadence,
+            )
+            continue
+        out[bucket.id] = retrain_bucket(bucket.id)
+    return out
+
+
+def _alert_summary(bucket_id: str, results: list[RetrainResult]) -> None:
+    """Telegram one-liner per retrained bucket (was the scheduler's job)."""
+    trained = sum(1 for r in results if r.status == "trained")
+    failed = sum(1 for r in results if r.status == "fetch_failed")
+    skipped = sum(1 for r in results if r.status == "skipped_low_data")
+    prefix = "⚠️ " if failed else ""
+    send_alert(
+        f"{prefix}Regime retrain {bucket_id}: "
+        f"trained={trained} fetch_failed={failed} skipped={skipped}"
+    )
+
+
 def main() -> None:
     configure_logging()
     parser = argparse.ArgumentParser(
-        description="Retrain a bucket's per-symbol HMM regime models"
+        description="Retrain bucket per-symbol HMM regime models"
     )
-    parser.add_argument(
-        "--bucket",
-        required=True,
-        help="bucket_id (e.g. longterm-crypto)",
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--bucket", help="retrain a single bucket_id")
+    target.add_argument(
+        "--all", action="store_true", help="retrain every enabled bucket"
+    )
+    target.add_argument(
+        "--due",
+        action="store_true",
+        help="retrain enabled buckets whose cadence is due today (timer mode)",
     )
     args = parser.parse_args()
-    results = retrain_bucket(args.bucket)
-    for r in results:
-        print(
-            f"  {r.bucket_id}/{r.symbol}  {r.status}  "
-            f"version={r.version}  tier={r.tier}  n_bars={r.n_bars}"
+
+    try:
+        if args.bucket:
+            results_by_bucket = {args.bucket: retrain_bucket(args.bucket)}
+        else:
+            results_by_bucket = retrain_enabled_buckets(due_only=args.due)
+    except Exception:
+        _log.exception("regime_retrain_failed")
+        send_alert(
+            "⚠️ Regime retrain FAILED — see VM logs "
+            "(journalctl -u regime-retrain)"
         )
+        raise
+
+    if not results_by_bucket:
+        _log.info("regime_retrain_nothing_due")
+        print("No buckets due for retrain.")
+        return
+
+    for bucket_id, results in results_by_bucket.items():
+        for r in results:
+            print(
+                f"  {r.bucket_id}/{r.symbol}  {r.status}  "
+                f"version={r.version}  tier={r.tier}  n_bars={r.n_bars}"
+            )
+        _alert_summary(bucket_id, results)
 
 
 if __name__ == "__main__":  # pragma: no cover

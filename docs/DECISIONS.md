@@ -412,3 +412,38 @@ Consequences:
   credentials are missing for the active mode (House Rule #6).
 - The Indian/Dhan buckets face the same netting issue within Dhan; that is a
   separate, later application of this decision in Phase 3+.
+
+## 020 — Regime retrain runs on the VM, not the Railway scheduler
+Date: 2026-06-23
+Status: Accepted
+Refines: 014
+
+Decision: The per-bucket HMM regime retrain runs on the **GCP Mumbai VM**
+via a `systemd` timer (`ops/regime-retrain.timer` → `.service`, calling
+`retrain_job --due`), **not** as an APScheduler job in the Railway
+`scheduler` service. The Railway-side retrain registration is removed.
+
+Rationale: The retrain trains on **Binance Futures klines**
+(`fapi.binance.com`), and Binance geo-blocks Railway's region — every
+Railway-side retrain returned `fetch_failed` / `n_bars=0` for all symbols.
+Confirmed 2026-06-23: the identical job run from the VM trained all 5
+symbols (Binance is reachable there, same as the bot's symbol-mapping
+fetch). Models had silently gone stale since the 2026-06-14 manual seed.
+
+Scope / mechanics:
+- One **daily** timer (02:00 UTC); the job's `--due` mode enforces each
+  bucket's `regime.yaml` `retrain_cadence` (weekly → Mondays, daily →
+  every day, manual → never), preserving the old per-bucket semantics with
+  a single timer. `--all` forces every enabled bucket; `--bucket <id>` runs
+  one.
+- The job posts the Telegram retrain summary itself (previously the
+  scheduler wrapper did). `nightly_export` stays on Railway.
+- Unit files are **not** auto-applied by the deploy pull-timer; they need a
+  one-off `daemon-reload` + `enable --now` on the VM (see runbook).
+
+Consequences:
+- Inference was never affected (it reads bars from Delta, not Binance), so
+  this only un-staled the regime models, not trading behaviour.
+- A future non-crypto (Dhan) bucket would not hit the Binance block, but
+  keeping all retrains on the VM timer is simplest; revisit if a bucket
+  ever needs a data source only reachable from Railway.

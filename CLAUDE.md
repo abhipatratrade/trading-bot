@@ -52,6 +52,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Architecture | Six (type × market) buckets w/ isolated capital — Decision 013 |
 | Execution accounts | One Delta India sub-account per crypto bucket — Decision 019 |
 | Regime | Per-bucket HMM at bucket TF (3-state bear/neutral/bull) — Decision 014 |
+| Regime retrain | VM systemd timer, not Railway (Binance geo-blocks Railway) — Decision 020 |
 | Sizing | Kelly on bucket capital, skip if insufficient — Decision 015 |
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |

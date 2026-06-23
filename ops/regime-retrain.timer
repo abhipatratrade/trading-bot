@@ -1,0 +1,23 @@
+# Fires regime-retrain.service daily at 02:00 UTC. The job itself (--due)
+# decides which buckets are actually due today, so weekly buckets retrain
+# only on Mondays while future daily buckets retrain every day — one timer
+# honours per-bucket cadence. See regime-retrain.service (Decision 020).
+#
+# Install + enable:
+#   sudo cp ops/regime-retrain.service ops/regime-retrain.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now regime-retrain.timer
+#   systemctl list-timers | grep regime-retrain   # confirm next-fire
+#
+# Run once on demand:  sudo systemctl start regime-retrain.service
+
+[Unit]
+Description=Daily trigger for regime-retrain.service (cadence enforced by the job)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+Persistent=true
+Unit=regime-retrain.service
+
+[Install]
+WantedBy=timers.target

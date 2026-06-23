@@ -74,6 +74,48 @@ systemctl list-timers | grep bot-deploy   # confirm next-fire
 
 ---
 
+## Regime retrain (runs on the VM, not Railway)
+
+The weekly regime-model retrain trains HMMs on **Binance Futures klines**.
+Binance geo-blocks Railway's region, so the retrain **must run on the
+Mumbai VM**, where Binance is reachable. It used to run in the Railway
+`scheduler` and silently `fetch_failed` every week (models went stale).
+Now it runs via a VM `systemd` timer — Decision 020.
+
+| Piece | What |
+|---|---|
+| `regime-retrain.timer` | Fires daily 02:00 UTC. |
+| `regime-retrain.service` | `oneshot`: `python -m src.shared.regime.retrain_job --due`. |
+| `--due` | Retrains only buckets whose `regime.yaml` `retrain_cadence` is due today (weekly → Mondays; daily → every day; manual → never). |
+
+The job posts a Telegram summary per bucket (`Regime retrain <bucket>:
+trained=N fetch_failed=N skipped=N`); a `⚠️` prefix means something
+failed.
+
+### Install (one-off; the deploy timer does NOT apply unit files)
+
+```bash
+cd ~/trading-bot && git pull origin main
+sudo cp ops/regime-retrain.service ops/regime-retrain.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now regime-retrain.timer
+systemctl list-timers | grep regime-retrain   # confirm next-fire
+```
+
+### Run / inspect
+
+```bash
+sudo systemctl start regime-retrain.service                 # run now (respects --due)
+sudo journalctl -u regime-retrain -n 50 --no-pager          # last run's output
+
+# Force a full retrain of every enabled bucket, ignoring cadence:
+cd ~/trading-bot && set -a && . ~/.env && set +a && \
+  .venv/bin/python -m src.shared.regime.retrain_job --all
+# Or a single bucket:  … retrain_job --bucket longterm-crypto
+```
+
+---
+
 ## Common checks
 
 ```bash
