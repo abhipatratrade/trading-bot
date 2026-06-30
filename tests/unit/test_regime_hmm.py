@@ -11,8 +11,9 @@ import pytest
 
 hmmlearn = pytest.importorskip("hmmlearn")
 
+from src.core.models import MarketRegime  # noqa: E402
 from src.shared.regime.features import compute_features  # noqa: E402
-from src.shared.regime.hmm_model import RegimeModel  # noqa: E402
+from src.shared.regime.hmm_model import RegimeModel, RegimePrediction  # noqa: E402
 
 
 def _synthetic_regime_bars(n: int = 600) -> pd.DataFrame:
@@ -49,3 +50,55 @@ class TestHMMRoundTrip:
         assert pred.regime == pred2.regime
         for k, v in pred.state_probabilities.items():
             assert abs(pred2.state_probabilities[k] - v) < 1e-6
+
+
+class TestMultiRestart:
+    def test_single_restart_uses_legacy_seed(self) -> None:
+        # n_restarts=1 must reproduce the legacy single fit (random_state=7).
+        feats = compute_features(_synthetic_regime_bars())
+        model = RegimeModel(
+            feature_columns=list(feats.columns), n_restarts=1
+        ).fit(feats)
+        assert model.chosen_seed == 7
+
+    def test_selection_is_deterministic(self) -> None:
+        feats = compute_features(_synthetic_regime_bars())
+        a = RegimeModel(feature_columns=list(feats.columns), n_restarts=4).fit(feats)
+        b = RegimeModel(feature_columns=list(feats.columns), n_restarts=4).fit(feats)
+        # Same fixed seed pool + same data → identical winner every time.
+        assert a.chosen_seed == b.chosen_seed
+        assert a.log_likelihood == pytest.approx(b.log_likelihood)
+        assert (
+            a.predict_latest(feats, model_version="v").regime
+            == b.predict_latest(feats, model_version="v").regime
+        )
+
+    def test_rejects_zero_restarts(self) -> None:
+        with pytest.raises(ValueError):
+            RegimeModel(feature_columns=["log_return"], n_restarts=0)
+
+
+class TestSignal:
+    def test_signal_three_state(self) -> None:
+        pred = RegimePrediction(
+            regime=MarketRegime.BULL,
+            state_probabilities={
+                MarketRegime.BEAR: 0.1,
+                MarketRegime.NEUTRAL: 0.3,
+                MarketRegime.BULL: 0.6,
+            },
+            model_version="v",
+        )
+        assert pred.signal == pytest.approx(0.5)
+
+    def test_signal_two_state(self) -> None:
+        # No NEUTRAL key — formula still holds (missing term is 0).
+        pred = RegimePrediction(
+            regime=MarketRegime.BEAR,
+            state_probabilities={
+                MarketRegime.BEAR: 0.7,
+                MarketRegime.BULL: 0.3,
+            },
+            model_version="v",
+        )
+        assert pred.signal == pytest.approx(-0.4)

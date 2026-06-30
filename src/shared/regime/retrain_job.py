@@ -29,8 +29,10 @@ plan for context.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import pandas as pd
 from sqlalchemy import select
@@ -43,15 +45,34 @@ from src.core.models import AuditEventType, AuditLog, SymbolMapping
 from src.data_sources.binance import BinanceData
 from src.shared.bucket import Market, load_bucket, load_buckets
 from src.shared.regime.brain import RegimeConfig, load_regime_config
+from src.shared.regime.diagnostics import persistence_diagnostic
 from src.shared.regime.features import compute_features
 from src.shared.regime.hmm_model import RegimeModel
 from src.shared.regime.store import MARKET_SENTINEL, save_model
+from src.shared.regime.verify import VerifyResult, verify_model
 
 _MIN_TRAIN_BARS: int = 150
 _TIER_FULL_MIN: int = 700
 _TIER_DIAG_MIN: int = 350
 
 _log = get_logger("shared.regime.retrain")
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Inf) with None.
+
+    Verification and diagnostic stats can carry NaN (e.g. a state that never
+    transitions out in the stride-sampled path). Postgres JSONB rejects
+    NaN/Infinity, so we scrub them before they reach ``extra`` / audit
+    ``payload`` columns.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +158,8 @@ def _delta_to_binance(delta_symbol: str) -> str | None:
 class RetrainResult:
     bucket_id: str
     symbol: str
-    status: str          # "trained" | "skipped_low_data" | "fetch_failed"
+    # "trained" | "skipped_low_data" | "fetch_failed" | "rejected_verification"
+    status: str
     version: str | None = None
     tier: str | None = None
     n_bars: int = 0
@@ -193,7 +215,76 @@ def _retrain_one(
         feature_columns=list(features.columns),
         n_states=tier.n_states,
         covariance_type=tier.covariance_type,
+        n_restarts=cfg.n_restarts,
     ).fit(features)
+
+    # FIX 1 (adapted): persistence/autocorrelation diagnostic. Reporting only
+    # — it never blocks a model from shipping; it lands in ``extra`` + logs.
+    diag = persistence_diagnostic(
+        model, features, stride=cfg.persistence_diag_stride
+    )
+    if diag.inflated:
+        _log.warning(
+            "regime_persistence_inflated",
+            bucket_id=bucket_id,
+            symbol=bucket_symbol,
+            message=diag.message,
+        )
+
+    # FIX 2: verify the freshly fitted model. On failure we do NOT save — the
+    # previously-saved model stays the latest, so the bucket never ends up
+    # with no regime. Audit + alert so the rejection is forensically visible.
+    verify: VerifyResult | None = None
+    if cfg.verify_labels:
+        verify = verify_model(
+            model,
+            features,
+            min_mean_gap=cfg.min_mean_gap,
+            min_state_occupancy=cfg.min_state_occupancy,
+        )
+        if not verify.passed:
+            _log.warning(
+                "regime_model_rejected",
+                bucket_id=bucket_id,
+                symbol=bucket_symbol,
+                tier=tier.name,
+                n_bars=n_bars,
+                reasons=verify.reasons,
+            )
+            with session_scope() as session:
+                session.add(
+                    AuditLog(
+                        strategy_id=bucket_id,
+                        event_type=AuditEventType.REGIME_MODEL_REJECTED,
+                        message=(
+                            f"{bucket_symbol} regime model REJECTED "
+                            f"({tier.name}, {n_bars} bars), prior model kept: "
+                            f"{'; '.join(verify.reasons)}"
+                        ),
+                        payload=_json_safe(
+                            {
+                                "bucket_id": bucket_id,
+                                "symbol": bucket_symbol,
+                                "fetch_symbol": fetch_symbol,
+                                "tier": tier.name,
+                                "n_bars": n_bars,
+                                "verify": verify.as_dict(),
+                                "persistence_diag": diag.as_dict(),
+                            }
+                        ),
+                    )
+                )
+            send_alert(
+                f"⚠️ [{bucket_id}] {bucket_symbol} regime model rejected "
+                f"(kept prior): {verify.reasons[0]}"
+            )
+            return RetrainResult(
+                bucket_id=bucket_id,
+                symbol=bucket_symbol,
+                status="rejected_verification",
+                tier=tier.name,
+                n_bars=n_bars,
+            )
 
     now = RealClock().now()
     version = f"v{now.strftime('%Y%m%d_%H%M%S')}_{bucket_symbol}"
@@ -206,13 +297,20 @@ def _retrain_one(
             version=version,
             trained_at=now,
             model=model,
-            extra={
-                "tier": tier.name,
-                "fetch_symbol": fetch_symbol,
-                "n_bars": n_bars,
-                "feature_window_start": bars.index[0].isoformat(),
-                "feature_window_end": bars.index[-1].isoformat(),
-            },
+            extra=_json_safe(
+                {
+                    "tier": tier.name,
+                    "fetch_symbol": fetch_symbol,
+                    "n_bars": n_bars,
+                    "feature_window_start": bars.index[0].isoformat(),
+                    "feature_window_end": bars.index[-1].isoformat(),
+                    "n_restarts": cfg.n_restarts,
+                    "chosen_seed": model.chosen_seed,
+                    "log_likelihood": model.log_likelihood,
+                    "verify": verify.as_dict() if verify is not None else None,
+                    "persistence_diag": diag.as_dict(),
+                }
+            ),
         )
         session.add(
             AuditLog(
@@ -322,6 +420,9 @@ def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
             1 for r in results if r.status == "skipped_low_data"
         ),
         fetch_failed=sum(1 for r in results if r.status == "fetch_failed"),
+        rejected=sum(
+            1 for r in results if r.status == "rejected_verification"
+        ),
     )
     return results
 
@@ -375,10 +476,12 @@ def _alert_summary(bucket_id: str, results: list[RetrainResult]) -> None:
     trained = sum(1 for r in results if r.status == "trained")
     failed = sum(1 for r in results if r.status == "fetch_failed")
     skipped = sum(1 for r in results if r.status == "skipped_low_data")
-    prefix = "⚠️ " if failed else ""
+    rejected = sum(1 for r in results if r.status == "rejected_verification")
+    prefix = "⚠️ " if (failed or rejected) else ""
     send_alert(
         f"{prefix}Regime retrain {bucket_id}: "
-        f"trained={trained} fetch_failed={failed} skipped={skipped}"
+        f"trained={trained} fetch_failed={failed} "
+        f"skipped={skipped} rejected={rejected}"
     )
 
 

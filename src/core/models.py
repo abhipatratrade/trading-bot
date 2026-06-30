@@ -34,6 +34,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     Index,
     Integer,
     Numeric,
@@ -96,6 +97,7 @@ class AuditEventType(StrEnum):
     UNIVERSE_CHANGE = "universe_change"
     REGIME_CHANGE = "regime_change"
     REGIME_MODEL_RETRAINED = "regime_model_retrained"
+    REGIME_MODEL_REJECTED = "regime_model_rejected"
     SIZING_DECISION = "sizing_decision"
     STRATEGY_GATE_BLOCKED = "strategy_gate_blocked"
     ORDER_PLACED = "order_placed"
@@ -474,6 +476,10 @@ class RegimeSnapshot(Base):
     )
     state_probabilities: Mapped[dict] = mapped_column(JSONB, nullable=False)
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Continuous regime conviction P(bull) − P(bear) ∈ [-1, 1] (Markov 2.0).
+    # Nullable: rows written before this column existed have NULL. Downstream
+    # sizing/gating still keys on ``regime``; this is observability only.
+    signal: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,18 @@ inference_lookback_bars: 200      # bars used at predict time
 retrain_cadence: weekly           # Mon 02:00 UTC via run_scheduler
 fallback_to_market: true          # under-data symbols defer to the _market_ model
 
+# --- Markov 2.0 detection-layer knobs (retrain-time) ---
+# Baum-Welch only finds local maxima. Fit several fixed seeds and keep the
+# best log-likelihood; 1 reproduces the legacy single-seed fit.
+n_restarts: 4
+# Verify each fitted model before it ships; on failure the prior model is
+# kept (the bucket never ends up with no regime) and a REGIME_MODEL_REJECTED
+# audit row + Telegram alert are emitted.
+verify_labels: true
+min_mean_gap: 0.0005              # min mean-log-return gap between adjacent regimes
+min_state_occupancy: 0.03         # each state must cover >= 3% of decoded bars
+persistence_diag_stride: 14       # per-bar vs stride-N persistence diagnostic (log/extra only)
+
 # Coins to train per-coin models for. When this list is empty, only the
 # `_market_` fallback gets trained — every coin then uses the broad
 # market regime (same behaviour as the pre-restructure single-HMM bot).

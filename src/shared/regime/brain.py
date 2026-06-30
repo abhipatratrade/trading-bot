@@ -69,6 +69,19 @@ class RegimeConfig(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     fallback_to_market: bool = True
 
+    # --- Markov 2.0 detection-layer knobs (retrain-time; safe defaults) ---
+    # Baum-Welch finds local maxima; fit this many seeds and keep the best
+    # log-likelihood. 1 == legacy single fit (random_state=7).
+    n_restarts: int = Field(default=1, ge=1)
+    # Verify each fitted model before it ships; reject + keep prior on fail.
+    verify_labels: bool = True
+    # Minimum mean-log-return separation required between adjacent regimes.
+    min_mean_gap: float = Field(default=0.0005, ge=0.0)
+    # Minimum Viterbi occupancy each state must hold (degenerate-state guard).
+    min_state_occupancy: float = Field(default=0.03, ge=0.0)
+    # Stride (bars) for the per-bar vs stride-sampled persistence diagnostic.
+    persistence_diag_stride: int = Field(default=14, ge=1)
+
 
 def load_regime_config(path: Path) -> RegimeConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -218,6 +231,7 @@ def predict_regime(
                     k.value: round(v, 6) for k, v in pred.state_probabilities.items()
                 },
                 model_version=version,
+                signal=round(pred.signal, 6),
             )
         )
         if prev is None or prev.regime != pred.regime:
