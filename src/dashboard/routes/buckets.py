@@ -290,6 +290,8 @@ def _regime_row(snap: RegimeSnapshot, *, is_market: bool) -> dict[str, object]:
         "model_version": snap.model_version,
         "age_min": _age_minutes(snap.ts),
         "probabilities": snap.state_probabilities,
+        # Continuous conviction P(bull)−P(bear) ∈ [-1, 1]; None on older rows.
+        "signal": snap.signal,
     }
 
 
