@@ -55,6 +55,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Regime retrain | VM systemd timer, not Railway (Binance geo-blocks Railway) — Decision 020 |
 | Sizing | Kelly on bucket capital, skip if insufficient — Decision 015 |
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
+| Exits & enforcement | Strategy-driven exits (step 0); breaker trip = kill switch + flatten; bucket_state mirrors sub-account wallet; dashboard basic auth — Decision 021 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |
 | Backtest engine | Out of scope for this repo |
 | Options trading | Deferred until all futures/spot phases live |

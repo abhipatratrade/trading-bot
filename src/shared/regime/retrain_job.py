@@ -131,12 +131,16 @@ def _fetch_bars(data: BinanceData, symbol: str, tf: str, limit: int):
 
     ``limit`` is capped at 1500 by Binance per request; the bot's
     default training window (1100 daily bars) fits in one call.
+
+    The last bar is dropped: Binance includes the in-progress candle,
+    and training on a partial bar skews the newest observation.
     """
     try:
-        return data.get_ohlcv(symbol, tf, limit=min(limit, 1500))
+        bars = data.get_ohlcv(symbol, tf, limit=min(limit, 1500))
     except Exception:
         _log.warning("retrain_fetch_failed", symbol=symbol, exc_info=True)
         return []
+    return bars[:-1] if len(bars) > 1 else []
 
 
 def _delta_to_binance(delta_symbol: str) -> str | None:

@@ -341,6 +341,17 @@ class DeltaIndiaClient(Broker):
             o = self._get(f"/v2/orders/{exchange_order_id}")
         except DeltaAPIError:
             return None
+        return self._to_open_order(o)
+
+    def get_order_by_client_id(self, client_order_id: str) -> OpenOrder | None:
+        try:
+            o = self._get(f"/v2/orders/client_order_id/{client_order_id}")
+        except DeltaAPIError:
+            return None
+        return self._to_open_order(o)
+
+    @staticmethod
+    def _to_open_order(o: dict[str, Any]) -> OpenOrder:
         return OpenOrder(
             exchange_order_id=str(o["id"]),
             client_order_id=o.get("client_order_id"),

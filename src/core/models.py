@@ -542,9 +542,9 @@ class BucketState(Base, TimestampMixin):
     """Current capital + available balance per bucket.
 
     capital_inr is the fixed bucket allocation (₹50k by default).
-    locked_margin_inr is what's currently tied up in open positions for this
-    bucket. available_balance_inr = capital_inr - locked_margin_inr.
-    Updated by the reconciler.
+    available_balance_inr and locked_margin_inr MIRROR the bucket's Delta
+    sub-account wallet (available / order+position margin, × allocator fx)
+    — synced by the reconciler every sweep (Decision 021).
     """
 
     __tablename__ = "bucket_state"

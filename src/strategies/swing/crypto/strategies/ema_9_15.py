@@ -19,11 +19,17 @@ matches the canonical TradingView/MT4 definition (no warm-up debiasing).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
 import pandas as pd
 
 from src.core.logging import get_logger
 from src.data_sources.base import MarketData
 from src.shared.base_strategy import EntryCandidate, Strategy
+
+if TYPE_CHECKING:
+    from src.core.models import MarketRegime, Position
 
 _log = get_logger("strategies.swing.crypto.ema_9_15")
 
@@ -96,3 +102,38 @@ class Ema9_15Crossover(Strategy):
             )
 
         return out
+
+    def select_exits(
+        self,
+        held: dict[str, Position],
+        data: MarketData,
+        regimes: Mapping[str, MarketRegime | None] | None = None,  # noqa: ARG002
+    ) -> list[str]:
+        """Exit a held long once EMA(9) sits below EMA(15).
+
+        State-based rather than cross-based so a missed cross bar (bot
+        restart, tick gap) still exits on the next tick.
+        """
+        exits: list[str] = []
+        for sym in held:
+            try:
+                bars = data.get_ohlcv(sym, self.tf, limit=_MIN_BARS + 30)
+            except Exception:
+                _log.warning("exit_ohlcv_fetch_failed", symbol=sym, exc_info=True)
+                continue
+            if len(bars) < _MIN_BARS:
+                continue
+
+            closes = pd.Series([float(b.close) for b in bars])
+            ema_fast = closes.ewm(span=_FAST, adjust=False).mean()
+            ema_slow = closes.ewm(span=_SLOW, adjust=False).mean()
+
+            if ema_fast.iloc[-1] < ema_slow.iloc[-1]:
+                exits.append(sym)
+                _log.info(
+                    "ema_exit_signal",
+                    symbol=sym,
+                    ema_fast=round(ema_fast.iloc[-1], 6),
+                    ema_slow=round(ema_slow.iloc[-1], 6),
+                )
+        return exits

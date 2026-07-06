@@ -5,7 +5,8 @@
 # Dhan adapter lands in Phase 3.
 #
 # The bucket_state Postgres table is seeded with these values by migration
-# 0002 and updated live by the reconciler.
+# 0002; available_balance_inr / locked_margin_inr then mirror the bucket's
+# Delta sub-account wallet via the reconciler sweep (Decision 021).
 
 # Decision 019 — each crypto bucket trades on its own Delta India sub-account
 # (account_ref → DELTA_<REF>_<MODE>_API_KEY/_SECRET). ``default`` reuses the

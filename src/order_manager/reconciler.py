@@ -23,6 +23,7 @@ from src.core.models import (
     AuditEventType,
     AuditLog,
     BrokerName,
+    BucketState,
     OrderStatus,
     Position,
     PositionSide,
@@ -56,6 +57,7 @@ class Reconciler:
         broker_name: BrokerName,
         clock: Clock | None = None,
         bucket_ids: list[str] | None = None,
+        bucket_fx: dict[str, Decimal] | None = None,
     ) -> None:
         self._broker = broker
         self._broker_name = broker_name
@@ -66,6 +68,9 @@ class Reconciler:
         # bucket's rows. ``None`` keeps the legacy broker-wide behaviour
         # (used by single-account smoke scripts / tests).
         self._bucket_ids = bucket_ids
+        # Decision 021: bucket_state mirrors the sub-account wallet. fx is
+        # the bucket's allocator fx_inr_per_usd (wallet quote → INR).
+        self._bucket_fx = bucket_fx or {}
 
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
@@ -80,10 +85,11 @@ class Reconciler:
         return [Trade.bucket_id.in_(self._bucket_ids)]
 
     def run(self) -> ReconcileReport:
-        """Full reconciliation pass: positions then orders."""
+        """Full reconciliation pass: positions, orders, then wallet sync."""
         report = ReconcileReport()
         self._reconcile_positions(report)
         self._reconcile_orders(report)
+        self._sync_bucket_state()
 
         if report.diffs:
             self._log.warning(
@@ -277,7 +283,7 @@ class Reconciler:
                     )
                     self._log.warning("position_size_mismatch", **diff)
 
-    def _latest_filled_trade(self, session, symbol: str) -> "Trade | None":
+    def _latest_filled_trade(self, session, symbol: str) -> Trade | None:
         """Most-recent FILLED Trade for this symbol on this broker.
 
         Used to attribute orphan positions back to the bucket / strategy
@@ -294,6 +300,60 @@ class Reconciler:
             .order_by(Trade.created_at.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+    # ── Bucket capital sync (Decision 021) ──────────────────────────
+
+    def _sync_bucket_state(self) -> None:
+        """Mirror the sub-account wallet into ``bucket_state``.
+
+        available_balance_inr ← wallet available × fx
+        locked_margin_inr     ← (order_margin + position_margin) × fx
+
+        Only runs when the reconciler is bucket-scoped (Decision 019).
+        With one sub-account per bucket the mapping is 1:1; if multiple
+        buckets ever share an account this would double-count, so warn.
+        """
+        if not self._bucket_ids:
+            return
+        if len(self._bucket_ids) > 1:
+            self._log.warning(
+                "bucket_state_sync_shared_account",
+                buckets=self._bucket_ids,
+                note="wallet mirrored into EACH bucket — capital double-counted",
+            )
+        try:
+            balances = self._broker.get_balances()
+        except Exception:
+            self._log.warning("bucket_state_sync_balance_fetch_failed", exc_info=True)
+            return
+
+        available = sum((b.available for b in balances), Decimal("0"))
+        locked = sum(
+            (b.order_margin + b.position_margin for b in balances),
+            Decimal("0"),
+        )
+
+        with session_scope() as session:
+            for bucket_id in self._bucket_ids:
+                state = session.execute(
+                    select(BucketState).where(
+                        BucketState.bucket_id == bucket_id
+                    )
+                ).scalar_one_or_none()
+                if state is None:
+                    self._log.warning(
+                        "bucket_state_row_missing", bucket_id=bucket_id
+                    )
+                    continue
+                fx = self._bucket_fx.get(bucket_id, Decimal("1"))
+                state.available_balance_inr = available * fx
+                state.locked_margin_inr = locked * fx
+        self._log.info(
+            "bucket_state_synced",
+            buckets=self._bucket_ids,
+            available=str(available),
+            locked=str(locked),
+        )
 
     # ── Order reconciliation ────────────────────────────────────────
 
@@ -361,7 +421,9 @@ def _map_status(status_str: str) -> OrderStatus:
         "open": OrderStatus.OPEN,
         "pending": OrderStatus.PENDING,
         "filled": OrderStatus.FILLED,
+        "partial": OrderStatus.PARTIAL,
         "canceled": OrderStatus.CANCELED,
+        "rejected": OrderStatus.REJECTED,
     }.get(status_str, OrderStatus.UNKNOWN)
 
 

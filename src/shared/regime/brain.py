@@ -178,8 +178,12 @@ def predict_regime(
         config.proxy_symbol if used_symbol == MARKET_SENTINEL else symbol
     )
     try:
+        # +1 then drop the last bar: exchanges return the in-progress
+        # candle, and a regime label computed from a minutes-old bar (near
+        # zero return / volume) is noise — worse, it gets cached for the
+        # whole bar window. Label only fully-closed bars.
         raw_bars = data.get_ohlcv(
-            fetch_symbol, config.tf, limit=config.inference_lookback_bars
+            fetch_symbol, config.tf, limit=config.inference_lookback_bars + 1
         )
     except Exception:
         _log.warning(
@@ -189,6 +193,9 @@ def predict_regime(
             exc_info=True,
         )
         raw_bars = None
+
+    if raw_bars and len(raw_bars) > 1:
+        raw_bars = raw_bars[:-1]
 
     if not raw_bars:
         _log.warning(

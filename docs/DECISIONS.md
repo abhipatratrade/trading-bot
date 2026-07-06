@@ -447,3 +447,59 @@ Consequences:
 - A future non-crypto (Dhan) bucket would not hit the Binance block, but
   keeping all retrains on the VM timer is simplest; revisit if a bucket
   ever needs a data source only reachable from Railway.
+
+## 021 — Exit engine, breaker enforcement, wallet-mirrored capital, dashboard auth
+Date: 2026-07-06
+Status: Accepted
+Refines: 013, 015, 019
+Related house rules: #3, #4
+
+Context: A full-project review (2026-07-06 session) found four gaps that
+made the pre-live soak unrepresentative: no exit path existed anywhere
+(BucketRunner was entry-only; `select_exits` was never called), the
+circuit breakers were defined but never invoked, `bucket_state` capital
+was never updated after the migration seed, and the dashboard had no
+authentication. User decisions recorded here:
+
+1. **Exits are strategy-driven.** BucketRunner runs a step 0 before
+   entries: every discovered strategy's `select_exits(held, data,
+   regimes)` runs — including strategies currently blocked by the
+   master/regime gate, since a gated strategy must still manage what it
+   holds. Exit orders are reduce-only market orders; the Position row is
+   flipped FLAT optimistically and the reconciler self-heals if the
+   exchange disagrees.
+   - `top5_volume` (longterm-crypto): hold until the symbol's regime
+     flips to BEAR.
+   - `ema_9_15` (swing-crypto): exit when EMA(9) sits below EMA(15)
+     (state-based, so a missed cross bar still exits next tick).
+
+2. **Direction is per strategy.** `EntryCandidate.side` is now honored by
+   the runner (was hardcoded "buy"). Long-only vs long/short is a
+   strategy property; the regime multiplier in `allocator.yaml` remains
+   the per-bucket scaling knob.
+
+3. **Breaker trip = halt + flatten.** `src/safety/enforcement.py` runs
+   all breakers per sub-account every tick from `run_bot`. Any trip:
+   engage the per-bucket kill switch (engaged_by="breaker"), then flatten
+   every position on the account with reduce-only market orders.
+   Reduce-only orders are allowed through an engaged kill switch
+   (`allow_when_killed`); risk-increasing orders never are. Recovery is
+   manual via the dashboard.
+
+4. **bucket_state mirrors the sub-account wallet.** The reconciler syncs
+   `available_balance_inr` (wallet available × allocator `fx_inr_per_usd`)
+   and `locked_margin_inr` (order+position margin × fx) every sweep.
+   Decision 019's one-account-per-bucket makes this 1:1; sharing an
+   account across buckets would double-count and logs a warning.
+
+5. **Dashboard uses HTTP basic auth.** All routes 401 without credentials
+   when `DASHBOARD_PASSWORD` is set (constant-time compare). Unset ⇒
+   serves openly with a startup warning — acceptable only while the URL
+   is not shared. Tracebacks are no longer returned to the browser.
+
+Also fixed under this decision (same session): transport-error recovery in
+OrderManager (query the exchange by client_order_id before marking a trade
+REJECTED, so a response timeout cannot double-fire next tick),
+`set_leverage` failure now aborts placement instead of warn-and-continue,
+and regime inference/training drop the in-progress candle (labels are
+computed from closed bars only).

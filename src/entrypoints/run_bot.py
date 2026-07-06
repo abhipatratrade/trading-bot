@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import signal
 import time
+from decimal import Decimal
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
@@ -36,6 +37,8 @@ from src.data_sources.symbol_loader import (
 )
 from src.order_manager.manager import OrderManager
 from src.order_manager.reconciler import Reconciler
+from src.safety.enforcement import enforce_breakers
+from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import Market, load_buckets
 from src.shared.bucket_runner import BucketRunner
 
@@ -114,12 +117,24 @@ def main() -> None:
     # OrderManager + Reconciler per distinct account_ref among enabled
     # crypto buckets; each reconciler is scoped to its account's bucket(s).
     accounts: dict[str, list[str]] = {}
+    bucket_fx: dict[str, Decimal] = {}
     for bucket in all_buckets:
         if not bucket.config.enabled or bucket.market != Market.CRYPTO:
             continue
         if bucket.config.broker != BrokerName.DELTA_INDIA:
             continue
         accounts.setdefault(bucket.config.account_ref, []).append(bucket.id)
+        # FX for the reconciler's wallet→bucket_state sync (Decision 021).
+        try:
+            bucket_fx[bucket.id] = load_allocator_config(
+                bucket.allocator_yaml_path
+            ).fx_inr_per_usd
+        except Exception:
+            _log.warning(
+                "allocator_fx_load_failed_using_1",
+                bucket_id=bucket.id,
+                exc_info=True,
+            )
 
     brokers: dict[str, Broker] = {}
     order_managers: dict[str, OrderManager] = {}
@@ -143,7 +158,13 @@ def main() -> None:
         brokers[ref] = client
         order_managers[ref] = OrderManager(client, BrokerName.DELTA_INDIA, clock)
         reconcilers[ref] = Reconciler(
-            client, BrokerName.DELTA_INDIA, clock, bucket_ids=ref_bucket_ids
+            client,
+            BrokerName.DELTA_INDIA,
+            clock,
+            bucket_ids=ref_bucket_ids,
+            bucket_fx={
+                b: fx for b, fx in bucket_fx.items() if b in ref_bucket_ids
+            },
         )
         _log.info("delta_account_ready", account_ref=ref, buckets=ref_bucket_ids)
 
@@ -231,7 +252,36 @@ def main() -> None:
         tick_interval=TICK_INTERVAL_SECONDS,
         buckets=bucket_ids,
     )
+    dd_pct = Decimal(str(settings.daily_drawdown_pct))
+    liq_pct = Decimal(str(settings.liquidation_distance_min_pct))
+    funding_max = Decimal(str(settings.funding_rate_max))
+
     while not _shutdown:
+        # ── Safety first: breakers per sub-account (Decision 021) ───────
+        # A trip engages the per-bucket kill switch and flattens the
+        # account; runners below then skip those buckets.
+        for ref, ref_bucket_ids in accounts.items():
+            try:
+                enforce_breakers(
+                    account_ref=ref,
+                    bucket_ids=ref_bucket_ids,
+                    broker=brokers[ref],
+                    order_manager=order_managers[ref],
+                    data=delta_data,
+                    max_drawdown_pct=dd_pct,
+                    min_liq_distance_pct=liq_pct,
+                    max_funding_rate=funding_max,
+                    clock=clock,
+                )
+            except Exception:
+                _log.error(
+                    "breaker_enforcement_error", account_ref=ref, exc_info=True
+                )
+                send_alert_dedup(
+                    f"breaker_error:{ref}",
+                    f"[bot] breaker enforcement ERROR on account {ref} — see logs",
+                )
+
         for runner in runners:
             try:
                 runner.run_once()

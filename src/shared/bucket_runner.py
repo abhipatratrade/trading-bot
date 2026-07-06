@@ -1,8 +1,12 @@
 """
 BucketRunner — the per-bucket pipeline orchestrator.
 
-Implements the eight-step pipeline from the plan / PPTX slide 3:
+Implements the eight-step pipeline from the plan / PPTX slide 3, plus the
+exit step added by Decision 021:
 
+    0. Strategy exits (select_exits per strategy — runs even for strategies
+       currently blocked by the master/regime gate, since a gated strategy
+       must still manage positions it already holds)
     1. Strategy discovery (folder scan)
     2. Strategy Master gate
     3. Market Scanner
@@ -25,9 +29,12 @@ Phase 3 when Indian buckets go live.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
-from typing import Mapping
+
+from sqlalchemy import select
 
 from src.brokers.base import Broker, OrderType
 from src.core.alerts import send_alert_dedup
@@ -38,7 +45,12 @@ from src.core.models import (
     AuditEventType,
     AuditLog,
     MarketRegime,
+    OrderSide,
+    OrderStatus,
+    Position,
+    PositionSide,
     SizingDecision,
+    Trade,
 )
 from src.data_sources.base import MarketData
 from src.order_manager.manager import KillSwitchEngagedError, OrderManager
@@ -48,6 +60,7 @@ from src.shared.allocator.sizer import (
     load_allocator_config,
     size_positions,
 )
+from src.shared.base_strategy import Strategy
 from src.shared.bucket import Bucket
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
@@ -61,7 +74,6 @@ from src.shared.strategy_master.loader import (
     StrategyMaster,
     load_strategy_master,
 )
-from src.shared.base_strategy import Strategy
 
 _log = get_logger("shared.bucket_runner")
 
@@ -77,6 +89,7 @@ class RunSummary:
     blocked_strategies: dict[str, str]
     universe: list[str]
     regime: MarketRegime | None
+    exited: int = 0
 
 
 class BucketRunner:
@@ -139,6 +152,10 @@ class BucketRunner:
             )
             return _empty_summary(self.bucket.id)
 
+        # 0. Exits — strategy-driven closes run before any entry logic
+        # (Decision 021). A failed exit must not block other strategies.
+        exited = self._run_exits(order_manager)
+
         # 1+2: discovery + master gate (already loaded; gate is per-strategy below).
 
         # 3. Scanner
@@ -200,6 +217,9 @@ class BucketRunner:
                 continue
 
             symbols = [ec.symbol for ec in entry_candidates]
+            # Honor the strategy's declared direction (Decision 021: some
+            # strategies are long-only, others long/short).
+            sides = {ec.symbol: ec.side for ec in entry_candidates}
             mark_prices = self._collect_mark_prices(symbols)
 
             # Per-symbol regimes for the sizer (one HMM call per
@@ -232,6 +252,7 @@ class BucketRunner:
                         om=order_manager,
                         strat_name=strat_name,
                         symbol=sym,
+                        side=sides.get(sym, "buy"),
                         size=res.contracts,
                     )
                     placed += 1
@@ -244,6 +265,7 @@ class BucketRunner:
             "bucket_run_complete",
             bucket_id=self.bucket.id,
             placed=placed,
+            exited=exited,
             eligible=eligible,
             blocked=list(blocked),
         )
@@ -256,9 +278,174 @@ class BucketRunner:
             blocked_strategies=blocked,
             universe=scan.universe,
             regime=market_regime,
+            exited=exited,
         )
 
     # ── Internals ──────────────────────────────────────────────────────
+    def _run_exits(self, om: OrderManager) -> int:
+        """Step 0: ask every discovered strategy which held positions to close.
+
+        Runs for ALL strategies with open positions in this bucket — the
+        master/regime gate does not apply to exits (a gated strategy still
+        manages what it holds). Exit orders are reduce-only market orders;
+        the Position row is flipped FLAT optimistically and the reconciler
+        re-imports it if the close somehow didn't stick.
+        """
+        with session_scope() as session:
+            held_rows = list(
+                session.execute(
+                    select(Position).where(
+                        Position.bucket_id == self.bucket.id,
+                        Position.side != PositionSide.FLAT,
+                        Position.quantity > 0,
+                    )
+                ).scalars()
+            )
+            # Belt-and-braces: skip symbols with an active reduce-only Trade
+            # placed recently (exit already in flight, position row not yet
+            # reconciled FLAT).
+            cutoff = self._clock.now() - timedelta(hours=1)
+            recent_trades = list(
+                session.execute(
+                    select(Trade).where(
+                        Trade.bucket_id == self.bucket.id,
+                        Trade.status.in_(
+                            [
+                                OrderStatus.PENDING,
+                                OrderStatus.OPEN,
+                                OrderStatus.PARTIAL,
+                                OrderStatus.FILLED,
+                            ]
+                        ),
+                        Trade.created_at > cutoff,
+                    )
+                ).scalars()
+            )
+        recent_exit_keys = {
+            (t.strategy_name, t.symbol)
+            for t in recent_trades
+            if t.extra and t.extra.get("reduce_only")
+        }
+
+        if not held_rows:
+            return 0
+
+        by_strategy: dict[str, dict[str, Position]] = {}
+        for pos in held_rows:
+            if not pos.strategy_name:
+                _log.warning(
+                    "held_position_without_strategy_name",
+                    bucket_id=self.bucket.id,
+                    symbol=pos.symbol,
+                )
+                continue
+            by_strategy.setdefault(pos.strategy_name, {})[pos.symbol] = pos
+
+        exited = 0
+        for strat_name, held in by_strategy.items():
+            strat_cls = self.strategies.get(strat_name)
+            if strat_cls is None:
+                send_alert_dedup(
+                    f"exit_no_strategy:{self.bucket.id}:{strat_name}",
+                    f"[{self.bucket.id}] positions held by unknown strategy "
+                    f"{strat_name!r} ({list(held)}) — no exit logic running",
+                )
+                continue
+
+            regimes: dict[str, MarketRegime | None] = {}
+            for sym in held:
+                pred = predict_regime(
+                    bucket_id=self.bucket.id,
+                    symbol=sym,
+                    config=self.regime_config,
+                    data=self._data,
+                    clock=self._clock,
+                )
+                regimes[sym] = pred.regime if pred else None
+
+            try:
+                exit_symbols = strat_cls().select_exits(held, self._data, regimes)
+            except Exception:
+                _log.error(
+                    "select_exits_failed",
+                    bucket_id=self.bucket.id,
+                    strategy=strat_name,
+                    exc_info=True,
+                )
+                continue
+
+            for sym in exit_symbols:
+                pos = held.get(sym)
+                if pos is None or (strat_name, sym) in recent_exit_keys:
+                    continue
+                if self._close_position(om, strat_name, pos, regimes.get(sym)):
+                    exited += 1
+        return exited
+
+    def _close_position(
+        self,
+        om: OrderManager,
+        strat_name: str,
+        pos: Position,
+        regime: MarketRegime | None,
+    ) -> bool:
+        exit_side = (
+            OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+        )
+        try:
+            om.place_order(
+                strategy_id=self.bucket.id,
+                bucket_id=self.bucket.id,
+                strategy_name=strat_name,
+                symbol=pos.symbol,
+                side=exit_side.value,
+                size=pos.quantity,
+                order_type=OrderType.MARKET,
+                reduce_only=True,
+                intent_id=f"exit-{self._clock.now().strftime('%Y%m%d%H%M')}",
+            )
+        except KillSwitchEngagedError:
+            raise
+        except Exception:
+            _log.error(
+                "close_position_failed",
+                bucket_id=self.bucket.id,
+                symbol=pos.symbol,
+                exc_info=True,
+            )
+            send_alert_dedup(
+                f"exit_failed:{self.bucket.id}:{pos.symbol}",
+                f"[{self.bucket.id}] FAILED to close {pos.symbol} via {strat_name}",
+            )
+            return False
+
+        # Optimistic close: reconciler re-imports if the exchange disagrees.
+        with session_scope() as session:
+            row = session.get(Position, pos.id)
+            if row is not None:
+                row.side = PositionSide.FLAT
+                row.quantity = Decimal("0")
+                row.closed_at = self._clock.now()
+            session.add(
+                AuditLog(
+                    strategy_id=self.bucket.id,
+                    event_type=AuditEventType.POSITION_CLOSED,
+                    message=(
+                        f"{strat_name} exit {pos.symbol} "
+                        f"({pos.side.value} {pos.quantity})"
+                    ),
+                    payload={
+                        "bucket_id": self.bucket.id,
+                        "strategy_name": strat_name,
+                        "symbol": pos.symbol,
+                        "position_side": pos.side.value,
+                        "quantity": str(pos.quantity),
+                        "regime": regime.value if regime else None,
+                    },
+                )
+            )
+        return True
+
     def _collect_mark_prices(self, symbols: list[str]) -> dict[str, Decimal]:
         out: dict[str, Decimal] = {}
         for s in symbols:
@@ -279,6 +466,7 @@ class BucketRunner:
         om: OrderManager,
         strat_name: str,
         symbol: str,
+        side: str,
         size: Decimal,
     ) -> None:
         try:
@@ -287,7 +475,7 @@ class BucketRunner:
                 bucket_id=self.bucket.id,
                 strategy_name=strat_name,
                 symbol=symbol,
-                side="buy",
+                side=side,
                 size=size,
                 order_type=OrderType.MARKET,
                 leverage=self.bucket.config.leverage_max,

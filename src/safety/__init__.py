@@ -5,6 +5,7 @@ from src.safety.breakers import (
     check_liquidation_distance,
     run_all_breakers,
 )
+from src.safety.enforcement import enforce_breakers
 from src.safety.kill_switch import disengage, engage, is_engaged
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "check_funding_extreme",
     "check_liquidation_distance",
     "disengage",
+    "enforce_breakers",
     "engage",
     "is_engaged",
     "run_all_breakers",

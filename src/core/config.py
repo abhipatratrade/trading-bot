@@ -116,11 +116,17 @@ class Settings(BaseSettings):
     # -- Dashboard ----------------------------------------------------------
     dashboard_host: str = "0.0.0.0"  # noqa: S104
     dashboard_port: int = 8000
+    # HTTP basic auth (Decision 021). When dashboard_password is unset the
+    # dashboard serves WITHOUT auth and logs a warning — set it before
+    # exposing the service anywhere reachable.
+    dashboard_user: str = "admin"
+    dashboard_password: SecretStr | None = None
 
     # -- Safety thresholds --------------------------------------------------
     daily_drawdown_pct: float = 5.0
     weekly_drawdown_pct: float = 10.0
     liquidation_distance_min_pct: float = 15.0
+    funding_rate_max: float = 0.01
     drift_bps_max: float = 50.0
 
     # -----------------------------------------------------------------------

@@ -105,15 +105,19 @@ class OrderManager:
         intent_id: str = "",
         bucket_id: str | None = None,
         strategy_name: str | None = None,
+        allow_when_killed: bool = False,
     ) -> PlacementResult:
         now = self._clock.now()
         client_oid = make_client_order_id(
             strategy_id, symbol, side, now, intent_id
         )
 
-        # 1. Kill switch
-        with session_scope() as session:
-            self._check_kill_switch(session, strategy_id)
+        # 1. Kill switch. ``allow_when_killed`` is reserved for the breaker
+        # flatten path (Decision 021): position-REDUCING orders may pass an
+        # engaged kill switch; risk-increasing orders never can.
+        if not (allow_when_killed and reduce_only):
+            with session_scope() as session:
+                self._check_kill_switch(session, strategy_id)
 
         # 2. Idempotency: return existing if already placed
         with session_scope() as session:
@@ -154,20 +158,31 @@ class OrderManager:
             client_order_id=client_oid,
             status=OrderStatus.PENDING,
             submitted_at=now,
+            extra={"reduce_only": reduce_only} if reduce_only else None,
         )
         with session_scope() as session:
             session.add(trade)
             session.flush()
             trade_id = trade.id
 
-        # 4. Set leverage if requested
+        # 4. Set leverage. A failure ABORTS the placement: firing a market
+        # order at whatever leverage the account happens to carry means the
+        # margin consumed can be a multiple of what the sizer assumed.
         if leverage is not None:
             try:
                 self._broker.set_leverage(symbol, leverage)
             except Exception:
-                self._log.warning(
-                    "set_leverage_failed", symbol=symbol, leverage=str(leverage)
+                self._log.error(
+                    "set_leverage_failed_aborting",
+                    symbol=symbol,
+                    leverage=str(leverage),
+                    exc_info=True,
                 )
+                self._mark_rejected(
+                    trade_id, strategy_id, client_oid,
+                    f"set_leverage({leverage}) failed for {symbol}",
+                )
+                raise
 
         # 5. Send to broker
         try:
@@ -184,18 +199,39 @@ class OrderManager:
                 )
             )
         except Exception:
-            with session_scope() as session:
-                t = session.get(Trade, trade_id)
-                if t:
-                    t.status = OrderStatus.REJECTED
-                session.add(
-                    AuditLog(
-                        strategy_id=strategy_id,
-                        event_type=AuditEventType.ORDER_PLACED,
-                        message=f"REJECTED {side} {size} {symbol}",
-                        payload={"client_order_id": client_oid, "reason": "broker_error"},
-                    )
+            # The request may have DIED IN TRANSIT after the exchange
+            # accepted it (e.g. response timeout). Marking it REJECTED in
+            # that case would let the next tick fire a duplicate under a
+            # fresh minute-based client_order_id. Ask the exchange first.
+            recovered = self._lookup_after_error(client_oid)
+            if recovered is not None:
+                mapped = _map_broker_status(recovered.status)
+                with session_scope() as session:
+                    t = session.get(Trade, trade_id)
+                    if t:
+                        t.exchange_order_id = recovered.exchange_order_id
+                        t.status = mapped
+                self._log.warning(
+                    "order_recovered_after_transport_error",
+                    client_order_id=client_oid,
+                    exchange_order_id=recovered.exchange_order_id,
+                    status=mapped.value,
                 )
+                send_alert(
+                    f"[{bucket_id or strategy_id}] order {symbol} recovered after "
+                    f"transport error [{mapped.value}] — no duplicate fired"
+                )
+                return PlacementResult(
+                    trade_id=trade_id,
+                    client_order_id=client_oid,
+                    exchange_order_id=recovered.exchange_order_id,
+                    status=mapped,
+                    was_existing=False,
+                    raw=recovered.raw,
+                )
+            self._mark_rejected(
+                trade_id, strategy_id, client_oid, "broker_error"
+            )
             raise
 
         # 6. Update trade with exchange response
@@ -295,6 +331,36 @@ class OrderManager:
 
     # ── Internal ────────────────────────────────────────────────────
 
+    def _lookup_after_error(self, client_oid: str) -> Any:
+        """Best-effort exchange lookup by client_order_id after a transport
+        error. Returns the broker's order record if the order actually
+        landed, else None (including when the lookup itself fails)."""
+        try:
+            return self._broker.get_order_by_client_id(client_oid)
+        except Exception:
+            self._log.warning(
+                "post_error_order_lookup_failed",
+                client_order_id=client_oid,
+                exc_info=True,
+            )
+            return None
+
+    def _mark_rejected(
+        self, trade_id: int, strategy_id: str, client_oid: str, reason: str
+    ) -> None:
+        with session_scope() as session:
+            t = session.get(Trade, trade_id)
+            if t:
+                t.status = OrderStatus.REJECTED
+            session.add(
+                AuditLog(
+                    strategy_id=strategy_id,
+                    event_type=AuditEventType.ORDER_PLACED,
+                    message=f"REJECTED {client_oid}",
+                    payload={"client_order_id": client_oid, "reason": reason},
+                )
+            )
+
     @staticmethod
     def _check_kill_switch(session: Any, strategy_id: str) -> None:
         global_kill = session.execute(
@@ -325,5 +391,7 @@ def _map_broker_status(status_str: str) -> OrderStatus:
         "open": OrderStatus.OPEN,
         "pending": OrderStatus.PENDING,
         "filled": OrderStatus.FILLED,
+        "partial": OrderStatus.PARTIAL,
         "canceled": OrderStatus.CANCELED,
+        "rejected": OrderStatus.REJECTED,
     }.get(status_str, OrderStatus.UNKNOWN)

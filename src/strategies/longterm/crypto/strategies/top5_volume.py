@@ -15,12 +15,24 @@ The equal-weight ×5x leverage logic that lived in the legacy runner's
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+from src.core.models import MarketRegime
 from src.data_sources.base import MarketData
 from src.shared.base_strategy import EntryCandidate, Strategy
 
+if TYPE_CHECKING:
+    from src.core.models import Position
+
 
 class Top5VolumeLongterm(Strategy):
-    """Phase 1: long-only entries on every symbol the scanner picked."""
+    """Phase 1: long-only entries on every symbol the scanner picked.
+
+    Exit rule (Decision 021): hold until the symbol's regime flips to BEAR.
+    Entries are already regime-scaled by the sizer (bear=0, neutral=0.5,
+    bull=1.0); the exit closes existing longs once the Brain says bear.
+    """
 
     name = "top5_volume"
     tf = "1d"
@@ -34,4 +46,18 @@ class Top5VolumeLongterm(Strategy):
         return [
             EntryCandidate(symbol=sym, side="buy", hint={"source": "volume_rank"})
             for sym in candidates
+        ]
+
+    def select_exits(
+        self,
+        held: dict[str, Position],
+        data: MarketData,  # noqa: ARG002 — interface signature
+        regimes: Mapping[str, MarketRegime | None] | None = None,
+    ) -> list[str]:
+        if not regimes:
+            return []
+        return [
+            sym
+            for sym in held
+            if regimes.get(sym) == MarketRegime.BEAR
         ]

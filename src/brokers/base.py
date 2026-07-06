@@ -134,5 +134,14 @@ class Broker(ABC):
         """Fetch a single order by exchange ID.  Returns None if not found."""
         return None
 
+    def get_order_by_client_id(self, client_order_id: str) -> OpenOrder | None:  # noqa: B027
+        """Fetch a single order by client_order_id.  Returns None if not found.
+
+        Used by the order manager to recover from transport errors without
+        double-firing (an order may land on the exchange even when the HTTP
+        response never made it back).
+        """
+        return None
+
     def close(self) -> None:  # noqa: B027
         """Release resources.  Default no-op; override if needed."""

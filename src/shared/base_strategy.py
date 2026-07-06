@@ -17,11 +17,15 @@ This keeps strategies thin, testable, and importable by the backtester
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from src.data_sources.base import MarketData
+
+if TYPE_CHECKING:  # ORM types only for annotations; strategies stay DB-free
+    from src.core.models import MarketRegime, Position
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,12 +75,22 @@ class Strategy(ABC):
 
     def select_exits(
         self,
-        held: dict[str, "Position"],  # noqa: F821 - forward ref to ORM type
+        held: dict[str, Position],
         data: MarketData,
+        regimes: Mapping[str, MarketRegime | None] | None = None,
     ) -> list[str]:
         """Return symbols to close. Default: do nothing (held positions persist).
 
-        Strategies that want explicit exits (mean-reversion, stop-loss) override.
+        Called by the runner every tick BEFORE entries, including when the
+        strategy is blocked by the master/regime gate — a gated strategy must
+        still manage the positions it already holds (Decision 021).
+
+        Args:
+            held: open positions attributed to this strategy, keyed by symbol.
+            data: market-data interface for signal computation.
+            regimes: per-symbol regime label from the Brain (None per symbol
+                when no prediction is available). Strategies that exit on
+                regime flips read this instead of calling the Brain themselves.
         """
         return []
 
