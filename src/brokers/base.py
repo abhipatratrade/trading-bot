@@ -84,6 +84,21 @@ class BalanceInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class FillInfo:
+    """One execution (fill) reported by the exchange."""
+
+    fill_id: str
+    exchange_order_id: str
+    symbol: str
+    side: str  # "buy" | "sell"
+    size: Decimal
+    price: Decimal
+    commission: Decimal
+    timestamp: datetime | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class OpenOrder:
     exchange_order_id: str
     client_order_id: str | None
@@ -142,6 +157,25 @@ class Broker(ABC):
         response never made it back).
         """
         return None
+
+    def get_fills(
+        self, *, start_time: datetime | None = None
+    ) -> list[FillInfo]:  # noqa: B027
+        """Fills since ``start_time`` (exchange-defined ordering).
+
+        Default: empty — brokers without a fills API just skip P&L
+        enrichment. Used by the reconciler to record avg fill price,
+        commissions, and realized P&L per trade.
+        """
+        return []
+
+    def contract_size(self, symbol: str) -> Decimal:  # noqa: B027
+        """Units of base asset per contract, from the venue's product spec.
+
+        Default 1 (spot-like). Overridden by adapters whose venues size
+        orders in contracts (Delta India perps).
+        """
+        return Decimal("1")
 
     def close(self) -> None:  # noqa: B027
         """Release resources.  Default no-op; override if needed."""

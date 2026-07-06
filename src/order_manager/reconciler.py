@@ -9,6 +9,7 @@ actually reports.  Every diff is logged to the ``audit_log`` table.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.core.models import (
     AuditLog,
     BrokerName,
     BucketState,
+    OrderSide,
     OrderStatus,
     Position,
     PositionSide,
@@ -85,11 +87,16 @@ class Reconciler:
         return [Trade.bucket_id.in_(self._bucket_ids)]
 
     def run(self) -> ReconcileReport:
-        """Full reconciliation pass: positions, orders, then wallet sync."""
+        """Full pass: positions, orders, wallet sync, then P&L enrichment."""
         report = ReconcileReport()
         self._reconcile_positions(report)
         self._reconcile_orders(report)
         self._sync_bucket_state()
+        try:
+            self._enrich_trades_pnl()
+        except Exception:
+            # P&L enrichment is observability — never let it fail the sweep.
+            self._log.warning("pnl_enrichment_failed", exc_info=True)
 
         if report.diffs:
             self._log.warning(
@@ -353,6 +360,205 @@ class Reconciler:
             buckets=self._bucket_ids,
             available=str(available),
             locked=str(locked),
+        )
+
+    # ── Per-trade P&L enrichment (Phase 1c) ─────────────────────────
+
+    def _enrich_trades_pnl(self) -> None:
+        """Record fills, fees, traded notional, and P&L on recent trades.
+
+        Runs every sweep (5 min by default). Writes to ``Trade.fees`` and
+        ``Trade.extra``:
+
+            avg_fill_price, filled_size, contract_size,
+            traded_notional_usd, pnl_usd, pnl_pct,
+            pnl_kind ("unrealized" | "realized"), pnl_final (bool),
+            pnl_updated_at
+
+        Realized P&L pairs a reduce-only exit with the latest prior entry
+        for the same (bucket, strategy, symbol) — matches the Phase-1
+        one-entry/one-exit flow; partial closes are approximated by the
+        smaller of the two sizes. Unrealized P&L for open entries comes
+        straight from the exchange's per-position ``unrealized_pnl``.
+        ``pnl_pct`` is against traded notional (× leverage for the
+        margin-relative return).
+        """
+        from src.order_manager.pnl import (
+            aggregate_fills,
+            pnl_pct,
+            realized_pnl,
+            trade_notional,
+        )
+
+        now = self._clock.now()
+        window_start = now - timedelta(days=7)
+
+        with session_scope() as session:
+            candidates = list(
+                session.execute(
+                    select(Trade).where(
+                        Trade.broker == self._broker_name,
+                        Trade.exchange_order_id.isnot(None),
+                        Trade.status.in_(
+                            [
+                                OrderStatus.FILLED,
+                                OrderStatus.PARTIAL,
+                                OrderStatus.OPEN,
+                            ]
+                        ),
+                        Trade.created_at > window_start,
+                        *self._scope_trades(),
+                    )
+                ).scalars()
+            )
+        open_for_enrich = [
+            t for t in candidates if not (t.extra or {}).get("pnl_final")
+        ]
+        if not open_for_enrich:
+            return
+
+        # One fills call covers every candidate order.
+        oldest = min(t.created_at for t in open_for_enrich)
+        fills = self._broker.get_fills(start_time=oldest)
+        by_order: dict[str, list] = {}
+        for f in fills:
+            by_order.setdefault(f.exchange_order_id, []).append(f)
+
+        exchange_positions = {
+            p.symbol: p for p in self._broker.get_positions()
+        }
+
+        with session_scope() as session:
+            # Re-load inside the write session.
+            rows = {
+                t.id: t
+                for t in session.execute(
+                    select(Trade).where(
+                        Trade.id.in_([t.id for t in candidates])
+                    )
+                ).scalars()
+            }
+
+            # Pass 1: attach fill aggregates.
+            for trade in rows.values():
+                if (trade.extra or {}).get("pnl_final"):
+                    continue
+                order_fills = by_order.get(trade.exchange_order_id or "")
+                if not order_fills:
+                    continue
+                agg = aggregate_fills(
+                    [(f.price, f.size, f.commission) for f in order_fills]
+                )
+                if agg is None:
+                    continue
+                csize = self._broker.contract_size(trade.symbol)
+                notional = trade_notional(
+                    agg.avg_price, agg.filled_size, csize
+                )
+                trade.fees = agg.commission
+                trade.extra = {
+                    **(trade.extra or {}),
+                    "avg_fill_price": str(agg.avg_price),
+                    "filled_size": str(agg.filled_size),
+                    "contract_size": str(csize),
+                    "traded_notional_usd": str(notional),
+                }
+                if trade.price is None:
+                    trade.price = agg.avg_price
+
+            # Pass 2: realized P&L — pair exits with their entries.
+            entries = sorted(
+                (
+                    t
+                    for t in rows.values()
+                    if not (t.extra or {}).get("reduce_only")
+                    and (t.extra or {}).get("avg_fill_price")
+                ),
+                key=lambda t: t.created_at,
+            )
+            exits = sorted(
+                (
+                    t
+                    for t in rows.values()
+                    if (t.extra or {}).get("reduce_only")
+                    and (t.extra or {}).get("avg_fill_price")
+                    and not (t.extra or {}).get("pnl_final")
+                ),
+                key=lambda t: t.created_at,
+            )
+            for exit_trade in exits:
+                entry = next(
+                    (
+                        e
+                        for e in reversed(entries)
+                        if e.bucket_id == exit_trade.bucket_id
+                        and e.strategy_name == exit_trade.strategy_name
+                        and e.symbol == exit_trade.symbol
+                        and e.side != exit_trade.side
+                        and e.created_at < exit_trade.created_at
+                        and not (e.extra or {}).get("closed_by_trade_id")
+                    ),
+                    None,
+                )
+                if entry is None:
+                    continue
+                e_extra, x_extra = entry.extra or {}, exit_trade.extra or {}
+                entry_avg = Decimal(e_extra["avg_fill_price"])
+                exit_avg = Decimal(x_extra["avg_fill_price"])
+                size = min(
+                    Decimal(e_extra["filled_size"]),
+                    Decimal(x_extra["filled_size"]),
+                )
+                csize = Decimal(x_extra.get("contract_size", "1"))
+                pnl = realized_pnl(
+                    entry_avg=entry_avg,
+                    exit_avg=exit_avg,
+                    size=size,
+                    contract_size=csize,
+                    entry_is_long=(entry.side == OrderSide.BUY),
+                    total_fees=(entry.fees or Decimal("0"))
+                    + (exit_trade.fees or Decimal("0")),
+                )
+                notional = Decimal(
+                    e_extra.get("traded_notional_usd", "0")
+                )
+                pct = pnl_pct(pnl, notional)
+                stamp = {
+                    "pnl_usd": str(pnl),
+                    "pnl_pct": str(pct) if pct is not None else None,
+                    "pnl_kind": "realized",
+                    "pnl_final": True,
+                    "pnl_updated_at": now.isoformat(),
+                }
+                exit_trade.extra = {**x_extra, **stamp}
+                entry.extra = {
+                    **e_extra,
+                    **stamp,
+                    "closed_by_trade_id": exit_trade.id,
+                }
+
+            # Pass 3: unrealized P&L for entries still open on the exchange.
+            for entry in entries:
+                extra = entry.extra or {}
+                if extra.get("pnl_final"):
+                    continue
+                pos = exchange_positions.get(entry.symbol)
+                if pos is None or pos.unrealized_pnl is None:
+                    continue
+                notional = Decimal(extra.get("traded_notional_usd", "0"))
+                pct = pnl_pct(pos.unrealized_pnl, notional)
+                entry.extra = {
+                    **extra,
+                    "pnl_usd": str(pos.unrealized_pnl),
+                    "pnl_pct": str(pct) if pct is not None else None,
+                    "pnl_kind": "unrealized",
+                    "pnl_updated_at": now.isoformat(),
+                }
+
+        self._log.info(
+            "pnl_enrichment_done",
+            trades=len(open_for_enrich),
+            fills=len(fills),
         )
 
     # ── Order reconciliation ────────────────────────────────────────

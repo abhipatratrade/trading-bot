@@ -132,24 +132,25 @@ top-to-bottom.
 - [x] Regime hygiene — inference + retrain drop the in-progress candle
 
 **Left (priority order):**
-- [ ] **Dashboard: cumulative bucket P&L** — on `/buckets` cards and the
-      bucket detail page, show cumulative P&L amount and % **between the
-      Available-balance and Regime sections**. Basis: wallet equity
-      (available + locked, already synced) minus `capital_inr`, % vs
-      `capital_inr`. Since each sub-account is bot-exclusive (Decision
-      019), wallet delta = bot P&L incl. fees/funding. Caveat to handle:
-      manual deposits/withdrawals on the sub-account skew it — document
-      or track a deposits offset in `bucket_state.extra`.
-- [ ] **Fills/fees/realized-P&L ingestion** (prerequisite for per-trade
-      P&L) — poll Delta `GET /v2/fills` (or use the orphaned WS client)
-      during the reconciler sweep; store fill price + commission on
-      `Trade`; compute realized P&L on close.
-- [ ] **Dashboard: per-trade traded amount + P&L amt & %** — for each
-      trade row: traded notional (fill price × contracts × contract
-      size), live P&L amount and % (unrealized via mark vs entry while
-      open; realized once closed). Refresh every reconcile sweep (5 min);
-      drop to per-tick (60s) if Delta rate limits allow — positions are
-      already fetched per tick by the breakers, so reuse that call.
+- [x] **Dashboard: cumulative bucket P&L** — shipped 2026-07-07: P&L amt
+      + % (vs capital) shown between Available and Regime on `/buckets`
+      cards and bucket detail. Basis: synced wallet equity −
+      `capital_inr` − optional `bucket_state.extra["capital_adjustments_inr"]`
+      (manual deposit/withdrawal offset). Math in
+      `src/order_manager/pnl.py::bucket_cumulative_pnl`.
+- [x] **Fills/fees/realized-P&L ingestion** — shipped 2026-07-07:
+      `Broker.get_fills` + Delta `GET /v2/fills` (µs epoch start_time,
+      page_size 500); reconciler `_enrich_trades_pnl` sweep stores avg
+      fill price / fees / traded notional on `Trade` and pairs
+      reduce-only exits with entries for realized P&L (net of both
+      sides' fees). Contract size now read live from `/v2/products`
+      `contract_value`.
+- [x] **Dashboard: per-trade traded amount + P&L amt & %** — shipped
+      2026-07-07: trade rows (bucket page + home) show fill price,
+      traded notional, P&L amt + % with realized/unrealized tag,
+      refreshed by the 5-min reconcile sweep. P&L % is against traded
+      notional (× leverage = margin-relative). Follow-up if wanted:
+      per-tick (60s) refresh by reusing the breakers' positions call.
 - [ ] Broker-side stop-loss order placed with every entry (protection
       when bot/VM is down) — biggest remaining risk gap
 - [ ] Daily-anchored drawdown breaker — start-of-day equity snapshot per
@@ -214,6 +215,7 @@ Append a one-liner per session for traceability.
 - 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
 - 2026-06-10 — Added EMA 9/15 crossover strategy for swing-crypto bucket. Populated `swing/crypto/allocator.yaml` with industry-standard μ/σ (BTC annualized 40%/70% → 1H mu=4.6e-5 sigma=0.0075; 10 majors total). 7 EMA strategy tests + scripts/swing_crypto_dryrun.py end-to-end check passing (3 candidates placed, ₹24.9k margin / ₹249.9k notional within ₹50k bucket at 10x leverage). Decision 018 added: sizer insufficiency check uses required margin, not leveraged notional.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
+- 2026-07-07 — Phase 1c items 1-3 shipped: cumulative bucket P&L (wallet equity vs capital, with capital-adjustments offset) on /buckets cards + detail page; fills/fees ingestion (Delta /v2/fills → Trade.fees + extra: avg_fill_price/traded_notional_usd; realized P&L by exit↔entry pairing; unrealized from exchange positions) in a new reconciler `_enrich_trades_pnl` sweep step; per-trade Traded amt / P&L / P&L% columns on bucket + home trade tables. Contract sizes now read from Delta /v2/products. New pure-math module src/order_manager/pnl.py + 14 tests (131 total green).
 - 2026-07-06 (later) — Phase 1c backlog section added: review leftovers + two new user asks (cumulative bucket P&L on dashboard; per-trade traded amt + P&L amt/% refreshed ≤5 min, with fills-ingestion prerequisite). `continue` resumes from Phase 1c top item. Deployed c36b038 to VM + Railway; DASHBOARD_PASSWORD set on Railway dashboard service.
 - 2026-07-06 — Critical-review session → Decision 021 shipped: exit engine wired into BucketRunner (step 0: `select_exits` per strategy incl. gated ones; top5_volume exits on BEAR flip, ema_9_15 on EMA state-down), breakers enforced per tick (trip → per-bucket kill switch + reduce-only flatten via `safety/enforcement.py`), reconciler now mirrors sub-account wallet into bucket_state (available/locked × allocator fx), dashboard HTTP basic auth (DASHBOARD_USER/PASSWORD) + traceback leak removed, OrderManager transport-error recovery via client_order_id lookup (no double-fire), set_leverage failure aborts placement, EntryCandidate.side honored (shorts plumbing), regime inference+retrain drop the in-progress candle, status maps gained partial/rejected. 117 unit tests green (was 73).
 - 2026-06-15 — Bot-worker VM migrated us-central1-f → asia-south1-a (Mumbai). Binance HTTP 451 geoblock cleared (no more Delta-only fallback for OHLCV). New VM `trading-bot-worker-mumbai`, static IP 34.14.200.220, whitelisted on Delta India. Old VM `trading-bot-worker` (35.184.66.247) systemd service stopped + disabled; VM kept for 24h soak, to be deleted ~2026-06-22. Per-coin HMM Brain (migration 0005 + symbol-keyed model+snapshot) shipped same day: tiered training (3-state-full / 3-state-diag / 2-state-diag / skip), `_market_` fallback under MARKET_SENTINEL, per-symbol regime dict in BucketRunner→sizer, dashboard regime grid per symbol. `/params` route split into index + allocation + trading + scanner sub-pages. Retrain flipped back to Binance (richer history via symbol_mapping Delta↔Binance crosswalk). 73 unit tests green.

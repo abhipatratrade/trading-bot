@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from src.core.db import session_scope
 from src.core.models import Position, PositionSide, Trade
+from src.dashboard.routes.buckets import _trade_row
 
 router = APIRouter()
 
@@ -43,21 +44,7 @@ def home(request: Request):
                 .limit(50)
             ).scalars()
         )
-        trade_data = [
-            {
-                "id": t.id,
-                "strategy_id": t.strategy_id,
-                "symbol": t.symbol,
-                "side": t.side.value,
-                "quantity": str(t.quantity),
-                "price": str(t.price) if t.price else "—",
-                "status": t.status.value,
-                "submitted_at": (
-                    t.submitted_at.strftime("%Y-%m-%d %H:%M") if t.submitted_at else "—"
-                ),
-            }
-            for t in recent_trades
-        ]
+        trade_data = [_trade_row(t) for t in recent_trades]
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
@@ -111,20 +98,7 @@ def trades_partial(request: Request):
                 .limit(50)
             ).scalars()
         )
-        trade_data = [
-            {
-                "strategy_id": t.strategy_id,
-                "symbol": t.symbol,
-                "side": t.side.value,
-                "quantity": str(t.quantity),
-                "price": str(t.price) if t.price else "—",
-                "status": t.status.value,
-                "submitted_at": (
-                    t.submitted_at.strftime("%Y-%m-%d %H:%M") if t.submitted_at else "—"
-                ),
-            }
-            for t in recent_trades
-        ]
+        trade_data = [_trade_row(t) for t in recent_trades]
 
     templates = request.app.state.templates
     return templates.TemplateResponse(

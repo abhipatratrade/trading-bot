@@ -15,7 +15,7 @@ inside the dashboard process because the dashboard has no broker clients
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -32,6 +32,7 @@ from src.core.models import (
     RegimeSnapshot,
     Trade,
 )
+from src.order_manager.pnl import bucket_cumulative_pnl
 from src.shared.bucket import load_buckets
 from src.shared.strategy_loader import discover_strategies
 from src.shared.strategy_master.loader import load_strategy_master
@@ -82,6 +83,7 @@ def _build_cards() -> list[dict[str, object]]:
     for b in buckets:
         st = states.get(b.id)
         rg = regimes.get(b.id)
+        pnl_amt, pnl_pct = _bucket_pnl(b.config.capital_inr, st)
         cards.append(
             {
                 "id": b.id,
@@ -91,6 +93,8 @@ def _build_cards() -> list[dict[str, object]]:
                 "capital_inr": str(b.config.capital_inr),
                 "available_inr": str(st.available_balance_inr) if st else "—",
                 "locked_inr": str(st.locked_margin_inr) if st else "—",
+                "pnl_amt": pnl_amt,
+                "pnl_pct": pnl_pct,
                 "leverage_max": str(b.config.leverage_max),
                 "enabled": b.config.enabled,
                 "open_positions": open_counts.get(b.id, 0),
@@ -102,8 +106,35 @@ def _build_cards() -> list[dict[str, object]]:
     return cards
 
 
+def _bucket_pnl(
+    capital: Decimal, state: BucketState | None
+) -> tuple[float | None, float | None]:
+    """Cumulative bot P&L for a bucket (floats for template rendering).
+
+    Wallet equity (synced by the reconciler, Decision 021) minus the
+    capital seed, adjusted by any manual deposits/withdrawals recorded in
+    ``bucket_state.extra["capital_adjustments_inr"]``.
+    """
+    if state is None:
+        return None, None
+    adjustments = Decimal("0")
+    raw_adj = (state.extra or {}).get("capital_adjustments_inr")
+    if raw_adj is not None:
+        try:
+            adjustments = Decimal(str(raw_adj))
+        except ArithmeticError:
+            pass
+    amt, pct = bucket_cumulative_pnl(
+        capital=capital,
+        available=state.available_balance_inr,
+        locked=state.locked_margin_inr,
+        adjustments=adjustments,
+    )
+    return float(amt), (float(pct) if pct is not None else None)
+
+
 def _age_minutes(ts: datetime) -> int:
-    return int((datetime.now(tz=timezone.utc) - ts).total_seconds() // 60)
+    return int((datetime.now(tz=UTC) - ts).total_seconds() // 60)
 
 
 # ---------------------------------------------------------------------------
@@ -160,22 +191,7 @@ def bucket_detail(bucket_id: str, request: Request):
                 .limit(20)
             ).scalars()
         )
-        recent_trades = [
-            {
-                "strategy_name": t.strategy_name or "—",
-                "symbol": t.symbol,
-                "side": t.side.value,
-                "quantity": str(t.quantity),
-                "price": str(t.price) if t.price else "—",
-                "status": t.status.value,
-                "submitted_at": (
-                    t.submitted_at.strftime("%Y-%m-%d %H:%M")
-                    if t.submitted_at
-                    else "—"
-                ),
-            }
-            for t in trades
-        ]
+        recent_trades = [_trade_row(t) for t in trades]
 
         # Bucket state + per-symbol regime (one row per (bucket, symbol)).
         # We pull the most-recent snapshot per symbol, ordered by ts desc.
@@ -207,6 +223,7 @@ def bucket_detail(bucket_id: str, request: Request):
             }
         )
 
+    pnl_amt, pnl_pct = _bucket_pnl(bucket.config.capital_inr, state)
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request,
@@ -224,6 +241,8 @@ def bucket_detail(bucket_id: str, request: Request):
             "state": {
                 "available_inr": str(state.available_balance_inr) if state else "—",
                 "locked_inr": str(state.locked_margin_inr) if state else "—",
+                "pnl_amt": pnl_amt,
+                "pnl_pct": pnl_pct,
             },
             "regimes": _regimes_table(regimes_by_symbol),
             "running": running,
@@ -295,6 +314,37 @@ def _regime_row(snap: RegimeSnapshot, *, is_market: bool) -> dict[str, object]:
     }
 
 
-# Decimal import kept for future P/L calculations on the running-trades table.
-_ = Decimal
-_ = timedelta
+def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _trade_row(t: Trade) -> dict[str, object]:
+    """Template dict for one trade row, incl. P&L fields written by the
+    reconciler's fill-enrichment sweep (floats so templates can colour by
+    sign; None until the first sweep after the fill)."""
+    extra = t.extra or {}
+    return {
+        "strategy_name": t.strategy_name or "—",
+        "strategy_id": t.strategy_id,
+        "symbol": t.symbol,
+        "side": t.side.value,
+        "quantity": str(t.quantity),
+        "price": (
+            str(extra.get("avg_fill_price"))
+            if extra.get("avg_fill_price")
+            else (str(t.price) if t.price else "—")
+        ),
+        "status": t.status.value,
+        "submitted_at": (
+            t.submitted_at.strftime("%Y-%m-%d %H:%M") if t.submitted_at else "—"
+        ),
+        "traded_amt": _float_or_none(extra.get("traded_notional_usd")),
+        "pnl_amt": _float_or_none(extra.get("pnl_usd")),
+        "pnl_pct": _float_or_none(extra.get("pnl_pct")),
+        "pnl_kind": extra.get("pnl_kind"),
+    }

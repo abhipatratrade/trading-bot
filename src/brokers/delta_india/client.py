@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
@@ -21,6 +22,7 @@ from src.brokers.base import (
     BalanceInfo,
     Broker,
     CancelResult,
+    FillInfo,
     OpenOrder,
     OrderRequest,
     OrderResult,
@@ -48,6 +50,21 @@ _STATUS_MAP: dict[str, str] = {
     "closed": "filled",
     "cancelled": "canceled",
 }
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse Delta timestamps — ISO strings or epoch micro/seconds."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            v = float(value)
+            if v > 1e14:  # microseconds
+                v /= 1e6
+            return datetime.fromtimestamp(v, tz=UTC)
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, OSError):
+        return None
 
 
 class DeltaIndiaClient(Broker):
@@ -189,6 +206,29 @@ class DeltaIndiaClient(Broker):
         self._ensure_products()
         assert self._products is not None
         return list(self._products.keys())
+
+    def contract_size(self, symbol: str) -> Decimal:
+        """Contract size from the live product spec (``contract_value``).
+
+        Falls back to 1 when the product or field is missing rather than
+        raising — callers use this for display/P&L math, not order sizing.
+        """
+        try:
+            self._ensure_products()
+        except Exception:
+            self._log.warning("contract_size_products_fetch_failed", symbol=symbol)
+            return Decimal("1")
+        assert self._products is not None
+        product = self._products.get(symbol)
+        if product is None:
+            return Decimal("1")
+        raw = product.get("contract_value")
+        if raw is None:
+            return Decimal("1")
+        try:
+            return Decimal(str(raw))
+        except ArithmeticError:
+            return Decimal("1")
 
     # ── Broker interface ────────────────────────────────────────────
 
@@ -349,6 +389,37 @@ class DeltaIndiaClient(Broker):
         except DeltaAPIError:
             return None
         return self._to_open_order(o)
+
+    def get_fills(self, *, start_time: datetime | None = None) -> list[FillInfo]:
+        """Fills for this (sub-)account, newest page only (page_size=500).
+
+        ``start_time`` narrows the window (Delta expects **microseconds**
+        since epoch). One page of 500 comfortably covers a multi-day
+        window at Phase-1 trade frequency; pagination can come later.
+        """
+        params: dict[str, Any] = {"page_size": 500}
+        if start_time is not None:
+            params["start_time"] = int(start_time.timestamp() * 1_000_000)
+        result = self._get("/v2/fills", params)
+        fills: list[FillInfo] = []
+        for f in result or []:
+            try:
+                fills.append(
+                    FillInfo(
+                        fill_id=str(f["id"]),
+                        exchange_order_id=str(f.get("order_id", "")),
+                        symbol=f.get("product_symbol", str(f.get("product_id", ""))),
+                        side=str(f.get("side", "")),
+                        size=Decimal(str(f.get("size", 0))),
+                        price=Decimal(str(f.get("price", 0))),
+                        commission=Decimal(str(f.get("commission", 0) or 0)),
+                        timestamp=_parse_ts(f.get("created_at")),
+                        raw=f,
+                    )
+                )
+            except (KeyError, ArithmeticError, TypeError):
+                self._log.warning("fill_parse_failed", fill=f)
+        return fills
 
     @staticmethod
     def _to_open_order(o: dict[str, Any]) -> OpenOrder:

@@ -39,6 +39,17 @@
           <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
           <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr|num3 }}</span></div>
           <div class="row"><span class="lab">Available</span><span>{{ c.available_inr|num3 }}</span></div>
+          <div class="row"><span class="lab">P&amp;L</span>
+            <span>
+              {% if c.pnl_amt is not none %}
+                <span style="font-weight:600;color:{% if c.pnl_amt > 0 %}#3fb950{% elif c.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">
+                  {{ "%+.2f"|format(c.pnl_amt) }}{% if c.pnl_pct is not none %} ({{ "%+.2f"|format(c.pnl_pct) }}%){% endif %}
+                </span>
+              {% else %}
+                <span class="lab">—</span>
+              {% endif %}
+            </span>
+          </div>
           <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
           <div class="row"><span class="lab">Regime</span>
             <span>
@@ -71,6 +82,17 @@
           <div class="meta">{{ c.id }} · max {{ c.leverage_max }}x</div>
           <div class="row"><span class="lab">Capital</span><span>{{ c.capital_inr|num3 }}</span></div>
           <div class="row"><span class="lab">Available</span><span>{{ c.available_inr|num3 }}</span></div>
+          <div class="row"><span class="lab">P&amp;L</span>
+            <span>
+              {% if c.pnl_amt is not none %}
+                <span style="font-weight:600;color:{% if c.pnl_amt > 0 %}#3fb950{% elif c.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">
+                  {{ "%+.2f"|format(c.pnl_amt) }}{% if c.pnl_pct is not none %} ({{ "%+.2f"|format(c.pnl_pct) }}%){% endif %}
+                </span>
+              {% else %}
+                <span class="lab">—</span>
+              {% endif %}
+            </span>
+          </div>
           <div class="row"><span class="lab">Open</span><span>{{ c.open_positions }}</span></div>
           <div class="row"><span class="lab">Regime</span>
             <span>

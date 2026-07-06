@@ -6,7 +6,10 @@
             <th>Symbol</th>
             <th>Side</th>
             <th>Qty</th>
-            <th>Price</th>
+            <th>Fill / limit price</th>
+            <th>Traded amt</th>
+            <th>P&amp;L</th>
+            <th>P&amp;L %</th>
             <th>Status</th>
             <th>Submitted</th>
         </tr>
@@ -19,6 +22,18 @@
             <td><span class="badge {% if t.side == 'buy' %}badge-green{% else %}badge-red{% endif %}">{{ t.side }}</span></td>
             <td>{{ t.quantity|num3 }}</td>
             <td>{{ t.price|num3 }}</td>
+            <td>{% if t.traded_amt is not none %}{{ "%.2f"|format(t.traded_amt) }}{% else %}—{% endif %}</td>
+            <td>
+                {% if t.pnl_amt is not none %}
+                    <span style="font-weight:600;color:{% if t.pnl_amt > 0 %}#3fb950{% elif t.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">{{ "%+.2f"|format(t.pnl_amt) }}</span>
+                    {% if t.pnl_kind %}<span style="font-size:0.7rem;color:#8b949e"> {{ t.pnl_kind[:6] }}</span>{% endif %}
+                {% else %}—{% endif %}
+            </td>
+            <td>
+                {% if t.pnl_pct is not none %}
+                    <span style="color:{% if t.pnl_pct > 0 %}#3fb950{% elif t.pnl_pct < 0 %}#f85149{% else %}#8b949e{% endif %}">{{ "%+.2f"|format(t.pnl_pct) }}%</span>
+                {% else %}—{% endif %}
+            </td>
             <td>
                 {% if t.status == 'filled' %}
                     <span class="badge badge-green">{{ t.status }}</span>

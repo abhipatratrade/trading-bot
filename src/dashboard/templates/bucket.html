@@ -18,11 +18,24 @@
   <a href="/buckets" class="btn">← All buckets</a>
 </div>
 
-<div class="section" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem">
+<div class="section" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:1rem">
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Available</div>
     <div style="font-size:1.4rem;font-weight:600">{{ state.available_inr|num3 }}</div>
     <div style="color:#8b949e;font-size:0.75rem">locked: {{ state.locked_inr|num3 }}</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Cumulative P&amp;L</div>
+    {% if state.pnl_amt is not none %}
+      <div style="font-size:1.4rem;font-weight:600;color:{% if state.pnl_amt > 0 %}#3fb950{% elif state.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">
+        {{ "%+.2f"|format(state.pnl_amt) }}
+      </div>
+      <div style="font-size:0.75rem;color:{% if state.pnl_amt > 0 %}#3fb950{% elif state.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">
+        {% if state.pnl_pct is not none %}{{ "%+.2f"|format(state.pnl_pct) }}% of capital{% endif %}
+      </div>
+    {% else %}
+      <div class="empty" style="padding:0">no wallet sync yet</div>
+    {% endif %}
   </div>
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Regime</div>
@@ -173,12 +186,19 @@
 {% endif %}
 
 <h2>Recent Trades</h2>
+<p style="color:#8b949e;font-size:0.75rem;margin-bottom:0.5rem">
+  Fill price, traded amount, and P&amp;L are written by the reconciler
+  sweep (~5 min after a fill). P&amp;L % is against traded notional —
+  multiply by leverage for the margin-relative return.
+</p>
 {% if recent_trades %}
   <table>
     <thead>
       <tr>
         <th>Symbol</th><th>Strategy</th><th>Side</th><th>Qty</th>
-        <th>Price</th><th>Status</th><th>Submitted</th>
+        <th>Fill / limit price</th><th>Traded amt</th>
+        <th>P&amp;L</th><th>P&amp;L %</th>
+        <th>Status</th><th>Submitted</th>
       </tr>
     </thead>
     <tbody>
@@ -189,6 +209,18 @@
         <td>{{ t.side }}</td>
         <td>{{ t.quantity|num3 }}</td>
         <td>{{ t.price|num3 }}</td>
+        <td>{% if t.traded_amt is not none %}{{ "%.2f"|format(t.traded_amt) }}{% else %}—{% endif %}</td>
+        <td>
+          {% if t.pnl_amt is not none %}
+            <span style="font-weight:600;color:{% if t.pnl_amt > 0 %}#3fb950{% elif t.pnl_amt < 0 %}#f85149{% else %}#8b949e{% endif %}">{{ "%+.2f"|format(t.pnl_amt) }}</span>
+            {% if t.pnl_kind %}<span style="font-size:0.7rem;color:#8b949e"> {{ t.pnl_kind[:6] }}</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if t.pnl_pct is not none %}
+            <span style="color:{% if t.pnl_pct > 0 %}#3fb950{% elif t.pnl_pct < 0 %}#f85149{% else %}#8b949e{% endif %}">{{ "%+.2f"|format(t.pnl_pct) }}%</span>
+          {% else %}—{% endif %}
+        </td>
         <td>
           {% if t.status == 'filled' %}<span class="badge badge-green">{{ t.status }}</span>
           {% elif t.status in ('rejected','canceled') %}<span class="badge badge-red">{{ t.status }}</span>
