@@ -38,6 +38,7 @@ from src.data_sources.symbol_loader import (
 from src.order_manager.manager import OrderManager
 from src.order_manager.reconciler import Reconciler
 from src.safety.enforcement import enforce_breakers
+from src.safety.stop_protection import ensure_stop_protection
 from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import Market, load_buckets
 from src.shared.bucket_runner import BucketRunner
@@ -118,12 +119,16 @@ def main() -> None:
     # crypto buckets; each reconciler is scoped to its account's bucket(s).
     accounts: dict[str, list[str]] = {}
     bucket_fx: dict[str, Decimal] = {}
+    stop_pcts: dict[str, Decimal] = {}
     for bucket in all_buckets:
         if not bucket.config.enabled or bucket.market != Market.CRYPTO:
             continue
         if bucket.config.broker != BrokerName.DELTA_INDIA:
             continue
         accounts.setdefault(bucket.config.account_ref, []).append(bucket.id)
+        # Broker-side protective stop distance (Decision 022).
+        if bucket.config.stop_loss_pct is not None:
+            stop_pcts[bucket.id] = bucket.config.stop_loss_pct
         # FX for the reconciler's wallet→bucket_state sync (Decision 021).
         try:
             bucket_fx[bucket.id] = load_allocator_config(
@@ -224,6 +229,35 @@ def main() -> None:
         except Exception:
             _log.error("startup_reconcile_failed", account_ref=ref, exc_info=True)
 
+    # ── Protective stop-loss sweep (Decision 022) ───────────────────────
+    # Idempotent: place missing stops, resize on adds, cancel orphans.
+    # Runs at startup and once per tick (after the runners, so fresh
+    # entries are protected within seconds).
+    def _sweep_stops() -> None:
+        for ref, ref_bucket_ids in accounts.items():
+            pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
+            if not pcts:
+                continue
+            try:
+                ensure_stop_protection(
+                    account_ref=ref,
+                    bucket_ids=ref_bucket_ids,
+                    broker=brokers[ref],
+                    order_manager=order_managers[ref],
+                    stop_pct_by_bucket=pcts,
+                    clock=clock,
+                )
+            except Exception:
+                _log.error(
+                    "stop_protection_sweep_failed", account_ref=ref, exc_info=True
+                )
+                send_alert_dedup(
+                    f"stop_sweep_error:{ref}",
+                    f"[bot] stop-protection sweep ERROR on account {ref} — see logs",
+                )
+
+    _sweep_stops()
+
     # ── Audit + alert startup ───────────────────────────────────────────
     bucket_ids = [r.bucket.id for r in runners]
     with session_scope() as session:
@@ -306,6 +340,9 @@ def main() -> None:
                 )
         if _shutdown:
             break
+
+        # Protect every position opened/changed this tick (Decision 022).
+        _sweep_stops()
 
         global _tick_count
         _tick_count += 1

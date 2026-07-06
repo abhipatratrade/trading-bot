@@ -230,6 +230,23 @@ class DeltaIndiaClient(Broker):
         except ArithmeticError:
             return Decimal("1")
 
+    def tick_size(self, symbol: str) -> Decimal | None:
+        """Price increment from the live product spec (``tick_size``)."""
+        try:
+            self._ensure_products()
+        except Exception:
+            self._log.warning("tick_size_products_fetch_failed", symbol=symbol)
+            return None
+        assert self._products is not None
+        product = self._products.get(symbol)
+        raw = product.get("tick_size") if product else None
+        if raw is None:
+            return None
+        try:
+            return Decimal(str(raw))
+        except ArithmeticError:
+            return None
+
     # ── Broker interface ────────────────────────────────────────────
 
     def place_order(self, request: OrderRequest) -> OrderResult:
@@ -246,6 +263,12 @@ class DeltaIndiaClient(Broker):
             body["time_in_force"] = request.time_in_force.value
         if request.reduce_only:
             body["reduce_only"] = "true"
+        if request.stop_price is not None:
+            # Stop order (stop-market when order_type is market_order).
+            # Trigger on mark price — last-traded can wick on thin books.
+            body["stop_order_type"] = "stop_loss_order"
+            body["stop_price"] = str(request.stop_price)
+            body["stop_trigger_method"] = "mark_price"
         if request.client_order_id:
             # Delta enforces max 32 characters for client_order_id.
             body["client_order_id"] = request.client_order_id[:32]
@@ -344,29 +367,13 @@ class DeltaIndiaClient(Broker):
         return balances
 
     def get_open_orders(self, symbol: str | None = None) -> list[OpenOrder]:
-        params: dict[str, Any] = {}
+        # "pending" includes untriggered stop orders — without it the
+        # protective stop layer (Decision 022) would never see its stops.
+        params: dict[str, Any] = {"states": "open,pending"}
         if symbol:
             params["product_id"] = self._product_id(symbol)
-        result = self._get("/v2/orders", params or None)
-        orders: list[OpenOrder] = []
-        for o in result:
-            orders.append(
-                OpenOrder(
-                    exchange_order_id=str(o["id"]),
-                    client_order_id=o.get("client_order_id"),
-                    symbol=o.get("product_symbol", str(o.get("product_id", ""))),
-                    side=o["side"],
-                    size=Decimal(str(o["size"])),
-                    unfilled_size=Decimal(str(o.get("unfilled_size", o["size"]))),
-                    order_type=o.get("order_type", ""),
-                    limit_price=(
-                        Decimal(str(o["limit_price"])) if o.get("limit_price") else None
-                    ),
-                    status=_STATUS_MAP.get(o.get("state", ""), "unknown"),
-                    raw=o,
-                )
-            )
-        return orders
+        result = self._get("/v2/orders", params)
+        return [self._to_open_order(o) for o in result]
 
     def set_leverage(self, symbol: str, leverage: Decimal) -> None:
         product_id = self._product_id(symbol)
@@ -435,6 +442,10 @@ class DeltaIndiaClient(Broker):
                 Decimal(str(o["limit_price"])) if o.get("limit_price") else None
             ),
             status=_STATUS_MAP.get(o.get("state", ""), "unknown"),
+            stop_price=(
+                Decimal(str(o["stop_price"])) if o.get("stop_price") else None
+            ),
+            reduce_only=str(o.get("reduce_only", "")).lower() == "true",
             raw=o,
         )
 

@@ -102,6 +102,7 @@ class OrderManager:
         leverage: Decimal | None = None,
         time_in_force: TimeInForce = TimeInForce.GTC,
         reduce_only: bool = False,
+        stop_price: Decimal | None = None,
         intent_id: str = "",
         bucket_id: str | None = None,
         strategy_name: str | None = None,
@@ -145,6 +146,16 @@ class OrderManager:
                 )
 
         # 3. Persist PENDING trade
+        extra: dict[str, Any] = {}
+        if reduce_only:
+            extra["reduce_only"] = True
+        if stop_price is not None:
+            extra["stop_price"] = str(stop_price)
+            if reduce_only:
+                # Protective stop (Decision 022) — excluded from the exit
+                # engine's in-flight-exit dedup; pairs as a real exit in
+                # P&L enrichment only once it actually fills.
+                extra["protective_stop"] = True
         trade = Trade(
             strategy_id=strategy_id,
             bucket_id=bucket_id,
@@ -158,7 +169,7 @@ class OrderManager:
             client_order_id=client_oid,
             status=OrderStatus.PENDING,
             submitted_at=now,
-            extra={"reduce_only": reduce_only} if reduce_only else None,
+            extra=extra or None,
         )
         with session_scope() as session:
             session.add(trade)
@@ -196,6 +207,7 @@ class OrderManager:
                     time_in_force=time_in_force,
                     reduce_only=reduce_only,
                     client_order_id=client_oid,
+                    stop_price=stop_price,
                 )
             )
         except Exception:
@@ -262,8 +274,11 @@ class OrderManager:
         )
 
         scope = bucket_id or strategy_id
-        tag = "EXIT" if reduce_only else "ORDER"
-        price_str = str(limit_price) if limit_price is not None else "market"
+        tag = "STOP" if stop_price is not None else ("EXIT" if reduce_only else "ORDER")
+        if stop_price is not None:
+            price_str = f"trigger {stop_price}"
+        else:
+            price_str = str(limit_price) if limit_price is not None else "market"
         send_alert(
             f"[{scope}] {tag} {side.upper()} {size} {symbol} @ {price_str} "
             f"[{mapped_status.value}]"

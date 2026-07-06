@@ -12,6 +12,11 @@
 # (account_ref → DELTA_<REF>_<MODE>_API_KEY/_SECRET). ``default`` reuses the
 # original keys (the account longterm-crypto is already soaking on). New
 # sub-accounts are provisioned per phase as each bucket comes online.
+# Decision 022 — stop_loss_pct is the broker-side protective stop distance
+# (percent of entry price). Values are set to 50% of bucket margin at
+# leverage_max (0.5 / leverage), well inside liquidation distance
+# (~1/leverage). The stop rests ON the exchange, so it protects even when
+# the bot/VM is down.
 buckets:
   longterm-crypto:
     capital_inr: 50000
@@ -19,6 +24,7 @@ buckets:
     leverage_max: 5
     enabled: true
     account_ref: default
+    stop_loss_pct: 10     # 5x → 50% of margin
 
   swing-crypto:
     capital_inr: 50000
@@ -26,6 +32,7 @@ buckets:
     leverage_max: 10
     enabled: false   # Phase 2
     account_ref: swing
+    stop_loss_pct: 5      # 10x → 50% of margin
 
   scalp-crypto:
     capital_inr: 50000
@@ -33,6 +40,7 @@ buckets:
     leverage_max: 25
     enabled: false   # Phase 5
     account_ref: scalp
+    stop_loss_pct: 2      # 25x → 50% of margin
 
   gambling-crypto:
     capital_inr: 50000
@@ -40,6 +48,7 @@ buckets:
     leverage_max: 100
     enabled: false   # Phase 6
     account_ref: gamble
+    stop_loss_pct: 0.5    # 100x → 50% of margin
 
   longterm-indian:
     capital_inr: 50000

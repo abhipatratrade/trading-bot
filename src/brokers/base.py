@@ -38,6 +38,10 @@ class OrderRequest:
     time_in_force: TimeInForce = TimeInForce.GTC
     reduce_only: bool = False
     client_order_id: str | None = None
+    # When set, the order is a stop order resting at this trigger price
+    # (stop-market when order_type is MARKET). Used by the protective
+    # stop-loss layer (Decision 022).
+    stop_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +113,8 @@ class OpenOrder:
     order_type: str
     limit_price: Decimal | None
     status: str
+    stop_price: Decimal | None = None
+    reduce_only: bool = False
     created_at: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -176,6 +182,14 @@ class Broker(ABC):
         orders in contracts (Delta India perps).
         """
         return Decimal("1")
+
+    def tick_size(self, symbol: str) -> Decimal | None:  # noqa: B027
+        """Price increment from the venue's product spec; None when unknown.
+
+        Used to snap stop-trigger prices onto the venue's grid before
+        placement.
+        """
+        return None
 
     def close(self) -> None:  # noqa: B027
         """Release resources.  Default no-op; override if needed."""

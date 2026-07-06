@@ -60,6 +60,11 @@ class BucketConfig(BaseModel):
     # buckets each get their own Delta India sub-account so positions,
     # leverage, and margin are isolated. ``default`` reuses the original keys.
     account_ref: str = "default"
+    # Decision 022 — broker-side protective stop distance as a percent of
+    # entry price. Every open position gets an exchange-resident reduce-only
+    # stop-market order at this distance, so a max loss holds even when the
+    # bot/VM is down. None ⇒ no broker-side stop for this bucket.
+    stop_loss_pct: Decimal | None = Field(default=None, gt=0, lt=100)
 
 
 class BucketsConfig(BaseModel):

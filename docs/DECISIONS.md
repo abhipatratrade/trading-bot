@@ -503,3 +503,60 @@ REJECTED, so a response timeout cannot double-fire next tick),
 `set_leverage` failure now aborts placement instead of warn-and-continue,
 and regime inference/training drop the in-progress candle (labels are
 computed from closed bars only).
+
+## 022 — Broker-side protective stop-loss on every position
+Date: 2026-07-07
+Status: Accepted
+Refines: 021
+Related house rules: #2, #8
+
+Context: All exits so far are bot-driven (strategy exits, breaker
+flatten). If the bot or its VM is down, nothing bounds the loss on an
+open leveraged position short of the exchange's liquidation engine. The
+2026-07-06 review flagged this as the biggest remaining risk gap before
+go-live.
+
+Decision: every open position gets an **exchange-resident reduce-only
+stop-market order** so a max loss holds even with the bot offline.
+
+Mechanics:
+- **Config**: `stop_loss_pct` per bucket in `buckets.yaml` (percent of
+  entry price). Seeded at 50% of bucket margin at `leverage_max`
+  (0.5/leverage): longterm 10, swing 5, scalp 2, gambling 0.5 — well
+  inside liquidation distance (~1/leverage). Indian buckets unset until
+  Phase 3.
+- **Sweep, not per-order hook**: `src/safety/stop_protection.py` runs
+  once per tick per sub-account (after the bucket runners, so fresh
+  entries are protected within seconds) plus once at startup. It diffs
+  exchange positions against resting protective stops: missing → place;
+  size mismatch (adds/partial closes) or trigger drift > 0.5% → cancel +
+  re-place; stop without a position → cancel. Idempotent and
+  self-healing; also protects positions that pre-date the feature or
+  were opened manually.
+- **Trigger**: entry_price ± stop_loss_pct, snapped to the product's
+  live `tick_size`, fired on **mark price** (last-traded can wick on
+  thin books). Delta body: `stop_order_type=stop_loss_order` +
+  `stop_price` + `stop_trigger_method=mark_price`; untriggered stops
+  rest in state `pending`, so `get_open_orders` now queries
+  `states=open,pending`.
+- **Through OrderManager**: stops get a Trade row (idempotent
+  client_order_id, audit log, Telegram "STOP" alert, extra:
+  `protective_stop`). If a stop fires while the bot is down, the next
+  reconcile marks it FILLED and P&L enrichment pairs it with its entry
+  like any other exit. Resting stops are excluded from the exit engine's
+  in-flight-exit dedup so they never suppress a strategy close.
+- **Kill-switch interaction**: placement uses `allow_when_killed` —
+  protective stops are risk-reducing and must be maintained even while a
+  bucket is halted (same rationale as the Decision 021 flatten path).
+
+Consequences:
+- A stop that fires shows up to the bot as a FILLED reduce-only trade +
+  position gone; the sizer's 23h trade-dedup then blocks immediate
+  re-entry on that symbol — desirable after a -10% move.
+- The strategy exit path is unchanged; orphaned stops left behind by a
+  strategy close are cancelled by the next sweep (≤1 tick). A triggered
+  stop on an already-flat position is rejected by the venue (reduce-only)
+  — harmless.
+- `stop_loss_pct` is a safety parameter (like breaker thresholds), not a
+  strategy parameter — no `backtest_ref` required to change it, but any
+  change should still be committed with rationale.

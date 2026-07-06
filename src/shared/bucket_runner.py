@@ -324,7 +324,11 @@ class BucketRunner:
         recent_exit_keys = {
             (t.strategy_name, t.symbol)
             for t in recent_trades
-            if t.extra and t.extra.get("reduce_only")
+            if t.extra
+            and t.extra.get("reduce_only")
+            # A resting protective stop (Decision 022) is not an exit in
+            # flight — it must not suppress a strategy-driven close.
+            and not t.extra.get("protective_stop")
         }
 
         if not held_rows:
