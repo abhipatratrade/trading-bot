@@ -139,3 +139,39 @@ def test_stale_products_survive_failed_refresh(
     client._ensure_products()  # refresh fails → stale catalogue kept
     assert client._products is not None
     assert "BTCUSD" in client._products
+
+
+def test_signature_prehash_includes_question_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delta signs METHOD+TS+PATH+'?'+QUERY+BODY — the '?' is mandatory
+    when params exist (2026-07-07 prod Signature Mismatch incident)."""
+    import hashlib
+    import hmac as hmac_mod
+
+    client = _client([])
+    monkeypatch.setattr(time, "time", lambda: 1_783_438_409.0)
+    headers = client._sign_headers("GET", "/v2/orders", "states=open%2Cpending")
+    expected = hmac_mod.new(
+        b"s",
+        b"GET1783438409/v2/orders?states=open%2Cpending",
+        hashlib.sha256,
+    ).hexdigest()
+    assert headers["signature"] == expected
+
+
+def test_signature_prehash_no_query_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import hmac as hmac_mod
+
+    client = _client([])
+    monkeypatch.setattr(time, "time", lambda: 1_783_438_409.0)
+    headers = client._sign_headers("GET", "/v2/wallet/balances")
+    expected = hmac_mod.new(
+        b"s",
+        b"GET1783438409/v2/wallet/balances",
+        hashlib.sha256,
+    ).hexdigest()
+    assert headers["signature"] == expected

@@ -121,9 +121,13 @@ class DeltaIndiaClient(Broker):
         body: str = "",
     ) -> dict[str, str]:
         timestamp = str(int(time.time() + self._time_offset))
-        # Prehash: METHOD + TIMESTAMP + PATH + QUERY_STRING + BODY
-        # Query string is WITHOUT the leading '?'.
-        message = method + timestamp + path + query_string + body
+        # Prehash: METHOD + TIMESTAMP + PATH + '?' + QUERY_STRING + BODY.
+        # The '?' IS part of the signed message when a query string exists —
+        # confirmed 2026-07-07 from the server's rejection signature_data
+        # ('GET<ts>/v2/orders?states=open%2Cpending'). Without it every
+        # authed GET that carries params 401s with Signature Mismatch.
+        query_part = f"?{query_string}" if query_string else ""
+        message = method + timestamp + path + query_part + body
         sig = hmac.new(
             self._api_secret.encode("utf-8"),
             message.encode("utf-8"),
