@@ -96,10 +96,10 @@ class Settings(BaseSettings):
     binance_rest_url: str = "https://fapi.binance.com"
     binance_ws_url: str = "wss://fstream.binance.com"
 
-    # -- Zerodha Kite -------------------------------------------------------
-    kite_api_key: SecretStr | None = None
-    kite_api_secret: SecretStr | None = None
-    kite_access_token: SecretStr | None = None
+    # -- Dhan (DhanHQ API — stocks, Decision 012; Phase 3) -------------------
+    # 30-day access tokens generated from the Dhan web console.
+    dhan_client_id: str | None = None
+    dhan_access_token: SecretStr | None = None
 
     # -- Telegram (optional) ------------------------------------------------
     telegram_bot_token: SecretStr | None = None

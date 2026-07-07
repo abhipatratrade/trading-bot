@@ -213,7 +213,11 @@ top-to-bottom.
       per-process random token in template globals, hidden field on both
       toggle forms, constant-time check → 403 on mismatch (rotates on
       restart; stale tab just refreshes).
-- [ ] Config cleanup — drop `kite_*` settings, add `dhan_*` (Phase 3 prep)
+- [x] **Config cleanup** — shipped 2026-07-07: `kite_*` settings dropped,
+      `dhan_client_id` + `dhan_access_token` added (Decision 012 / Phase
+      3 prep); `.env.example` updated. Stale KITE_* env vars are ignored
+      (`extra="ignore"`). `symbol_mapping.kite_symbol` DB columns left
+      for a Phase 3 migration.
 
 ---
 
@@ -258,6 +262,7 @@ Append a one-liner per session for traceability.
 - 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
 - 2026-06-10 — Added EMA 9/15 crossover strategy for swing-crypto bucket. Populated `swing/crypto/allocator.yaml` with industry-standard μ/σ (BTC annualized 40%/70% → 1H mu=4.6e-5 sigma=0.0075; 10 majors total). 7 EMA strategy tests + scripts/swing_crypto_dryrun.py end-to-end check passing (3 candidates placed, ₹24.9k margin / ₹249.9k notional within ₹50k bucket at 10x leverage). Decision 018 added: sizer insufficiency check uses required margin, not leveraged notional.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
+- 2026-07-07 (cont.) — Phase 1c item 13 shipped: config cleanup (kite_* → dhan_* settings + .env.example). Phase 1c backlog now complete except the kill-switch-semantics item, which is explicitly waiting on a user decision. 191 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 12 shipped: CSRF token on kill-switch toggle (per-process token via Jinja globals, constant-time compare, 403 on mismatch). 191 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 11 shipped: regime brain cache generalized to any TF (`_window_start` parses `<N><m|h|d|w>`; bounded one-entry-per-(bucket,symbol) cache). 188 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 10 shipped: Delta client hardening (central `_request`: GET transport/5xx retries w/ backoff, universal 429 retry honoring Retry-After, HMAC clock-skew resync from Date header, no transport retry on POSTs; product catalogue 6h TTL with stale-keep). 183 unit tests green.
