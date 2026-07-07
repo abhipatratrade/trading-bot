@@ -175,13 +175,18 @@ class Broker(ABC):
         """
         return []
 
-    def contract_size(self, symbol: str) -> Decimal:  # noqa: B027
+    def contract_size(
+        self, symbol: str, default: Decimal | None = Decimal("1")
+    ) -> Decimal | None:  # noqa: B027
         """Units of base asset per contract, from the venue's product spec.
 
-        Default 1 (spot-like). Overridden by adapters whose venues size
-        orders in contracts (Delta India perps).
+        Returns ``default`` when the venue doesn't know the symbol (or the
+        catalogue fetch fails). Display/P&L callers keep the historical
+        ``Decimal("1")`` default; the sizer passes ``default=None`` so an
+        unknown live value falls back to the YAML table instead of
+        silently sizing at 1.
         """
-        return Decimal("1")
+        return default
 
     def tick_size(self, symbol: str) -> Decimal | None:  # noqa: B027
         """Price increment from the venue's product spec; None when unknown.

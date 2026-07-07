@@ -53,6 +53,7 @@ from src.core.models import (
     Trade,
 )
 from src.data_sources.base import MarketData
+from src.data_sources.fx import get_usd_inr
 from src.order_manager.manager import KillSwitchEngagedError, OrderManager
 from src.safety import kill_switch
 from src.shared.allocator.sizer import (
@@ -265,6 +266,18 @@ class BucketRunner:
                 )
                 regimes[sym] = pred.regime if pred else None
 
+            # Live venue values (Phase 1c): contract sizes from the
+            # broker's product catalogue (None ⇒ symbol unknown, YAML
+            # table applies) and a refreshed USD/INR rate.
+            live_contract_sizes: dict[str, Decimal] = {}
+            for sym in symbols:
+                cs = broker.contract_size(sym, default=None)
+                if cs is not None:
+                    live_contract_sizes[sym] = cs
+            live_fx = get_usd_inr(
+                fallback=self.allocator_config.fx_inr_per_usd
+            )
+
             results = size_positions(
                 bucket=self.bucket,
                 strategy_name=strat_name,
@@ -275,6 +288,8 @@ class BucketRunner:
                 # One-bar re-entry lockout at the STRATEGY's timeframe
                 # (1d → 23h, 1h → ~57 min), not a hardcoded 23h.
                 dedup_window_hours=dedup_window_hours_for_tf(row.tf),
+                contract_sizes_override=live_contract_sizes,
+                fx_inr_per_usd_override=live_fx,
             )
 
             for sym, res in results.items():

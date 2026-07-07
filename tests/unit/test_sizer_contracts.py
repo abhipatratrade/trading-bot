@@ -142,3 +142,43 @@ def test_min_contract_floor_via_zero_fx_protection() -> None:
             aggregate_cap=Decimal("1"),
             fx_inr_per_usd=Decimal("0"),
         )
+
+
+class TestLiveOverrides:
+    """Phase 1c: live venue contract size + FX beat the YAML table."""
+
+    def test_contract_size_override_wins(self) -> None:
+        config = _cfg()
+        contracts = notional_inr_to_contracts(
+            notional_inr=Decimal("100000"),
+            mark_price_usd=Decimal("1000"),
+            symbol="BTCUSD",
+            config=config,
+            contract_size_override=Decimal("0.01"),
+            fx_override=None,
+        )
+        # yaml would give 0.001/contract; live 0.01 → 10x fewer contracts
+        yaml_contracts = notional_inr_to_contracts(
+            notional_inr=Decimal("100000"),
+            mark_price_usd=Decimal("1000"),
+            symbol="BTCUSD",
+            config=config,
+        )
+        assert contracts * 10 == yaml_contracts
+
+    def test_fx_override_wins(self) -> None:
+        config = _cfg()
+        live = notional_inr_to_contracts(
+            notional_inr=Decimal("100000"),
+            mark_price_usd=Decimal("1000"),
+            symbol="BTCUSD",
+            config=config,
+            fx_override=config.fx_inr_per_usd * 2,
+        )
+        static = notional_inr_to_contracts(
+            notional_inr=Decimal("100000"),
+            mark_price_usd=Decimal("1000"),
+            symbol="BTCUSD",
+            config=config,
+        )
+        assert live * 2 == static

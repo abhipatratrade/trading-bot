@@ -207,28 +207,32 @@ class DeltaIndiaClient(Broker):
         assert self._products is not None
         return list(self._products.keys())
 
-    def contract_size(self, symbol: str) -> Decimal:
+    def contract_size(
+        self, symbol: str, default: Decimal | None = Decimal("1")
+    ) -> Decimal | None:
         """Contract size from the live product spec (``contract_value``).
 
-        Falls back to 1 when the product or field is missing rather than
-        raising — callers use this for display/P&L math, not order sizing.
+        Returns ``default`` when the product/field is missing or the
+        catalogue fetch fails rather than raising. The sizer passes
+        ``default=None`` so it can distinguish "venue says 1" from
+        "venue doesn't know" and fall back to YAML.
         """
         try:
             self._ensure_products()
         except Exception:
             self._log.warning("contract_size_products_fetch_failed", symbol=symbol)
-            return Decimal("1")
+            return default
         assert self._products is not None
         product = self._products.get(symbol)
         if product is None:
-            return Decimal("1")
+            return default
         raw = product.get("contract_value")
         if raw is None:
-            return Decimal("1")
+            return default
         try:
             return Decimal(str(raw))
         except ArithmeticError:
-            return Decimal("1")
+            return default
 
     def tick_size(self, symbol: str) -> Decimal | None:
         """Price increment from the live product spec (``tick_size``)."""

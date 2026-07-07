@@ -131,6 +131,8 @@ def notional_inr_to_contracts(
     mark_price_usd: Decimal,
     symbol: str,
     config: AllocatorConfig,
+    contract_size_override: Decimal | None = None,
+    fx_override: Decimal | None = None,
 ) -> Decimal:
     """Convert an INR-denominated target notional into a whole-contract count.
 
@@ -143,12 +145,21 @@ def notional_inr_to_contracts(
     the bucket-allocated notional by that gives the number of contracts
     the broker should receive.
 
+    ``contract_size_override`` / ``fx_override`` carry live venue values
+    (Delta ``/v2/products`` contract_value; refreshed USD/INR). None ⇒
+    the static ``allocator.yaml`` values (Phase 1c).
+
     Returns 0 if any input is non-positive (caller decides what to do).
     """
     if notional_inr <= 0 or mark_price_usd <= 0:
         return Decimal("0")
-    contract_size = config.contract_sizes.get(symbol, config.default_contract_size)
-    price_per_contract_inr = mark_price_usd * contract_size * config.fx_inr_per_usd
+    contract_size = (
+        contract_size_override
+        if contract_size_override is not None
+        else config.contract_sizes.get(symbol, config.default_contract_size)
+    )
+    fx = fx_override if fx_override is not None else config.fx_inr_per_usd
+    price_per_contract_inr = mark_price_usd * contract_size * fx
     if price_per_contract_inr <= 0:
         return Decimal("0")
     return (notional_inr / price_per_contract_inr).quantize(
@@ -181,6 +192,8 @@ def size_positions(
     regimes: dict[str, MarketRegime | None],
     config: AllocatorConfig,
     dedup_window_hours: float | None = None,
+    contract_sizes_override: dict[str, Decimal] | None = None,
+    fx_inr_per_usd_override: Decimal | None = None,
 ) -> dict[str, SizingResult]:
     """Compute per-symbol sizing for one strategy in one bucket.
 
@@ -200,6 +213,11 @@ def size_positions(
             strategy, symbol) blocks re-entry. Callers should pass
             ``dedup_window_hours_for_tf(strategy_tf)``; None falls back
             to the legacy 23h.
+        contract_sizes_override: live per-symbol contract sizes from the
+            venue's product catalogue; symbols missing from the dict use
+            the ``allocator.yaml`` table.
+        fx_inr_per_usd_override: live USD/INR rate; None uses the
+            ``allocator.yaml`` value.
 
     Returns:
         {symbol: SizingResult} for every input candidate. Caller iterates
@@ -364,6 +382,12 @@ def size_positions(
             mark_price_usd=price,
             symbol=sym,
             config=config,
+            contract_size_override=(
+                contract_sizes_override.get(sym)
+                if contract_sizes_override
+                else None
+            ),
+            fx_override=fx_inr_per_usd_override,
         )
         if contracts < 1:
             results[sym] = SizingResult(

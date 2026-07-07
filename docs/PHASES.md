@@ -186,8 +186,14 @@ top-to-bottom.
       `dedup_window_hours_for_tf` (23/24 of one strategy bar: 1d → 23h
       as before, 1h → ~57 min, 5m → ~4.8 min); BucketRunner passes it
       per strategy row into `size_positions`. Unblocks Phase 2 swing.
-- [ ] Contract sizes + FX from live sources — read `contract_value` from
-      Delta `/v2/products` instead of YAML; periodic USD/INR refresh
+- [x] **Contract sizes + FX from live sources** — shipped 2026-07-07:
+      sizer now uses live `contract_value` from Delta `/v2/products`
+      (per-symbol override; YAML table stays as fallback when the venue
+      doesn't know the symbol) and a live USD/INR rate
+      (`src/data_sources/fx.py`: frankfurter.app ECB rate, 12h cache,
+      sanity-clamped to [50,150], falls back to last-good then YAML).
+      Reconciler wallet→bucket_state mirror uses the same live rate via
+      `fx_provider`.
 - [ ] Delta client hardening — retry/backoff, HTTP 429 handling, clock-skew
       tolerance on HMAC timestamp, periodic product-catalogue refresh
 - [ ] Regime brain cache for 4h/15m TFs (currently uncached → per-tick HMM)
@@ -239,6 +245,7 @@ Append a one-liner per session for traceability.
 - 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
 - 2026-06-10 — Added EMA 9/15 crossover strategy for swing-crypto bucket. Populated `swing/crypto/allocator.yaml` with industry-standard μ/σ (BTC annualized 40%/70% → 1H mu=4.6e-5 sigma=0.0075; 10 majors total). 7 EMA strategy tests + scripts/swing_crypto_dryrun.py end-to-end check passing (3 candidates placed, ₹24.9k margin / ₹249.9k notional within ₹50k bucket at 10x leverage). Decision 018 added: sizer insufficiency check uses required margin, not leveraged notional.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
+- 2026-07-07 (cont.) — Phase 1c item 9 shipped: live contract sizes + FX. `src/data_sources/fx.py` (12h-cached frankfurter.app USD/INR, sanity [50,150], last-good → YAML fallback chain); `Broker.contract_size` gained `default=` so the sizer can distinguish unknown (→ YAML) from real values; `size_positions` + `notional_inr_to_contracts` gained overrides; reconciler `fx_provider`. 176 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 8 shipped: TF-scaled dedup window (`dedup_window_hours_for_tf` in sizer; 23/24 of one strategy bar; runner passes per-strategy-row TF). 170 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 7 shipped: per-bucket tick cadence (`tick_interval_for_tf`, 1d bucket now re-scans every 15 min instead of 60s; safety paths unchanged at 60s; crashing buckets back off to their cadence) + nightly retention prune on Railway scheduler (`src/core/retention.py`; snapshots 60d, audit_log 180d). 165 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 6 shipped: heartbeat/dead-man's switch. `heartbeat` table (migration 0008), `src/core/heartbeat.py` (beat/last_beat/pure staleness), bot beats after each completed tick, Railway scheduler `heartbeat_watch` job (2 min interval) pages on stale (>600s, HEARTBEAT_STALE_SECONDS) with dedup + recovery ping. 160 unit tests green.
