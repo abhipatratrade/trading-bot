@@ -98,14 +98,20 @@ Kelly-sized against ₹50k bucket capital, optional regime multiplier.
 - [x] Unit tests for shared modules (36 passing)
 
 ### 1b — Soak restart on new structure (Decision 017)
-- [ ] Run migration 0002 against GCP Postgres
-- [ ] Redeploy bot to GCP VM
-- [ ] **Run on testnet ≥ 14 days unattended on the new structure**
-- [ ] Train initial HMM on BTCUSDT 1D and flip `regime.enabled: true` in
-      `longterm/crypto/regime.yaml`
-- [ ] Update `allocator.yaml` μ/σ values from backtester output + new
-      `backtest_ref`
-- [ ] Go live with ₹50,000 capital
+- [x] Run migration 0002 against prod Postgres (Railway — done 2026-06-12;
+      DB lives on Railway, not GCP; migrations now auto-apply on deploy)
+- [x] Redeploy bot to GCP VM (2026-06-12; Mumbai VM since 2026-06-15)
+- [~] **Run on testnet ≥ 14 days unattended on the new structure** —
+      ongoing; note the Phase 1c safety changes (exits, breakers, stops,
+      heartbeat) landed 2026-07-06/07, so the user may want the soak
+      clock to count from 2026-07-07
+- [x] Train initial HMM on BTC 1D and flip `regime.enabled: true` —
+      done 2026-06-14/15 (per-coin models + weekly VM retrain,
+      Decision 020); `regime.yaml` has `enabled: true`
+- [!] Update `allocator.yaml` μ/σ values from backtester output + new
+      `backtest_ref` — BLOCKED on the backtester (separate project,
+      built by the user); required before go-live
+- [ ] Go live with ₹50,000 capital (user decision, after soak + μ/σ)
 
 **Phase 1 exit criterion**: 14 testnet days clean (under new structure) +
 first live week clean.
