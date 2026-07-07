@@ -11,8 +11,11 @@ Recovery is manual: the user disengages the kill switch from the
 dashboard once the underlying condition is understood.
 
 ``run_bot`` calls :func:`enforce_breakers` once per tick per sub-account.
-Accounts whose buckets are all already killed are skipped, so a trip
-fires the flatten exactly once and stays quiet afterwards.
+Decision 024: breakers are WATCHED even while the account's buckets are
+killed — a manual kill leaves positions open, and those positions must
+still be flattened if a breaker trips. Acting is gated so a persistent
+trip on an already-halted, already-flat account stays quiet (no
+re-engage/re-alert spam every tick); Telegram pings are dedup-capped.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from src.brokers.base import Broker, OrderType, PositionInfo
-from src.core.alerts import send_alert
+from src.core.alerts import note_alert_recovery, send_alert_dedup
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -51,9 +54,10 @@ def enforce_breakers(
     """
     clk = clock or RealClock()
 
-    # Already halted → nothing to enforce (prevents re-flatten every tick).
-    if all(kill_switch.is_engaged(b) for b in bucket_ids):
-        return False
+    # Decision 024: breakers run even while killed. Remember the prior
+    # kill state so acting can be gated below (a persistent trip on an
+    # already-halted, already-flat account must not re-fire every tick).
+    already_killed = all(kill_switch.is_engaged(b) for b in bucket_ids)
 
     positions = broker.get_positions()
     held_symbols = [p.symbol for p in positions]
@@ -85,6 +89,18 @@ def enforce_breakers(
     )
     tripped = [r for r in results if r.tripped]
     if not tripped:
+        # One-off ping if this account had been paging breaker trips.
+        note_alert_recovery(
+            f"breaker_trip:{account_ref}",
+            f"[{account_ref}] breakers CLEAR again (kill switch stays "
+            f"engaged until manually released)",
+        )
+        return False
+
+    # Act-gate (Decision 024): already halted AND flat → nothing left to
+    # protect; keep watching silently. Any open position (manual kill, or
+    # one that slipped past a flatten) still gets flattened.
+    if already_killed and not positions:
         return False
 
     names = [r.name for r in tripped]
@@ -112,9 +128,15 @@ def enforce_breakers(
             )
 
     # 1. Halt: per-bucket kill switch (dashboard-visible, manually cleared).
+    # Only engage switches that aren't already on — engage() alerts and
+    # audit-logs each call, and a manually-killed bucket should keep its
+    # original reason/engaged_by.
     reason = f"breaker(s) tripped: {', '.join(names)}"
     for bucket_id in bucket_ids:
-        kill_switch.engage(reason, strategy_id=bucket_id, engaged_by="breaker")
+        if not kill_switch.is_engaged(bucket_id):
+            kill_switch.engage(
+                reason, strategy_id=bucket_id, engaged_by="breaker"
+            )
 
     # 2. Flatten every open position on the account.
     flattened, failed = _flatten_positions(
@@ -124,11 +146,12 @@ def enforce_breakers(
         clock=clk,
     )
 
-    send_alert(
+    send_alert_dedup(
+        f"breaker_trip:{account_ref}",
         f"BREAKER ENFORCEMENT on {account_ref} (buckets {bucket_ids})\n"
         f"Tripped: {', '.join(names)}\n"
         f"Kill switch ENGAGED; flatten: {flattened} closed, {len(failed)} FAILED"
-        + (f"\nFailed symbols: {failed} — CLOSE MANUALLY" if failed else "")
+        + (f"\nFailed symbols: {failed} — CLOSE MANUALLY" if failed else ""),
     )
     return True
 

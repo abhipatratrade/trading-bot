@@ -57,6 +57,8 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
 | Exits & enforcement | Strategy-driven exits (step 0); breaker trip = kill switch + flatten; bucket_state mirrors sub-account wallet; dashboard basic auth — Decision 021 |
 | Protective stops | Exchange-resident reduce-only stop-market per position; `stop_loss_pct` per bucket in buckets.yaml (0.5/leverage rule) — Decision 022 |
+| Kill-switch semantics | Blocks risk-increasing actions only: strategy exits + breaker watch continue while killed — Decision 024 |
+| USD/INR rate | FIXED 85 in each bucket's allocator.yaml (no live FX feed) — user decision 2026-07-07, see Decision 024 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |
 | Backtest engine | Out of scope for this repo |
 | Options trading | Deferred until all futures/spot phases live |

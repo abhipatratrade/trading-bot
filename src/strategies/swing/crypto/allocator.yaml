@@ -40,7 +40,7 @@ stats:
 
 # See src/strategies/longterm/crypto/allocator.yaml for an explanation
 # of these two blocks. Same Delta India contract-size table.
-fx_inr_per_usd: 84.0
+fx_inr_per_usd: 85.0
 default_contract_size: 1
 contract_sizes:
   BTCUSD:  0.001

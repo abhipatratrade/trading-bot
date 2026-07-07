@@ -53,7 +53,6 @@ from src.core.models import (
     Trade,
 )
 from src.data_sources.base import MarketData
-from src.data_sources.fx import get_usd_inr
 from src.order_manager.manager import KillSwitchEngagedError, OrderManager
 from src.safety import kill_switch
 from src.shared.allocator.sizer import (
@@ -167,10 +166,6 @@ class BucketRunner:
             _log.info("bucket_disabled_skip", bucket_id=self.bucket.id)
             return _empty_summary(self.bucket.id)
 
-        if kill_switch.is_engaged(self.bucket.id):
-            _log.info("bucket_kill_switch_skip", bucket_id=self.bucket.id)
-            return _empty_summary(self.bucket.id)
-
         account_ref = self.bucket.config.account_ref
         broker = self._brokers.get(account_ref)
         order_manager = self._oms.get(account_ref)
@@ -184,7 +179,27 @@ class BucketRunner:
 
         # 0. Exits — strategy-driven closes run before any entry logic
         # (Decision 021). A failed exit must not block other strategies.
+        # Decision 024: exits also run while the kill switch is engaged —
+        # they are reduce-only, and a halted bucket must still manage the
+        # positions it holds. Entries below are what the kill blocks.
         exited = self._run_exits(order_manager)
+
+        if kill_switch.is_engaged(self.bucket.id):
+            _log.info(
+                "bucket_killed_exits_only",
+                bucket_id=self.bucket.id,
+                exited=exited,
+            )
+            return RunSummary(
+                bucket_id=self.bucket.id,
+                placed=0,
+                skipped={},
+                eligible_strategies=[],
+                blocked_strategies={"*": "kill switch engaged"},
+                universe=[],
+                regime=None,
+                exited=exited,
+            )
 
         # 1+2: discovery + master gate (already loaded; gate is per-strategy below).
 
@@ -266,17 +281,15 @@ class BucketRunner:
                 )
                 regimes[sym] = pred.regime if pred else None
 
-            # Live venue values (Phase 1c): contract sizes from the
-            # broker's product catalogue (None ⇒ symbol unknown, YAML
-            # table applies) and a refreshed USD/INR rate.
+            # Live contract sizes from the broker's product catalogue
+            # (None ⇒ symbol unknown, YAML table applies). FX stays the
+            # fixed allocator.yaml rate — user decision 2026-07-07:
+            # 1 USD = 85 INR for Delta India, no live feed.
             live_contract_sizes: dict[str, Decimal] = {}
             for sym in symbols:
                 cs = broker.contract_size(sym, default=None)
                 if cs is not None:
                     live_contract_sizes[sym] = cs
-            live_fx = get_usd_inr(
-                fallback=self.allocator_config.fx_inr_per_usd
-            )
 
             results = size_positions(
                 bucket=self.bucket,
@@ -289,7 +302,6 @@ class BucketRunner:
                 # (1d → 23h, 1h → ~57 min), not a hardcoded 23h.
                 dedup_window_hours=dedup_window_hours_for_tf(row.tf),
                 contract_sizes_override=live_contract_sizes,
-                fx_inr_per_usd_override=live_fx,
             )
 
             for sym, res in results.items():
@@ -453,6 +465,9 @@ class BucketRunner:
                 size=pos.quantity,
                 order_type=OrderType.MARKET,
                 reduce_only=True,
+                # Decision 024: strategy exits are risk-reducing and pass
+                # an engaged kill switch (same as breaker flatten / stops).
+                allow_when_killed=True,
                 intent_id=f"exit-{self._clock.now().strftime('%Y%m%d%H%M')}",
             )
         except KillSwitchEngagedError:

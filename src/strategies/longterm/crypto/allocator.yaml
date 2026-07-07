@@ -31,9 +31,10 @@ stats:
   BNBUSD:  { mu_per_period: 0.0010, sigma_per_period: 0.0300 }
 
 # USD/INR rate used to convert bucket capital (INR) into broker quote
-# currency (USD on Delta India). Worth refreshing periodically; the
-# sizer reads this at strategy load time.
-fx_inr_per_usd: 84.0
+# currency (USD on Delta India). FIXED at 85 per user decision
+# 2026-07-07 — no live FX feed; change it here (and in the other bucket
+# allocator.yaml files) if the rate should move.
+fx_inr_per_usd: 85.0
 
 # Delta India perpetual contract sizes (units of base asset per contract).
 # Verify against the Delta India product spec before going live; values

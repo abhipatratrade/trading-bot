@@ -603,3 +603,42 @@ Known limitations (accepted for Phase 1):
   killed account the day's anchor is only created after un-killing —
   the first post-recovery pass anchors at recovered equity, which is
   the conservative choice.
+
+## 024 — Kill-switch semantics: exits + breaker watch stay active while killed
+Date: 2026-07-07
+Status: Accepted (user chose option c, 2026-07-07 session)
+Refines: 021, 023
+
+Context: an engaged kill switch previously skipped the bucket entirely,
+so a *manually* killed bucket ran no strategy exits, and an account
+whose buckets were all killed was skipped by breaker enforcement. A
+halted bucket holding positions was therefore unmanaged: no exit logic,
+no drawdown/liquidation watch (only the exchange-resident stops from
+Decision 022 remained).
+
+Decision (user-selected option c): **the kill switch blocks
+risk-INCREASING actions only.**
+
+1. **Strategy exits run while killed.** BucketRunner's step 0 executes
+   every tick regardless of kill state; exit orders pass the engaged
+   switch via ``allow_when_killed`` (they are reduce-only). Scanner,
+   regime, sizing, and entries remain fully blocked while killed.
+2. **Breakers are watched while killed.** ``enforce_breakers`` no longer
+   early-returns on all-killed accounts. A trip on a killed account with
+   open positions still flattens them. Acting is gated: an
+   already-halted, already-flat account with a persistent condition is
+   watched silently (no re-engage / re-flatten / re-alert every tick).
+   ``engage()`` is only called for switches not already on, so a manual
+   kill keeps its original reason/engaged_by.
+3. **Alert hygiene.** Per-breaker detail alerts and the enforcement trip
+   alert are dedup-capped (3/hour per key) since breakers now evaluate
+   every tick under persistent conditions; a one-off "breakers CLEAR"
+   ping fires on recovery. The kill switch itself still only clears
+   manually from the dashboard.
+
+Also recorded under this session (supersedes part of the Phase 1c "live
+FX" item): **USD/INR is a fixed rate, not a live feed** — user decision:
+1 USD = 85 INR for Delta India. ``fx_inr_per_usd: 85.0`` in each
+bucket's ``allocator.yaml`` is the single source; the frankfurter.app
+fetch (``src/data_sources/fx.py``) was removed same-day. Live contract
+sizes from ``/v2/products`` are unaffected and still used.

@@ -30,7 +30,6 @@ from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
-from src.data_sources.fx import get_usd_inr
 from src.data_sources.symbol_loader import (
     DEFAULT_CSV,
     fetch_mappings,
@@ -172,11 +171,6 @@ def main() -> None:
             bucket_fx={
                 b: fx for b, fx in bucket_fx.items() if b in ref_bucket_ids
             },
-            # Live USD/INR for the wallet→bucket_state mirror; YAML value
-            # remains the fallback when the FX API is unreachable.
-            fx_provider=lambda b: get_usd_inr(
-                fallback=bucket_fx.get(b, Decimal("1"))
-            ),
         )
         _log.info("delta_account_ready", account_ref=ref, buckets=ref_bucket_ids)
 

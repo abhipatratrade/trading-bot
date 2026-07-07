@@ -145,9 +145,11 @@ def notional_inr_to_contracts(
     the bucket-allocated notional by that gives the number of contracts
     the broker should receive.
 
-    ``contract_size_override`` / ``fx_override`` carry live venue values
-    (Delta ``/v2/products`` contract_value; refreshed USD/INR). None ⇒
-    the static ``allocator.yaml`` values (Phase 1c).
+    ``contract_size_override`` carries the live venue contract_value
+    (Delta ``/v2/products``); ``fx_override`` exists for callers that
+    want a non-YAML rate (unused in production — FX is FIXED in
+    ``allocator.yaml`` per user decision 2026-07-07). None ⇒ the static
+    ``allocator.yaml`` values.
 
     Returns 0 if any input is non-positive (caller decides what to do).
     """
@@ -216,8 +218,9 @@ def size_positions(
         contract_sizes_override: live per-symbol contract sizes from the
             venue's product catalogue; symbols missing from the dict use
             the ``allocator.yaml`` table.
-        fx_inr_per_usd_override: live USD/INR rate; None uses the
-            ``allocator.yaml`` value.
+        fx_inr_per_usd_override: optional non-YAML USD/INR rate. Unused
+            in production — the rate is fixed in ``allocator.yaml``
+            (85 for Delta India, user decision 2026-07-07).
 
     Returns:
         {symbol: SizingResult} for every input candidate. Caller iterates
@@ -446,7 +449,14 @@ def size_positions(
                 message=(
                     f"sized {len(results)} candidates for "
                     f"{strategy_name}@{bucket.id}: "
-                    f"{sum(1 for r in results.values() if r.decision == SizingDecision.PLACED)} placed"
+                    + str(
+                        sum(
+                            1
+                            for r in results.values()
+                            if r.decision == SizingDecision.PLACED
+                        )
+                    )
+                    + " placed"
                 ),
                 payload={
                     "bucket_id": bucket.id,

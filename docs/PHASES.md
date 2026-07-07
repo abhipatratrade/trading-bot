@@ -192,14 +192,14 @@ top-to-bottom.
       `dedup_window_hours_for_tf` (23/24 of one strategy bar: 1d → 23h
       as before, 1h → ~57 min, 5m → ~4.8 min); BucketRunner passes it
       per strategy row into `size_positions`. Unblocks Phase 2 swing.
-- [x] **Contract sizes + FX from live sources** — shipped 2026-07-07:
-      sizer now uses live `contract_value` from Delta `/v2/products`
-      (per-symbol override; YAML table stays as fallback when the venue
-      doesn't know the symbol) and a live USD/INR rate
-      (`src/data_sources/fx.py`: frankfurter.app ECB rate, 12h cache,
-      sanity-clamped to [50,150], falls back to last-good then YAML).
-      Reconciler wallet→bucket_state mirror uses the same live rate via
-      `fx_provider`.
+- [x] **Contract sizes live + FX fixed** — contract sizes shipped
+      2026-07-07: sizer uses live `contract_value` from Delta
+      `/v2/products` (per-symbol override; YAML table is the fallback
+      when the venue doesn't know the symbol). FX: live feed was built,
+      then **superseded same day by user decision** — 1 USD = 85 INR
+      FIXED for Delta India; `fx_inr_per_usd: 85.0` in each bucket's
+      `allocator.yaml` is the single source (frankfurter fetch removed;
+      see Decision 024 note).
 - [x] **Delta client hardening** — shipped 2026-07-07: central `_request`
       with bounded safety-aware retries — GETs retry transport/5xx with
       exponential backoff; 429 retried for ALL verbs (rate-limited =
@@ -213,8 +213,13 @@ top-to-bottom.
       4h/15m buckets previously never hit the cache → per-tick HMM +
       snapshot writes. Cache now bounded at one entry per
       (bucket, symbol) instead of growing per bar.
-- [ ] Kill-switch semantics refinement (user to confirm): allow strategy
-      exits and/or breaker watch while manually killed (reduce-only paths)
+- [x] **Kill-switch semantics refinement** — shipped 2026-07-07
+      (Decision 024, user chose option c): kill switch blocks
+      risk-increasing actions only. Strategy exits run while killed
+      (reduce-only, `allow_when_killed`); breakers watched while killed
+      (trip on a killed account with positions still flattens; halted +
+      flat accounts watched silently); breaker alerts dedup-capped with
+      a recovery ping.
 - [x] **CSRF token on kill-switch toggle** — shipped 2026-07-07:
       per-process random token in template globals, hidden field on both
       toggle forms, constant-time check → 403 on mismatch (rotates on
@@ -268,6 +273,7 @@ Append a one-liner per session for traceability.
 - 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
 - 2026-06-10 — Added EMA 9/15 crossover strategy for swing-crypto bucket. Populated `swing/crypto/allocator.yaml` with industry-standard μ/σ (BTC annualized 40%/70% → 1H mu=4.6e-5 sigma=0.0075; 10 majors total). 7 EMA strategy tests + scripts/swing_crypto_dryrun.py end-to-end check passing (3 candidates placed, ₹24.9k margin / ₹249.9k notional within ₹50k bucket at 10x leverage). Decision 018 added: sizer insufficiency check uses required margin, not leveraged notional.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
+- 2026-07-07 (final) — Phase 1c COMPLETE. Decision 024 shipped (user chose option c): strategy exits run while killed (reduce-only, allow_when_killed) and breakers stay watched while killed (act-gated to avoid re-flatten/alert spam; per-breaker alerts dedup-capped; recovery ping). FX switched to FIXED 85 INR/USD per user (allocator.yaml source of truth; fx.py live feed removed same-day). 188 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 13 shipped: config cleanup (kite_* → dhan_* settings + .env.example). Phase 1c backlog now complete except the kill-switch-semantics item, which is explicitly waiting on a user decision. 191 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 12 shipped: CSRF token on kill-switch toggle (per-process token via Jinja globals, constant-time compare, 403 on mismatch). 191 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 11 shipped: regime brain cache generalized to any TF (`_window_start` parses `<N><m|h|d|w>`; bounded one-entry-per-(bucket,symbol) cache). 188 unit tests green.

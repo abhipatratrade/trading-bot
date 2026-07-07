@@ -17,10 +17,14 @@ from decimal import Decimal
 from typing import Any
 
 from src.brokers.base import Broker
-from src.core.alerts import send_alert
+from src.core.alerts import send_alert_dedup
 from src.core.logging import get_logger
 
 _log = get_logger("safety.breakers")
+
+# Decision 024: breakers keep running while an account is killed, so a
+# persistent condition would page every 60s tick — dedup-cap the detail
+# alerts per breaker (enforcement.py sends the main dedup'd trip alert).
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +72,11 @@ def check_daily_drawdown(
             anchor_equity=str(anchor_equity),
             current_equity=str(current_equity),
         )
-        send_alert(
+        send_alert_dedup(
+            "breaker_detail:daily_drawdown",
             f"BREAKER TRIPPED: daily_drawdown\n"
             f"drawdown={drawdown_pct:.2f}% (threshold {max_drawdown_pct}%)\n"
-            f"equity={current_equity} vs day anchor={anchor_equity}"
+            f"equity={current_equity} vs day anchor={anchor_equity}",
         )
 
     return BreakerResult(
@@ -123,12 +128,14 @@ def check_liquidation_distance(
             violations=violations,
             threshold=str(min_distance_pct),
         )
-        send_alert(
+        send_alert_dedup(
+            "breaker_detail:liquidation_distance",
             f"BREAKER TRIPPED: liquidation_distance (threshold {min_distance_pct}%)\n"
             + "\n".join(
-                f"- {v['symbol']}: entry={v['entry_price']} liq={v['liquidation_price']} dist={v['distance_pct']}%"
+                f"- {v['symbol']}: entry={v['entry_price']} "
+                f"liq={v['liquidation_price']} dist={v['distance_pct']}%"
                 for v in violations
-            )
+            ),
         )
 
     return BreakerResult(
@@ -175,12 +182,13 @@ def check_funding_extreme(
             violations=violations,
             threshold=str(max_funding_rate),
         )
-        send_alert(
+        send_alert_dedup(
+            "breaker_detail:funding_extreme",
             f"BREAKER TRIPPED: funding_extreme (threshold {max_funding_rate})\n"
             + "\n".join(
                 f"- {v['symbol']}: rate={v['funding_rate']}"
                 for v in violations
-            )
+            ),
         )
 
     return BreakerResult(

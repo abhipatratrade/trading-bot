@@ -8,7 +8,6 @@ actually reports.  Every diff is logged to the ``audit_log`` table.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
@@ -61,7 +60,6 @@ class Reconciler:
         clock: Clock | None = None,
         bucket_ids: list[str] | None = None,
         bucket_fx: dict[str, Decimal] | None = None,
-        fx_provider: Callable[[str], Decimal] | None = None,
     ) -> None:
         self._broker = broker
         self._broker_name = broker_name
@@ -73,11 +71,9 @@ class Reconciler:
         # (used by single-account smoke scripts / tests).
         self._bucket_ids = bucket_ids
         # Decision 021: bucket_state mirrors the sub-account wallet. fx is
-        # the bucket's allocator fx_inr_per_usd (wallet quote → INR).
-        # ``fx_provider`` (Phase 1c) supplies a LIVE per-bucket rate and
-        # wins over the static dict when set.
+        # the bucket's allocator fx_inr_per_usd (wallet quote → INR) —
+        # a FIXED rate per user decision 2026-07-07 (85 for Delta India).
         self._bucket_fx = bucket_fx or {}
-        self._fx_provider = fx_provider
 
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
@@ -357,10 +353,7 @@ class Reconciler:
                         "bucket_state_row_missing", bucket_id=bucket_id
                     )
                     continue
-                if self._fx_provider is not None:
-                    fx = self._fx_provider(bucket_id)
-                else:
-                    fx = self._bucket_fx.get(bucket_id, Decimal("1"))
+                fx = self._bucket_fx.get(bucket_id, Decimal("1"))
                 state.available_balance_inr = available * fx
                 state.locked_margin_inr = locked * fx
         self._log.info(
