@@ -1,9 +1,13 @@
 """
 Position-size allocator.
 
-Per PPTX slide 4(d) + Decision 015 (clarification 018), sizing is:
+Per PPTX slide 4(d) + Decision 015 (clarifications 018 and 025), sizing is:
 
-    required_margin_inr   = bucket.capital_inr
+    equity_inr             = bucket_state.available_balance_inr
+                             + bucket_state.locked_margin_inr
+                             (live sub-account mirror — Decision 025;
+                             bucket.capital_inr is only the P&L baseline)
+    required_margin_inr   = equity_inr
                             * kelly_fraction(μ, σ)
                             * fractional_kelly
                             * regime_multiplier
@@ -239,6 +243,7 @@ def size_positions(
                 "Did migration 0002 seed run?"
             )
         available_inr = state.available_balance_inr
+        locked_inr = state.locked_margin_inr
 
         held_rows = session.execute(
             select(Position.symbol).where(
@@ -317,7 +322,11 @@ def size_positions(
     # ---- per-symbol decision ---------------------------------------------
     results: dict[str, SizingResult] = {}
     leverage = bucket.config.leverage_max
-    capital = bucket.config.capital_inr
+    # Decision 025 (amends 015): Kelly sizes against LIVE sub-account
+    # equity (available + locked margin, mirrored from the exchange every
+    # reconcile sweep) — the book grows and shrinks with the account.
+    # ``capital_inr`` is only the P&L baseline / dashboard reference now.
+    capital = available_inr + locked_inr
 
     for sym in candidates:
         if sym in held:

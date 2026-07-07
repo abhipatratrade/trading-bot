@@ -642,3 +642,46 @@ FX" item): **USD/INR is a fixed rate, not a live feed** — user decision:
 bucket's ``allocator.yaml`` is the single source; the frankfurter.app
 fetch (``src/data_sources/fx.py``) was removed same-day. Live contract
 sizes from ``/v2/products`` are unaffected and still used.
+
+## 025 — Kelly sizes on live equity; capital_inr is the P&L baseline only
+Date: 2026-07-07
+Status: Accepted (user decision, 2026-07-07 session)
+Amends: 015
+Refines: 021
+
+Context: the sizer computed Kelly notionals against the static
+``buckets.yaml`` ``capital_inr`` (₹50k) while the actual sub-account
+wallet held far less (testnet losses from the June duplicate-order bug
+and liquidations left ~₹18k). Result: oversized suggestions that mostly
+skipped as insufficient-margin, and a dashboard P&L of −63.9% measured
+against capital the wallet no longer (and possibly never) held.
+
+Decision (user): **sizing follows the account, P&L follows a baseline.**
+
+1. **Kelly base = live equity.** ``size_positions`` uses
+   ``bucket_state.available_balance_inr + locked_margin_inr`` (the
+   exchange-mirrored sub-account wallet, Decision 021) as the Kelly
+   capital base. The book automatically scales down after losses and up
+   after gains/deposits. ``buckets.yaml`` ``capital_inr`` no longer
+   affects sizing.
+2. **P&L baseline = capital_inr + capital_adjustments_inr.**
+   ``pnl = equity − (capital_inr + adjustments)`` with adjustments in
+   ``bucket_state.extra["capital_adjustments_inr"]``. On any manual
+   deposit (+X) or withdrawal (−X), record it with
+   ``python -m scripts.record_capital_adjustment <bucket> --amount ±X``
+   so the money movement doesn't read as P&L; ``--rebase`` zeroes the
+   P&L at the current wallet. Every run writes an audit row.
+3. **Executed this session:** longterm-crypto adjustments set to
+   −31,736.34 (= 214.866592 USD × 85 − 50,000), writing off the
+   June-era testnet losses; cumulative P&L now counts from the current
+   ~$215 wallet.
+
+Consequences:
+- Sizing needs no config edits when funding changes; the adjustment
+  script is only about keeping the P&L display honest.
+- With equity as the Kelly base, the insufficient-margin skip
+  effectively stops firing for fresh entries (weights ≤ aggregate cap
+  1.0 of equity); it still guards when margin is already locked.
+- A stale wallet mirror now affects sizing, not just display — the
+  reconciler sync being healthy matters more (see the 2026-07-07 note
+  about the suspected failing sweep on the VM).

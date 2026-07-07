@@ -53,7 +53,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Execution accounts | One Delta India sub-account per crypto bucket — Decision 019 |
 | Regime | Per-bucket HMM at bucket TF (3-state bear/neutral/bull) — Decision 014 |
 | Regime retrain | VM systemd timer, not Railway (Binance geo-blocks Railway) — Decision 020 |
-| Sizing | Kelly on bucket capital, skip if insufficient — Decision 015 |
+| Sizing | Kelly on LIVE sub-account equity (available+locked mirror); `capital_inr` is P&L baseline only — Decision 025 (amends 015) |
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
 | Exits & enforcement | Strategy-driven exits (step 0); breaker trip = kill switch + flatten; bucket_state mirrors sub-account wallet; dashboard basic auth — Decision 021 |
 | Protective stops | Exchange-resident reduce-only stop-market per position; `stop_loss_pct` per bucket in buckets.yaml (0.5/leverage rule) — Decision 022 |
