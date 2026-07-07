@@ -560,3 +560,46 @@ Consequences:
 - `stop_loss_pct` is a safety parameter (like breaker thresholds), not a
   strategy parameter — no `backtest_ref` required to change it, but any
   change should still be committed with rationale.
+
+## 023 — Daily-anchored drawdown breaker
+Date: 2026-07-07
+Status: Accepted
+Refines: 021
+Related house rules: #3, #8
+
+Context: the `daily_drawdown` breaker was daily in name only — it
+compared *current unrealized* PnL against *current* equity every tick.
+Realized losses never counted (close a losing position and the breaker
+resets), and the denominator shrank with the losses. A day of repeated
+small realized losses could never trip it.
+
+Decision: the breaker measures **total equity vs a fixed start-of-day
+anchor**.
+
+Mechanics:
+- New table `daily_equity_anchor` (migration 0007): one row per
+  (account_ref, UTC date), unique-constrained. Equity is in the
+  account's settlement currency (USD for Delta India).
+- The first breaker pass of each UTC day inserts the anchor with that
+  moment's equity; later passes — including after restarts — read it
+  back, so the anchor survives crashes (House Rule #3).
+- Equity = wallet (available + order_margin + position_margin) +
+  unrealized PnL, computed in `safety/enforcement.py` from the balances
+  + positions it already fetches. `check_daily_drawdown` is now pure
+  math: drawdown% = (anchor − current)/anchor × 100, trip at
+  `DAILY_DRAWDOWN_PCT` (default 5%). Anchor helper:
+  `src/safety/equity_anchor.py::get_or_create_daily_anchor`.
+- `ops/deploy.sh` now runs `alembic upgrade head` (before the service
+  restart) whenever a push touches `migrations/`; failure aborts the
+  restart so old code keeps running against the old schema. Migration
+  0007 itself was applied manually this session (the deploy cycle that
+  ships this feature still runs the old script).
+
+Known limitations (accepted for Phase 1):
+- Mid-day deposits/withdrawals distort the measure (a withdrawal reads
+  as a loss). Sub-account funding changes are rare and user-initiated;
+  re-anchor manually by deleting the day's row if needed.
+- While an account is fully halted, enforcement early-returns, so on a
+  killed account the day's anchor is only created after un-killing —
+  the first post-recovery pass anchors at recovered equity, which is
+  the conservative choice.

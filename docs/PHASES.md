@@ -161,8 +161,13 @@ top-to-bottom.
       mark price, snapped to live tick_size. Stops flow through
       OrderManager so a stop that fires while the bot is down still gets
       P&L-paired by the reconciler.
-- [ ] Daily-anchored drawdown breaker — start-of-day equity snapshot per
-      account (realized + unrealized vs anchor; needs small migration)
+- [x] **Daily-anchored drawdown breaker** — shipped 2026-07-07 (Decision
+      023): `daily_equity_anchor` table (migration 0007, applied to
+      Postgres) snapshots each sub-account's equity (wallet + unrealized)
+      at first breaker pass of the UTC day; `check_daily_drawdown` is now
+      pure math vs that anchor, so realized losses count. Bonus:
+      `ops/deploy.sh` auto-runs `alembic upgrade head` when a push
+      touches `migrations/`.
 - [ ] Heartbeat / dead-man's switch — bot writes a heartbeat row; Railway
       scheduler (or healthchecks.io) alerts on silence
 - [ ] Per-bucket tick cadence derived from bucket TF (stop re-scanning a
@@ -223,6 +228,7 @@ Append a one-liner per session for traceability.
 - 2026-06-10 — Major restructure per PPTX `C:\Users\User\Documents\Trading bot instructions.pptx`: six (type × market) buckets, per-bucket regime HMM, Kelly sizer with insufficient-balance skip rule, CSV Strategy Master, dashboard 6-card overview + per-bucket pages. Decisions 013-017 added. Old `crypto_longterm` removed and re-ported as `longterm/crypto/strategies/top5_volume.py`. 36 unit tests passing. Soak clock to restart at next deploy.
 - 2026-06-10 — Added EMA 9/15 crossover strategy for swing-crypto bucket. Populated `swing/crypto/allocator.yaml` with industry-standard μ/σ (BTC annualized 40%/70% → 1H mu=4.6e-5 sigma=0.0075; 10 majors total). 7 EMA strategy tests + scripts/swing_crypto_dryrun.py end-to-end check passing (3 candidates placed, ₹24.9k margin / ₹249.9k notional within ₹50k bucket at 10x leverage). Decision 018 added: sizer insufficiency check uses required margin, not leveraged notional.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
+- 2026-07-07 (later still) — Phase 1c item 5 shipped (Decision 023): daily-anchored drawdown breaker. `daily_equity_anchor` table (migration 0007 — applied to Railway Postgres this session), first breaker pass of each UTC day snapshots account equity (wallet + unrealized), `check_daily_drawdown` rewritten as pure anchor-vs-current math so realized losses count toward the 5% trip. `ops/deploy.sh` now auto-applies alembic migrations on pushes touching `migrations/`. 155 unit tests green (was 147).
 - 2026-07-07 (later) — Phase 1c item 4 shipped (Decision 022): broker-side protective stop-losses. New `src/safety/stop_protection.py` sweep (per tick per sub-account + startup) rests a reduce-only stop-market order on every open position at `stop_loss_pct` from entry (buckets.yaml; 0.5/leverage rule). Delta client gained stop-order placement (stop_loss_order/mark_price), `states=open,pending` on get_open_orders (untriggered stops), and live tick_size; OrderManager gained stop_price + "STOP" alerts; protective stops excluded from exit-engine dedup. 147 unit tests green (was 131).
 - 2026-07-07 — Phase 1c items 1-3 shipped: cumulative bucket P&L (wallet equity vs capital, with capital-adjustments offset) on /buckets cards + detail page; fills/fees ingestion (Delta /v2/fills → Trade.fees + extra: avg_fill_price/traded_notional_usd; realized P&L by exit↔entry pairing; unrealized from exchange positions) in a new reconciler `_enrich_trades_pnl` sweep step; per-trade Traded amt / P&L / P&L% columns on bucket + home trade tables. Contract sizes now read from Delta /v2/products. New pure-math module src/order_manager/pnl.py + 14 tests (131 total green).
 - 2026-07-06 (later) — Phase 1c backlog section added: review leftovers + two new user asks (cumulative bucket P&L on dashboard; per-trade traded amt + P&L amt/% refreshed ≤5 min, with fills-ingestion prerequisite). `continue` resumes from Phase 1c top item. Deployed c36b038 to VM + Railway; DASHBOARD_PASSWORD set on Railway dashboard service.

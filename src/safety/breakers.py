@@ -31,39 +31,33 @@ class BreakerResult:
 
 
 def check_daily_drawdown(
-    broker: Broker,
     *,
+    anchor_equity: Decimal | None,
+    current_equity: Decimal,
     max_drawdown_pct: Decimal = Decimal("5"),
 ) -> BreakerResult:
-    """Trip if total unrealised PnL across all positions exceeds threshold.
+    """Trip when equity has fallen ``max_drawdown_pct`` below the day anchor.
 
-    Uses the broker's live position data.  The threshold is expressed as a
-    percentage of total equity (available + margin).
+    Decision 023: ``anchor_equity`` is the account's start-of-UTC-day
+    equity (``daily_equity_anchor`` row, written by the first breaker pass
+    of the day). ``current_equity`` = wallet balance + unrealized PnL, so
+    both realized losses through the day AND open drawdown count. Pure
+    math — the caller (``safety.enforcement``) supplies both numbers.
     """
-    positions = broker.get_positions()
-    balances = broker.get_balances()
-
-    total_equity = sum(
-        (b.available + b.order_margin + b.position_margin for b in balances),
-        Decimal("0"),
-    )
-
-    total_unrealised = sum(
-        (p.unrealized_pnl or Decimal("0") for p in positions),
-        Decimal("0"),
-    )
-
-    if total_equity <= 0:
+    if anchor_equity is None or anchor_equity <= 0:
         return BreakerResult(
             name="daily_drawdown",
             tripped=False,
-            detail={"reason": "no_equity", "total_equity": "0"},
+            detail={
+                "reason": "no_anchor",
+                "anchor_equity": str(anchor_equity),
+            },
         )
 
-    if total_unrealised < 0:
-        drawdown_pct = abs(total_unrealised) / total_equity * 100
-    else:
-        drawdown_pct = Decimal("0")
+    loss = anchor_equity - current_equity
+    drawdown_pct = (
+        loss / anchor_equity * 100 if loss > 0 else Decimal("0")
+    )
     tripped = drawdown_pct >= max_drawdown_pct
 
     if tripped:
@@ -71,13 +65,13 @@ def check_daily_drawdown(
             "breaker_daily_drawdown_tripped",
             drawdown_pct=str(drawdown_pct),
             threshold=str(max_drawdown_pct),
-            unrealised=str(total_unrealised),
-            equity=str(total_equity),
+            anchor_equity=str(anchor_equity),
+            current_equity=str(current_equity),
         )
         send_alert(
             f"BREAKER TRIPPED: daily_drawdown\n"
             f"drawdown={drawdown_pct:.2f}% (threshold {max_drawdown_pct}%)\n"
-            f"unrealised={total_unrealised} on equity={total_equity}"
+            f"equity={current_equity} vs day anchor={anchor_equity}"
         )
 
     return BreakerResult(
@@ -86,8 +80,8 @@ def check_daily_drawdown(
         detail={
             "drawdown_pct": str(drawdown_pct),
             "threshold_pct": str(max_drawdown_pct),
-            "unrealised_pnl": str(total_unrealised),
-            "total_equity": str(total_equity),
+            "anchor_equity": str(anchor_equity),
+            "current_equity": str(current_equity),
         },
     )
 
@@ -204,13 +198,19 @@ def run_all_breakers(
     data_source: Any,
     held_symbols: list[str],
     *,
+    anchor_equity: Decimal | None,
+    current_equity: Decimal,
     max_drawdown_pct: Decimal = Decimal("5"),
     min_liq_distance_pct: Decimal = Decimal("10"),
     max_funding_rate: Decimal = Decimal("0.01"),
 ) -> list[BreakerResult]:
     """Run every breaker and return the full list of results."""
     return [
-        check_daily_drawdown(broker, max_drawdown_pct=max_drawdown_pct),
+        check_daily_drawdown(
+            anchor_equity=anchor_equity,
+            current_equity=current_equity,
+            max_drawdown_pct=max_drawdown_pct,
+        ),
         check_liquidation_distance(broker, min_distance_pct=min_liq_distance_pct),
         check_funding_extreme(
             broker,

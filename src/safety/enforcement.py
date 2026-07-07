@@ -28,6 +28,7 @@ from src.core.models import AuditEventType, AuditLog
 from src.order_manager.manager import OrderManager
 from src.safety import kill_switch
 from src.safety.breakers import run_all_breakers
+from src.safety.equity_anchor import get_or_create_daily_anchor
 
 _log = get_logger("safety.enforcement")
 
@@ -57,10 +58,27 @@ def enforce_breakers(
     positions = broker.get_positions()
     held_symbols = [p.symbol for p in positions]
 
+    # Daily-anchored equity (Decision 023): wallet balance + unrealized PnL,
+    # measured against the account's start-of-UTC-day anchor so realized
+    # losses through the day count toward the drawdown, not just open PnL.
+    balances = broker.get_balances()
+    current_equity = sum(
+        (b.available + b.order_margin + b.position_margin for b in balances),
+        Decimal("0"),
+    ) + sum(
+        (p.unrealized_pnl or Decimal("0") for p in positions),
+        Decimal("0"),
+    )
+    anchor_equity = get_or_create_daily_anchor(
+        account_ref, current_equity, clk
+    )
+
     results = run_all_breakers(
         broker,
         data,
         held_symbols,
+        anchor_equity=anchor_equity,
+        current_equity=current_equity,
         max_drawdown_pct=max_drawdown_pct,
         min_liq_distance_pct=min_liq_distance_pct,
         max_funding_rate=max_funding_rate,

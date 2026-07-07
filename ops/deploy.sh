@@ -30,8 +30,9 @@ ENV_FILE=/home/kohinoor_abhi/.env
 
 # Paths whose change requires a bot restart. Dashboard/docs/ops changes
 # alone do not (Railway serves the dashboard; the timer reloads itself).
-RESTART_PATHS='^(src/(strategies|shared|core|safety|order_manager|data_sources|brokers|entrypoints)/|buckets\.yaml$|requirements\.txt$|pyproject\.toml$)'
+RESTART_PATHS='^(src/(strategies|shared|core|safety|order_manager|data_sources|brokers|entrypoints)/|buckets\.yaml$|migrations/|requirements\.txt$|pyproject\.toml$)'
 DEP_PATHS='^(requirements\.txt|pyproject\.toml)$'
+MIGRATION_PATHS='^migrations/'
 
 cd "$REPO" || { echo "repo not found: $REPO" >&2; exit 1; }
 
@@ -83,6 +84,17 @@ if printf '%s\n' "$CHANGED" | grep -qE "$DEP_PATHS"; then
         notify "🚨 Deployed $SHA — pip install FAILED, bot NOT restarted (old code still running)"
         exit 1
     fi
+fi
+
+# Apply schema migrations before the new code (which expects them) boots.
+# On failure, do NOT restart — old code keeps running against the old
+# schema, and the alert tells the user to run alembic by hand.
+if printf '%s\n' "$CHANGED" | grep -qE "$MIGRATION_PATHS"; then
+    if ! "$PY" -m alembic upgrade head; then
+        notify "🚨 Deployed $SHA — alembic upgrade FAILED, bot NOT restarted (run migrations manually)"
+        exit 1
+    fi
+    notify "🗄️ Deployed $SHA — alembic migrations applied"
 fi
 
 # Restart only when something the bot actually runs has changed.

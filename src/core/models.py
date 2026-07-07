@@ -20,6 +20,7 @@ Tables:
     regime_snapshot       — per-bucket regime predictions over time
     sizing_snapshot       — every allocator decision (placed or skipped)
     bucket_state          — per-bucket capital & available balance
+    daily_equity_anchor   — start-of-day equity per sub-account (DD breaker)
 """
 
 from __future__ import annotations
@@ -563,6 +564,29 @@ class BucketState(Base, TimestampMixin):
     extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
+class DailyEquityAnchor(Base, TimestampMixin):
+    """Start-of-day (UTC) equity snapshot per execution sub-account.
+
+    The daily-drawdown breaker measures realized + unrealized loss against
+    this anchor (Decision 023). The first breaker pass of each UTC day
+    writes the row; restarts within the day reuse it, so the anchor
+    survives crashes. ``equity`` is in the account's settlement currency
+    (USD for Delta India) = wallet balance + unrealized PnL at snapshot.
+    """
+
+    __tablename__ = "daily_equity_anchor"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_ref", "date", name="uq_equity_anchor_account_date"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    account_ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    date: Mapped[date_] = mapped_column(Date, nullable=False)
+    equity: Mapped[Decimal] = mapped_column(Money, nullable=False)
+
+
 # Re-export for convenience: ``from src.core.models import *`` grabs everything.
 __all__ = [
     "BrokerName",
@@ -585,4 +609,5 @@ __all__ = [
     "RegimeSnapshot",
     "SizingSnapshot",
     "BucketState",
+    "DailyEquityAnchor",
 ]
