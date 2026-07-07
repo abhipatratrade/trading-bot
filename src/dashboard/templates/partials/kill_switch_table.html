@@ -33,6 +33,7 @@
                     <input type="hidden" name="strategy_id" value="{{ s.strategy_id if s.strategy_id != '—' else '' }}">
                     <input type="hidden" name="action" value="disengage">
                     <input type="hidden" name="reason" value="">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button type="submit" class="btn btn-success">Disengage</button>
                 </form>
                 {% else %}

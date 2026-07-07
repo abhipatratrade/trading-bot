@@ -86,6 +86,12 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
     templates.env.filters["num3"] = _num3
     app.state.templates = templates
+    # CSRF token for state-changing forms (kill-switch toggle). Random per
+    # process: pages served by this process embed it; a cross-site POST
+    # can't know it. Rotates on restart — a stale open tab just needs a
+    # refresh after a redeploy.
+    app.state.csrf_token = secrets.token_urlsafe(32)
+    templates.env.globals["csrf_token"] = app.state.csrf_token
 
     @app.exception_handler(Exception)
     async def _global_error(request: Request, exc: Exception) -> HTMLResponse:

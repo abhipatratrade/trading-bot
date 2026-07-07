@@ -22,6 +22,7 @@
             <input type="text" name="reason" placeholder="Why?" style="width:200px;">
         </div>
         <input type="hidden" name="action" value="engage">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="btn btn-danger">Engage Kill Switch</button>
     </form>
 </div>

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Form, Request
+import secrets
+
+from fastapi import APIRouter, Form, HTTPException, Request
 from sqlalchemy import select
 
 from src.core.db import session_scope
@@ -30,8 +32,19 @@ def toggle_kill_switch(
     strategy_id: str = Form(""),
     action: str = Form(...),
     reason: str = Form(""),
+    csrf_token: str = Form(""),
 ):
     """Toggle a kill switch.  Called via HTMX from the dashboard."""
+    # CSRF guard (Phase 1c): the token is embedded in every form this
+    # process serves; a cross-site POST (riding cached basic-auth
+    # credentials) can't know it. Constant-time compare.
+    if not secrets.compare_digest(
+        csrf_token, str(request.app.state.csrf_token)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="CSRF token invalid — refresh the page and retry",
+        )
     sid = strategy_id.strip() or None
 
     if action == "engage":
