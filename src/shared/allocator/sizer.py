@@ -30,14 +30,13 @@ audit (Decision 008's "audit every decision" rule).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-
-from datetime import UTC, datetime, timedelta
 
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -60,11 +59,27 @@ from src.shared.bucket import Bucket
 
 _log = get_logger("shared.allocator.sizer")
 
-# Window over which an already-placed-and-not-rejected Trade for
-# (bucket, strategy, symbol) blocks new orders. 23 hours matches the
-# longterm-crypto daily rebalance cadence (one trade per day per symbol).
-# A future enhancement will scale this off the strategy's TF.
-_DEDUP_TRADE_WINDOW_HOURS: int = 23
+# Fallback window over which an already-placed-and-not-rejected Trade for
+# (bucket, strategy, symbol) blocks new orders when the caller doesn't
+# supply a TF-scaled one. 23 hours matches the longterm-crypto daily
+# rebalance cadence (one trade per day per symbol).
+_DEDUP_TRADE_WINDOW_HOURS: float = 23.0
+
+
+def dedup_window_hours_for_tf(tf: str) -> float:
+    """Dedup window ≈ one strategy bar, with a 1/24 early-rebalance buffer.
+
+    23/24 of the TF: 1d → 23h (the historical hardcode), 1h → 57.5 min,
+    5m → 4.8 min. So a strategy can re-enter a symbol on the next bar of
+    ITS timeframe, never within the current one. Unparseable tf falls
+    back to the legacy 23h (safe-conservative for anything ≥ intraday).
+    """
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    try:
+        tf_seconds = int(tf[:-1]) * units[tf[-1].lower()]
+    except (KeyError, ValueError, IndexError):
+        return _DEDUP_TRADE_WINDOW_HOURS
+    return tf_seconds / 3600 * 23 / 24
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +180,7 @@ def size_positions(
     mark_prices_inr: dict[str, Decimal],
     regimes: dict[str, MarketRegime | None],
     config: AllocatorConfig,
+    dedup_window_hours: float | None = None,
 ) -> dict[str, SizingResult]:
     """Compute per-symbol sizing for one strategy in one bucket.
 
@@ -180,6 +196,10 @@ def size_positions(
             ``config.regime_multipliers``; symbols missing from the
             dict are treated as None (no regime → multiplier 1.0).
         config: validated ``allocator.yaml`` for this bucket.
+        dedup_window_hours: how long an active Trade for (bucket,
+            strategy, symbol) blocks re-entry. Callers should pass
+            ``dedup_window_hours_for_tf(strategy_tf)``; None falls back
+            to the legacy 23h.
 
     Returns:
         {symbol: SizingResult} for every input candidate. Caller iterates
@@ -216,7 +236,11 @@ def size_positions(
         # opened, causing the bot to fire a duplicate order every tick.
         # See journal logs 2026-06-12T17:25-17:26 for the bug this fixes.
         cutoff = datetime.now(tz=UTC) - timedelta(
-            hours=_DEDUP_TRADE_WINDOW_HOURS
+            hours=(
+                dedup_window_hours
+                if dedup_window_hours is not None
+                else _DEDUP_TRADE_WINDOW_HOURS
+            )
         )
         active_trade_rows = session.execute(
             select(Trade.symbol).where(

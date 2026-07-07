@@ -57,6 +57,7 @@ from src.order_manager.manager import KillSwitchEngagedError, OrderManager
 from src.safety import kill_switch
 from src.shared.allocator.sizer import (
     AllocatorConfig,
+    dedup_window_hours_for_tf,
     load_allocator_config,
     size_positions,
 )
@@ -271,6 +272,9 @@ class BucketRunner:
                 mark_prices_inr=mark_prices,
                 regimes=regimes,
                 config=self.allocator_config,
+                # One-bar re-entry lockout at the STRATEGY's timeframe
+                # (1d → 23h, 1h → ~57 min), not a hardcoded 23h.
+                dedup_window_hours=dedup_window_hours_for_tf(row.tf),
             )
 
             for sym, res in results.items():
