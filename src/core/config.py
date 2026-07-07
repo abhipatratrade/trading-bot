@@ -132,6 +132,11 @@ class Settings(BaseSettings):
     # heartbeat row is older than this (bot beats every ~60s tick).
     heartbeat_stale_seconds: int = 600
 
+    # -- Retention (nightly prune job on the Railway scheduler) --------------
+    # audit_log keeps 3× longer — it's the forensic record (House Rule #8).
+    snapshot_retention_days: int = 60
+    audit_retention_days: int = 180
+
     # -----------------------------------------------------------------------
     # Validation
     # -----------------------------------------------------------------------

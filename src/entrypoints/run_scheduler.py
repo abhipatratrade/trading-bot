@@ -7,6 +7,9 @@ Jobs:
       heartbeat row goes stale. Runs on Railway — infrastructure
       independent of the GCP VM, so a dead VM cannot silence its own
       watchdog.
+    - Nightly retention prune: deletes expired scanner/sizing/regime
+      snapshot rows (SNAPSHOT_RETENTION_DAYS) and audit_log rows
+      (AUDIT_RETENTION_DAYS).
 
 NOTE: the regime retrain used to be registered here, but Binance Futures
 geo-blocks Railway's region, so every Railway-side retrain fetch_failed.
@@ -27,6 +30,7 @@ from src.core.config import get_settings
 from src.core.export import export_trades, upload_to_gdrive
 from src.core.heartbeat import SERVICE_BOT_WORKER, last_beat, staleness
 from src.core.logging import configure_logging, get_logger
+from src.core.retention import prune_old_rows
 
 _log = get_logger("scheduler")
 
@@ -86,6 +90,14 @@ def _nightly_export() -> None:
         send_alert("Nightly export FAILED — check logs")
 
 
+def _nightly_prune() -> None:
+    """Prune expired snapshot/audit rows; page only when a table fails."""
+    counts = prune_old_rows()
+    failed = [t for t, n in counts.items() if n < 0]
+    if failed:
+        send_alert(f"Retention prune FAILED for: {', '.join(failed)} — check logs")
+
+
 def main() -> None:
     configure_logging()
     _log.info("scheduler_starting")
@@ -106,6 +118,15 @@ def main() -> None:
         "interval",
         minutes=2,
         id="heartbeat_watch",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        _nightly_prune,
+        "cron",
+        hour=1,
+        minute=0,
+        id="nightly_prune",
         replace_existing=True,
     )
 

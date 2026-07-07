@@ -291,6 +291,17 @@ def main() -> None:
     liq_pct = Decimal(str(settings.liquidation_distance_min_pct))
     funding_max = Decimal(str(settings.funding_rate_max))
 
+    # Per-bucket cadence: full pipeline passes are paced to the bucket TF
+    # (a 1d bucket re-scans every 15 min, not every 60s). Safety below
+    # (breakers, stop sweep, heartbeat) stays on the 60s loop.
+    next_due: dict[str, float] = {r.bucket.id: 0.0 for r in runners}
+    for r in runners:
+        _log.info(
+            "bucket_cadence",
+            bucket_id=r.bucket.id,
+            tick_interval_seconds=r.tick_interval_seconds,
+        )
+
     while not _shutdown:
         # ── Safety first: breakers per sub-account (Decision 021) ───────
         # A trip engages the per-bucket kill switch and flattens the
@@ -318,6 +329,13 @@ def main() -> None:
                 )
 
         for runner in runners:
+            if time.monotonic() < next_due[runner.bucket.id]:
+                continue
+            # Schedule the next pass up front so a crashing bucket backs
+            # off to its cadence instead of hot-looping every 60s.
+            next_due[runner.bucket.id] = (
+                time.monotonic() + runner.tick_interval_seconds
+            )
             try:
                 runner.run_once()
                 # If this bucket had been paging tick errors, tell the

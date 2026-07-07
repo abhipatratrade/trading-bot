@@ -77,6 +77,29 @@ from src.shared.strategy_master.loader import (
 
 _log = get_logger("shared.bucket_runner")
 
+_TF_UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def tick_interval_for_tf(tf: str) -> int:
+    """Seconds between full pipeline passes for a bucket at timeframe ``tf``.
+
+    A 1d bucket gains nothing from re-scanning every 60s — signals only
+    change on bar close. Interval = tf/20 clamped to [60, 900]:
+    5m/15m → 60s, 1h → 180s, 4h → 720s, 1d → 900s (15 min). Safety paths
+    (breakers, stop sweep, kill switch) are NOT affected — they run on
+    the main 60s loop in ``run_bot``.
+
+    Unparseable tf → 60 (legacy every-tick behaviour, fail-fast is the
+    loader's job).
+    """
+    try:
+        unit = tf[-1].lower()
+        value = int(tf[:-1])
+        tf_seconds = value * _TF_UNIT_SECONDS[unit]
+    except (KeyError, ValueError, IndexError):
+        return 60
+    return max(60, min(900, tf_seconds // 20))
+
 
 @dataclass(frozen=True, slots=True)
 class RunSummary:
@@ -126,6 +149,11 @@ class BucketRunner:
         )
         self.strategies: dict[str, type[Strategy]] = discover_strategies(
             bucket.strategies_folder
+        )
+        # Full pipeline passes are paced to the bucket's timeframe; the
+        # 60s main loop skips this runner until the interval elapses.
+        self.tick_interval_seconds: int = tick_interval_for_tf(
+            self.regime_config.tf
         )
 
     # ── Main entry ─────────────────────────────────────────────────────
