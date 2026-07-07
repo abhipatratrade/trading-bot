@@ -13,6 +13,7 @@ import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -104,6 +105,11 @@ class DeltaIndiaClient(Broker):
             headers={"User-Agent": "trading-bot/0.1.0"},
         )
         self._products: dict[str, dict[str, Any]] | None = None
+        self._products_fetched_at: float = 0.0  # monotonic
+        # Seconds to ADD to local time when signing (clock-skew tolerance).
+        # Re-learned from the server's Date header whenever Delta rejects
+        # a signature as expired.
+        self._time_offset: float = 0.0
 
     # ── HMAC signing ────────────────────────────────────────────────
 
@@ -114,7 +120,7 @@ class DeltaIndiaClient(Broker):
         query_string: str = "",
         body: str = "",
     ) -> dict[str, str]:
-        timestamp = str(int(time.time()))
+        timestamp = str(int(time.time() + self._time_offset))
         # Prehash: METHOD + TIMESTAMP + PATH + QUERY_STRING + BODY
         # Query string is WITHOUT the leading '?'.
         message = method + timestamp + path + query_string + body
@@ -150,6 +156,104 @@ class DeltaIndiaClient(Broker):
             )
         return data["result"]
 
+    _MAX_ATTEMPTS = 3
+    _BACKOFF_BASE_SECONDS = 0.5
+    _RETRY_AFTER_CAP_SECONDS = 10.0
+
+    def _resync_clock(self, resp: httpx.Response) -> None:
+        """Learn the local↔server clock offset from the HTTP Date header."""
+        date_header = resp.headers.get("Date")
+        if not date_header:
+            return
+        try:
+            server_now = parsedate_to_datetime(date_header).timestamp()
+        except (ValueError, TypeError):
+            return
+        self._time_offset = server_now - time.time()
+        self._log.warning(
+            "delta_clock_resynced", offset_seconds=round(self._time_offset, 1)
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query_string: str = "",
+        body_str: str = "",
+        auth: bool = True,
+        retry_transport: bool = False,
+    ) -> Any:
+        """Send one signed request with bounded, safety-aware retries.
+
+        Retry policy per failure class:
+          - HTTP 429: always retry (the request was rate-limited, never
+            processed), honoring Retry-After capped at 10s.
+          - expired/invalid-timestamp signature: resync the clock offset
+            from the response's Date header and retry (rejected = safe).
+          - transport errors / 5xx: retry ONLY when ``retry_transport``
+            (GETs). For order placement the outcome is unknown — the
+            OrderManager's client_order_id recovery owns that path.
+        """
+        url = f"{path}?{query_string}" if query_string else path
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_ATTEMPTS):
+            backoff = self._BACKOFF_BASE_SECONDS * (2**attempt)
+            # Signature includes the timestamp — rebuild every attempt.
+            headers = (
+                self._sign_headers(method, path, query_string, body_str)
+                if auth
+                else {}
+            )
+            try:
+                resp = self._http.request(
+                    method, url, content=body_str or None, headers=headers
+                )
+            except httpx.TransportError as exc:
+                last_exc = exc
+                if not retry_transport or attempt == self._MAX_ATTEMPTS - 1:
+                    raise
+                self._log.warning(
+                    "delta_transport_retry", path=path, attempt=attempt + 1
+                )
+                time.sleep(backoff)
+                continue
+
+            if resp.status_code == 429 and attempt < self._MAX_ATTEMPTS - 1:
+                try:
+                    delay = float(resp.headers.get("Retry-After", backoff))
+                except ValueError:
+                    delay = backoff
+                self._log.warning(
+                    "delta_rate_limited", path=path, attempt=attempt + 1
+                )
+                time.sleep(min(max(delay, backoff), self._RETRY_AFTER_CAP_SECONDS))
+                continue
+            if (
+                resp.status_code >= 500
+                and retry_transport
+                and attempt < self._MAX_ATTEMPTS - 1
+            ):
+                self._log.warning(
+                    "delta_5xx_retry",
+                    path=path,
+                    status=resp.status_code,
+                    attempt=attempt + 1,
+                )
+                time.sleep(backoff)
+                continue
+
+            try:
+                return self._handle_response(resp)
+            except DeltaAPIError as exc:
+                code = str(exc.code)
+                stale_sig = "expired" in code or "timestamp" in code
+                if stale_sig and auth and attempt < self._MAX_ATTEMPTS - 1:
+                    self._resync_clock(resp)
+                    continue
+                raise
+        raise last_exc if last_exc else RuntimeError("unreachable")  # pragma: no cover
+
     def _get(
         self,
         path: str,
@@ -162,35 +266,57 @@ class DeltaIndiaClient(Broker):
             filtered = {k: str(v) for k, v in params.items() if v is not None}
             if filtered:
                 query_string = urlencode(sorted(filtered.items()))
-        url = f"{path}?{query_string}" if query_string else path
-        headers = self._sign_headers("GET", path, query_string) if auth else {}
-        resp = self._http.get(url, headers=headers)
-        return self._handle_response(resp)
+        return self._request(
+            "GET", path, query_string=query_string, auth=auth, retry_transport=True
+        )
 
     def _post(self, path: str, body: dict[str, Any] | None = None) -> Any:
-        body_str = json.dumps(body) if body else ""
-        headers = self._sign_headers("POST", path, body=body_str)
-        resp = self._http.post(path, content=body_str or None, headers=headers)
-        return self._handle_response(resp)
+        # No transport retry: a POST that died in transit may have landed
+        # (order placement). 429 / stale-signature retries still apply.
+        return self._request(
+            "POST", path, body_str=json.dumps(body) if body else ""
+        )
 
     def _delete(self, path: str, body: dict[str, Any] | None = None) -> Any:
-        body_str = json.dumps(body) if body else ""
-        headers = self._sign_headers("DELETE", path, body=body_str)
-        resp = self._http.request("DELETE", path, content=body_str or None, headers=headers)
-        return self._handle_response(resp)
+        return self._request(
+            "DELETE", path, body_str=json.dumps(body) if body else ""
+        )
 
     # ── Product resolution ──────────────────────────────────────────
 
+    _PRODUCTS_TTL_SECONDS = 6 * 3600
+
     def _ensure_products(self) -> None:
-        """Lazy-load the product catalogue from ``GET /v2/products``."""
-        if self._products is not None:
+        """Load/refresh the product catalogue from ``GET /v2/products``.
+
+        Refreshed every 6h so new listings, tick sizes, and contract
+        values track the venue. A failed refresh keeps serving the stale
+        catalogue (better than none) unless there has never been one.
+        """
+        fresh = (
+            self._products is not None
+            and time.monotonic() - self._products_fetched_at
+            < self._PRODUCTS_TTL_SECONDS
+        )
+        if fresh:
             return
-        raw = self._get("/v2/products", auth=False)
+        try:
+            raw = self._get("/v2/products", auth=False)
+        except Exception:
+            if self._products is not None:
+                self._log.warning("products_refresh_failed_serving_stale")
+                # Retry the refresh in ~10 min, not a full TTL from now.
+                self._products_fetched_at = (
+                    time.monotonic() - self._PRODUCTS_TTL_SECONDS + 600
+                )
+                return
+            raise
         self._products = {}
         for p in raw:
             sym = p.get("symbol")
             if sym:
                 self._products[sym] = p
+        self._products_fetched_at = time.monotonic()
         self._log.info("products_loaded", count=len(self._products))
 
     def _product_id(self, symbol: str) -> int:
