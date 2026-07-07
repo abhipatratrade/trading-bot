@@ -21,6 +21,7 @@ Tables:
     sizing_snapshot       — every allocator decision (placed or skipped)
     bucket_state          — per-bucket capital & available balance
     daily_equity_anchor   — start-of-day equity per sub-account (DD breaker)
+    heartbeat             — liveness row per service (dead-man's switch)
 """
 
 from __future__ import annotations
@@ -587,6 +588,27 @@ class DailyEquityAnchor(Base, TimestampMixin):
     equity: Mapped[Decimal] = mapped_column(Money, nullable=False)
 
 
+class Heartbeat(Base, TimestampMixin):
+    """Liveness row per service — the dead-man's switch (Phase 1c).
+
+    The bot-worker upserts its row every tick; the Railway scheduler
+    (independent infrastructure from the VM) pages when ``beat_at`` goes
+    stale. One row per service name.
+    """
+
+    __tablename__ = "heartbeat"
+    __table_args__ = (
+        UniqueConstraint("service", name="uq_heartbeat_service"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    service: Mapped[str] = mapped_column(String(64), nullable=False)
+    beat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
 # Re-export for convenience: ``from src.core.models import *`` grabs everything.
 __all__ = [
     "BrokerName",
@@ -610,4 +632,5 @@ __all__ = [
     "SizingSnapshot",
     "BucketState",
     "DailyEquityAnchor",
+    "Heartbeat",
 ]

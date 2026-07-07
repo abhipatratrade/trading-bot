@@ -128,6 +128,9 @@ class Settings(BaseSettings):
     liquidation_distance_min_pct: float = 15.0
     funding_rate_max: float = 0.01
     drift_bps_max: float = 50.0
+    # Dead-man's switch: the Railway scheduler pages when the bot-worker's
+    # heartbeat row is older than this (bot beats every ~60s tick).
+    heartbeat_stale_seconds: int = 600
 
     # -----------------------------------------------------------------------
     # Validation

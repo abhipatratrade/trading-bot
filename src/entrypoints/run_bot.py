@@ -25,6 +25,7 @@ from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
 from src.core.clock import RealClock
 from src.core.config import get_settings
 from src.core.db import session_scope
+from src.core.heartbeat import SERVICE_BOT_WORKER, beat
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
 from src.data_sources.binance import BinanceData
@@ -343,6 +344,10 @@ def main() -> None:
 
         # Protect every position opened/changed this tick (Decision 022).
         _sweep_stops()
+
+        # Dead-man's switch: certify this tick completed. The Railway
+        # scheduler pages if this row goes stale (heartbeat_stale_seconds).
+        beat(SERVICE_BOT_WORKER, clock)
 
         global _tick_count
         _tick_count += 1
