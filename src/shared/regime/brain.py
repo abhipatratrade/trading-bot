@@ -20,8 +20,7 @@ None and emits a ``regime_model_missing`` log line.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -91,26 +90,38 @@ def load_regime_config(path: Path) -> RegimeConfig:
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
-class _CacheKey:
-    bucket_id: str
-    symbol: str
-    window_start_iso: str
-
-
-_cache: dict[_CacheKey, RegimePrediction] = {}
+# (bucket_id, symbol) → (window_start_iso, prediction). One entry per key:
+# a new bar window replaces the old one, so the cache stays bounded at
+# #buckets × #symbols instead of growing by one entry per bar forever.
+_cache: dict[tuple[str, str], tuple[str, RegimePrediction]] = {}
 
 
 def _window_start(now: datetime, tf: str) -> datetime:
-    """Truncate ``now`` to the start of the current bar."""
-    if tf == "1d":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if tf == "1h":
-        return now.replace(minute=0, second=0, microsecond=0)
-    if tf == "5m":
-        minute = (now.minute // 5) * 5
+    """Truncate ``now`` to the start of the current bar for ANY ``<N><unit>`` TF.
+
+    Handles m/h/d/w generically (15m, 30m, 4h, 1d, 1w, …) — the original
+    version special-cased only 1d/1h/5m, so 4h and 15m buckets never hit
+    the cache and re-ran the HMM every tick. Unparseable TF → ``now``
+    (effectively uncached).
+    """
+    try:
+        unit = tf[-1].lower()
+        value = int(tf[:-1])
+        if value <= 0:
+            return now
+    except (ValueError, IndexError):
+        return now
+    if unit == "m":
+        minute = (now.minute // value) * value if value <= 60 else 0
         return now.replace(minute=minute, second=0, microsecond=0)
-    # Unknown TF — don't cache.
+    if unit == "h":
+        hour = (now.hour // value) * value
+        return now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if unit == "d":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if unit == "w":
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start - timedelta(days=now.weekday())
     return now
 
 
@@ -144,13 +155,11 @@ def predict_regime(
 
     clk = clock or RealClock()
     now = clk.now()
-    cache_key = _CacheKey(
-        bucket_id=bucket_id,
-        symbol=symbol,
-        window_start_iso=_window_start(now, config.tf).isoformat(),
-    )
-    if cache_key in _cache:
-        return _cache[cache_key]
+    cache_key = (bucket_id, symbol)
+    window_iso = _window_start(now, config.tf).isoformat()
+    cached = _cache.get(cache_key)
+    if cached is not None and cached[0] == window_iso:
+        return cached[1]
 
     # 1) Try per-symbol model first.
     with session_scope() as session:
@@ -269,7 +278,7 @@ def predict_regime(
                     f"{prev.regime.value} -> {pred.regime.value}"
                 )
 
-    _cache[cache_key] = pred
+    _cache[cache_key] = (window_iso, pred)
     _log.info(
         "regime_predicted",
         bucket_id=bucket_id,

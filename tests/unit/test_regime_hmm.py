@@ -102,3 +102,52 @@ class TestSignal:
             model_version="v",
         )
         assert pred.signal == pytest.approx(-0.4)
+
+
+class TestWindowStart:
+    """Bar-window truncation must work for ANY <N><unit> TF (Phase 1c —
+    4h/15m buckets previously never hit the cache)."""
+
+    def test_15m(self) -> None:
+        from datetime import UTC, datetime
+
+        from src.shared.regime.brain import _window_start
+
+        now = datetime(2026, 7, 7, 12, 47, 33, tzinfo=UTC)
+        assert _window_start(now, "15m") == datetime(
+            2026, 7, 7, 12, 45, tzinfo=UTC
+        )
+
+    def test_4h(self) -> None:
+        from datetime import UTC, datetime
+
+        from src.shared.regime.brain import _window_start
+
+        now = datetime(2026, 7, 7, 14, 5, tzinfo=UTC)
+        assert _window_start(now, "4h") == datetime(
+            2026, 7, 7, 12, 0, tzinfo=UTC
+        )
+
+    def test_1d_unchanged(self) -> None:
+        from datetime import UTC, datetime
+
+        from src.shared.regime.brain import _window_start
+
+        now = datetime(2026, 7, 7, 14, 5, tzinfo=UTC)
+        assert _window_start(now, "1d") == datetime(2026, 7, 7, tzinfo=UTC)
+
+    def test_1w_anchors_to_monday(self) -> None:
+        from datetime import UTC, datetime
+
+        from src.shared.regime.brain import _window_start
+
+        now = datetime(2026, 7, 9, 14, 5, tzinfo=UTC)  # Thursday
+        assert _window_start(now, "1w") == datetime(2026, 7, 6, tzinfo=UTC)
+
+    def test_garbage_returns_now(self) -> None:
+        from datetime import UTC, datetime
+
+        from src.shared.regime.brain import _window_start
+
+        now = datetime(2026, 7, 7, 14, 5, 9, tzinfo=UTC)
+        assert _window_start(now, "daily") == now
