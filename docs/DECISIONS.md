@@ -685,3 +685,36 @@ Consequences:
 - A stale wallet mirror now affects sizing, not just display — the
   reconciler sync being healthy matters more (see the 2026-07-07 note
   about the suspected failing sweep on the VM).
+
+## 026 — Multiple scanner sets per bucket (CSV-linked)
+Date: 2026-07-08
+Status: Accepted (user chose Option A, 2026-07-08 session)
+Refines: 016
+
+Context: a bucket had exactly one scanner.yaml + allocator.yaml, so every
+strategy in it shared one universe and one allocation config. The user
+wants strategies within a bucket to run against different scanning AND
+allocation logic (e.g. a top-volume universe next to a momentum
+universe, each Kelly-tuned separately).
+
+Decision (Option A — CSV column, not scanner-owned subfolders):
+
+1. **Named scanner sets.** A set ``<name>`` is a
+   ``scanner_<name>.yaml`` + ``allocator_<name>.yaml`` pair in the
+   bucket folder. The existing ``scanner.yaml`` + ``allocator.yaml``
+   remain the default set (blank name).
+2. **Linking via strategy_master.csv.** New optional ``scanner`` column
+   (lowercase letters/digits/underscore); blank/absent ⇒ default set.
+   The master CSV stays the single control sheet per bucket
+   (Decision 016 intact); re-pointing a strategy is a one-cell edit.
+3. **Runtime.** BucketRunner loads every named pair at boot (fail-fast
+   when a referenced pair is missing) and runs ONE scan per set per
+   pipeline pass, lazily. Sizing uses the strategy's set's allocator
+   config (μ/σ, Kelly fraction, caps, regime multipliers, fx). All sets
+   share the bucket's one capital pool (live equity, Decision 025) and
+   sub-account; the per-set aggregate_cap bounds each book and the
+   insufficient-margin skip arbitrates between them.
+4. **Persistence.** Named scans write DailyUniverse / ScannerSnapshot
+   rows under ``strategy_id = "<bucket_id>:<name>"`` so they don't
+   collide with the default scan's (date, strategy_id, symbol) unique
+   key. Regime (per bucket), exits, breakers, and stops are unaffected.

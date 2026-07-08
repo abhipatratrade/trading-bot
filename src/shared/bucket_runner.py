@@ -9,11 +9,13 @@ exit step added by Decision 021:
        must still manage positions it already holds)
     1. Strategy discovery (folder scan)
     2. Strategy Master gate
-    3. Market Scanner
+    3. Market Scanner — one scan per named scanner set (Decision 026);
+       each strategy's ``scanner`` column picks its universe AND its
+       allocation config (scanner_<name>.yaml + allocator_<name>.yaml)
     4. Regime Selector (Brain)
     5. Regime gate per strategy
     6. Dedup gate (Sizer)
-    7. Position Size Allocator (Kelly + bucket capital)
+    7. Position Size Allocator (Kelly on live equity, per scanner set)
     8. Order Manager → Broker (safety-wrapped)
 
 One ``BucketRunner`` per (type × market) bucket. ``run_bot`` constructs
@@ -67,6 +69,7 @@ from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_re
 from src.shared.regime.store import MARKET_SENTINEL
 from src.shared.scanner.engine import (
     ScannerConfig,
+    ScanResult,
     load_scanner_config,
     run_scan,
 )
@@ -139,15 +142,26 @@ class BucketRunner:
             bucket.strategy_master_csv_path,
             bucket_trading_type=bucket.trading_type.value,
         )
-        self.scanner_config: ScannerConfig = load_scanner_config(
-            bucket.scanner_yaml_path
-        )
         self.regime_config: RegimeConfig = load_regime_config(
             bucket.regime_yaml_path
         )
-        self.allocator_config: AllocatorConfig = load_allocator_config(
-            bucket.allocator_yaml_path
-        )
+        # Decision 026 — one scanner/allocator config pair per named
+        # scanner set used in strategy_master.csv ("" = the default
+        # scanner.yaml + allocator.yaml, always loaded). A named set with
+        # missing yaml files fails the boot, not the tick.
+        scanner_names = {""} | {row.scanner for row in self.master.rows}
+        self.scanner_configs: dict[str, ScannerConfig] = {
+            name: load_scanner_config(bucket.scanner_yaml_path_for(name))
+            for name in scanner_names
+        }
+        self.allocator_configs: dict[str, AllocatorConfig] = {
+            name: load_allocator_config(bucket.allocator_yaml_path_for(name))
+            for name in scanner_names
+        }
+        # Default-pair aliases kept for external readers (run_bot fx map,
+        # stop-protection fallbacks, tests).
+        self.scanner_config: ScannerConfig = self.scanner_configs[""]
+        self.allocator_config: AllocatorConfig = self.allocator_configs[""]
         self.strategies: dict[str, type[Strategy]] = discover_strategies(
             bucket.strategies_folder
         )
@@ -204,15 +218,28 @@ class BucketRunner:
         # 1+2: discovery + master gate (already loaded; gate is per-strategy below).
 
         # 3. Scanner
-        scan = run_scan(
-            bucket_id=self.bucket.id,
-            data=self._data,
-            config=self.scanner_config,
-            scan_date=self._clock.now().date(),
-            require_binance_listed=(
-                self.bucket.market.value == "crypto"
-            ),
-        )
+        # One scan per named scanner set, run lazily on first use this
+        # tick (Decision 026). Named scans persist their snapshots under
+        # "<bucket_id>:<scanner>" so they don't collide with the default
+        # scan's (date, strategy_id, symbol) unique key.
+        scans: dict[str, ScanResult] = {}
+
+        def _scan_for(name: str) -> ScanResult:
+            if name not in scans:
+                scans[name] = run_scan(
+                    bucket_id=(
+                        f"{self.bucket.id}:{name}" if name else self.bucket.id
+                    ),
+                    data=self._data,
+                    config=self.scanner_configs[name],
+                    scan_date=self._clock.now().date(),
+                    require_binance_listed=(
+                        self.bucket.market.value == "crypto"
+                    ),
+                )
+            return scans[name]
+
+        _scan_for("")  # default scan always runs (universe rows + dashboards)
 
         # 4. Regime
         # Broad-market label drives the per-strategy regime gate
@@ -257,7 +284,10 @@ class BucketRunner:
 
             eligible.append(strat_name)
             strategy = strat_cls()
-            entry_candidates = strategy.select_entries(scan.universe, self._data)
+            strat_scan = _scan_for(row.scanner)
+            entry_candidates = strategy.select_entries(
+                strat_scan.universe, self._data
+            )
             if not entry_candidates:
                 continue
 
@@ -297,7 +327,10 @@ class BucketRunner:
                 candidates=symbols,
                 mark_prices_inr=mark_prices,
                 regimes=regimes,
-                config=self.allocator_config,
+                # Decision 026: the strategy's scanner set carries its own
+                # allocation logic (μ/σ, Kelly fraction, caps, regime
+                # multipliers, fx).
+                config=self.allocator_configs[row.scanner],
                 # One-bar re-entry lockout at the STRATEGY's timeframe
                 # (1d → 23h, 1h → ~57 min), not a hardcoded 23h.
                 dedup_window_hours=dedup_window_hours_for_tf(row.tf),
@@ -335,7 +368,8 @@ class BucketRunner:
             skipped=skipped_counts,
             eligible_strategies=eligible,
             blocked_strategies=blocked,
-            universe=scan.universe,
+            # Union across every scanner set that ran this tick.
+            universe=sorted({s for r in scans.values() for s in r.universe}),
             regime=market_regime,
             exited=exited,
         )

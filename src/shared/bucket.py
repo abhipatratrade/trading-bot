@@ -31,7 +31,6 @@ from pydantic import BaseModel, Field
 
 from src.core.models import BrokerName
 
-
 # Repo root (..\..\.. relative to this file).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _BUCKETS_YAML_PATH = _REPO_ROOT / "buckets.yaml"
@@ -99,6 +98,24 @@ class Bucket:
     @property
     def allocator_yaml_path(self) -> Path:
         return self.folder / "allocator.yaml"
+
+    # Decision 026 — named scanner sets. Each name maps to a
+    # scanner_<name>.yaml + allocator_<name>.yaml pair in the bucket
+    # folder; "" is the default pair above. Strategies pick a set via the
+    # optional ``scanner`` column in strategy_master.csv.
+    def scanner_yaml_path_for(self, scanner: str = "") -> Path:
+        return (
+            self.folder / f"scanner_{scanner}.yaml"
+            if scanner
+            else self.scanner_yaml_path
+        )
+
+    def allocator_yaml_path_for(self, scanner: str = "") -> Path:
+        return (
+            self.folder / f"allocator_{scanner}.yaml"
+            if scanner
+            else self.allocator_yaml_path
+        )
 
     @property
     def strategy_master_csv_path(self) -> Path:

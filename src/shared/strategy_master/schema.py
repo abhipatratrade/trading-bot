@@ -15,6 +15,11 @@ Columns:
     trading_regime_1    — ∈ {bull, neutral, bear, ""}
     trading_regime_2    — ∈ {bull, neutral, bear, ""}
     trading_type        — must equal bucket.trading_type
+    scanner             — OPTIONAL (Decision 026): named scanner set this
+                          strategy uses. Blank/absent ⇒ the bucket's
+                          default scanner.yaml + allocator.yaml pair;
+                          ``momentum`` ⇒ scanner_momentum.yaml +
+                          allocator_momentum.yaml in the bucket folder.
 
 Blank field ⇒ that constraint is absent. If BOTH regime slots are blank
 the strategy is regime-agnostic. If exactly one is filled the strategy
@@ -23,11 +28,14 @@ trades only in that regime.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
 
 from src.core.models import MarketRegime
+
+_SCANNER_NAME_RE = re.compile(r"^[a-z0-9_]*$")
 
 
 class StrategyMasterRow(BaseModel):
@@ -39,6 +47,8 @@ class StrategyMasterRow(BaseModel):
     trading_regime_1: MarketRegime | None = None
     trading_regime_2: MarketRegime | None = None
     trading_type: str = Field(min_length=1)
+    # Named scanner set (Decision 026). "" ⇒ default scanner/allocator pair.
+    scanner: str = ""
 
     # CSV cells arrive as strings. Combined parser: blanks → None,
     # then min_vol gets numeric coercion (underscores/commas stripped).
@@ -50,6 +60,18 @@ class StrategyMasterRow(BaseModel):
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
+
+    @field_validator("scanner", mode="before")
+    @classmethod
+    def _normalize_scanner(cls, v: object) -> str:
+        if v is None:
+            return ""
+        name = str(v).strip().lower()
+        if not _SCANNER_NAME_RE.match(name):
+            raise ValueError(
+                f"scanner name {name!r} must be lowercase letters/digits/_"
+            )
+        return name
 
     @field_validator("min_vol", mode="before")
     @classmethod

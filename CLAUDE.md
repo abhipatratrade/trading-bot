@@ -55,6 +55,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Regime retrain | VM systemd timer, not Railway (Binance geo-blocks Railway) — Decision 020 |
 | Sizing | Kelly on LIVE sub-account equity (available+locked mirror); `capital_inr` is P&L baseline only — Decision 025 (amends 015) |
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
+| Scanner sets | Multiple named scanner+allocator yaml pairs per bucket; `scanner` column in strategy_master.csv links them — Decision 026 |
 | Exits & enforcement | Strategy-driven exits (step 0); breaker trip = kill switch + flatten; bucket_state mirrors sub-account wallet; dashboard basic auth — Decision 021 |
 | Protective stops | Exchange-resident reduce-only stop-market per position; `stop_loss_pct` per bucket in buckets.yaml (0.5/leverage rule) — Decision 022 |
 | Kill-switch semantics | Blocks risk-increasing actions only: strategy exits + breaker watch continue while killed — Decision 024 |
