@@ -94,6 +94,11 @@ class Reconciler:
         self._reconcile_orders(report)
         self._sync_bucket_state()
         try:
+            self._sync_wallet_flows()
+        except Exception:
+            # Observability only — never let it fail the sweep.
+            self._log.warning("wallet_flows_sync_failed", exc_info=True)
+        try:
             self._enrich_trades_pnl()
         except Exception:
             # P&L enrichment is observability — never let it fail the sweep.
@@ -363,6 +368,38 @@ class Reconciler:
             locked=str(locked),
         )
 
+    # ── Wallet deposit/withdrawal totals (dashboard header) ─────────
+
+    def _sync_wallet_flows(self) -> None:
+        """Cache lifetime deposit/withdrawal totals into ``bucket_state``.
+
+        The dashboard (Railway) can't call Delta directly (IP whitelist),
+        so the bot stores ``wallet_deposits_usd`` / ``wallet_withdrawals_usd``
+        in ``bucket_state.extra`` every sweep. Settlement currency (USD);
+        the dashboard converts to INR at the bucket's fixed fx.
+        """
+        if not self._bucket_ids:
+            return
+        totals = self._broker.wallet_flow_totals()
+        if totals is None:
+            return
+        deposits, withdrawals = totals
+        with session_scope() as session:
+            for bucket_id in self._bucket_ids:
+                state = session.execute(
+                    select(BucketState).where(
+                        BucketState.bucket_id == bucket_id
+                    )
+                ).scalar_one_or_none()
+                if state is None:
+                    continue
+                state.extra = {
+                    **(state.extra or {}),
+                    "wallet_deposits_usd": str(deposits),
+                    "wallet_withdrawals_usd": str(withdrawals),
+                    "wallet_flows_updated_at": self._clock.now().isoformat(),
+                }
+
     # ── Per-trade P&L enrichment (Phase 1c) ─────────────────────────
 
     def _enrich_trades_pnl(self) -> None:
@@ -488,12 +525,16 @@ class Reconciler:
                 key=lambda t: t.created_at,
             )
             for exit_trade in exits:
+                # Pair on (bucket, symbol, opposite side) — NOT
+                # strategy_name: breaker flatten and protective-stop
+                # exits carry a different strategy_name than the entry,
+                # and one bucket holds at most one position per symbol
+                # (dedup gate), so bucket+symbol is unambiguous.
                 entry = next(
                     (
                         e
                         for e in reversed(entries)
                         if e.bucket_id == exit_trade.bucket_id
-                        and e.strategy_name == exit_trade.strategy_name
                         and e.symbol == exit_trade.symbol
                         and e.side != exit_trade.side
                         and e.created_at < exit_trade.created_at
@@ -501,6 +542,11 @@ class Reconciler:
                     ),
                     None,
                 )
+                if entry is None:
+                    # Entry may have aged out of the 7-day enrichment
+                    # window (position held longer than a week) — fall
+                    # back to a direct lookup.
+                    entry = self._lookup_entry_for_exit(session, exit_trade)
                 if entry is None:
                     continue
                 e_extra, x_extra = entry.extra or {}, exit_trade.extra or {}
@@ -561,6 +607,36 @@ class Reconciler:
             trades=len(open_for_enrich),
             fills=len(fills),
         )
+
+    def _lookup_entry_for_exit(self, session, exit_trade: Trade) -> Trade | None:
+        """Latest unpaired opposite-side FILLED entry for an exit's symbol.
+
+        Used when the entry predates the 7-day enrichment window (held
+        longer than a week). Must already carry ``avg_fill_price`` from
+        the sweep that ran while it was in-window.
+        """
+        candidates = session.execute(
+            select(Trade)
+            .where(
+                Trade.broker == self._broker_name,
+                Trade.bucket_id == exit_trade.bucket_id,
+                Trade.symbol == exit_trade.symbol,
+                Trade.side != exit_trade.side,
+                Trade.status == OrderStatus.FILLED,
+                Trade.created_at < exit_trade.created_at,
+            )
+            .order_by(Trade.created_at.desc())
+            .limit(10)
+        ).scalars()
+        for e in candidates:
+            extra = e.extra or {}
+            if (
+                not extra.get("reduce_only")
+                and extra.get("avg_fill_price")
+                and not extra.get("closed_by_trade_id")
+            ):
+                return e
+        return None
 
     # ── Order reconciliation ────────────────────────────────────────
 

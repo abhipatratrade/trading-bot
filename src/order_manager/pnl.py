@@ -79,6 +79,18 @@ def pnl_pct(pnl: Decimal, notional: Decimal) -> Decimal | None:
     return pnl / notional * Decimal("100")
 
 
+def realized_totals(pnls: list[Decimal]) -> tuple[Decimal, Decimal]:
+    """Split realized round-trip P&Ls into (gross profit, gross loss).
+
+    Profit = Σ winners (≥ 0), loss = Σ losers (≤ 0, returned as a
+    negative number). Used by the dashboard's cumulative profit / loss
+    header cells.
+    """
+    profit = sum((p for p in pnls if p > 0), Decimal("0"))
+    loss = sum((p for p in pnls if p < 0), Decimal("0"))
+    return profit, loss
+
+
 def bucket_cumulative_pnl(
     *,
     capital: Decimal,

@@ -38,29 +38,37 @@
     {% endif %}
   </div>
   <div>
-    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Regime</div>
-    {% if regimes %}
-      {% set market_row = regimes|selectattr('is_market')|first %}
-      {% if market_row %}
-        <div style="font-size:1.4rem;font-weight:600;text-transform:capitalize">
-          {{ market_row.label }}
-          {% if market_row.signal is not none %}
-            <span style="font-size:0.9rem;font-weight:600;color:{% if market_row.signal > 0 %}#3fb950{% elif market_row.signal < 0 %}#f85149{% else %}#8b949e{% endif %}">{{ "%+.2f"|format(market_row.signal) }}</span>
-          {% endif %}
-          <span style="font-size:0.7rem;color:#8b949e;font-weight:400">(market)</span>
-        </div>
-        <div style="color:#8b949e;font-size:0.75rem">
-          {{ market_row.model_version }} · {{ market_row.age_min }}m ago
-        </div>
-      {% else %}
-        <div style="font-size:0.85rem;color:#8b949e">per-coin only — no market label</div>
-      {% endif %}
-      <div style="font-size:0.75rem;color:#8b949e;margin-top:0.3rem">
-        {{ regimes|length }} prediction(s) recorded
-      </div>
-    {% else %}
-      <div class="empty" style="padding:0">no prediction yet</div>
-    {% endif %}
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Deposited</div>
+    <div style="font-size:1.4rem;font-weight:600">
+      {% if money.deposited_inr is not none %}{{ "%.2f"|format(money.deposited_inr) }}{% else %}—{% endif %}
+    </div>
+    <div style="color:#8b949e;font-size:0.75rem">lifetime, from exchange history</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Withdrawn</div>
+    <div style="font-size:1.4rem;font-weight:600">
+      {% if money.withdrawn_inr is not none %}{{ "%.2f"|format(money.withdrawn_inr) }}{% else %}—{% endif %}
+    </div>
+    <div style="color:#8b949e;font-size:0.75rem">lifetime, from exchange history</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Cumulative Profit</div>
+    <div style="font-size:1.4rem;font-weight:600;color:#3fb950">
+      {{ "%+.2f"|format(money.profit_inr) }}
+    </div>
+    <div style="color:#8b949e;font-size:0.75rem">closed winners only</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Cumulative Loss</div>
+    <div style="font-size:1.4rem;font-weight:600;color:{% if money.loss_inr < 0 %}#f85149{% else %}#8b949e{% endif %}">
+      {{ "%.2f"|format(money.loss_inr) }}
+    </div>
+    <div style="color:#8b949e;font-size:0.75rem">closed losers only</div>
+  </div>
+  <div>
+    <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Total Fees</div>
+    <div style="font-size:1.4rem;font-weight:600">{{ "%.2f"|format(money.fees_inr) }}</div>
+    <div style="color:#8b949e;font-size:0.75rem">all filled orders</div>
   </div>
   <div>
     <div style="color:#8b949e;font-size:0.75rem;text-transform:uppercase">Start New Trade</div>

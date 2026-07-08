@@ -562,6 +562,36 @@ class DeltaIndiaClient(Broker):
                 self._log.warning("fill_parse_failed", fill=f)
         return fills
 
+    def wallet_flow_totals(self) -> tuple[Decimal, Decimal] | None:
+        """Deposit/withdrawal totals from ``GET /v2/wallet/transactions``.
+
+        Classification by ``transaction_type``: *deposit* types add to
+        deposits, *withdrawal* types to withdrawals, *transfer* types
+        (sub-account funding) by amount sign. Trading cashflows (pnl,
+        commission, funding) are ignored. One page of 500 covers Phase-1
+        history; pagination can come later.
+        """
+        result = self._get("/v2/wallet/transactions", {"page_size": 500})
+        rows = result.get("result", result) if isinstance(result, dict) else result
+        deposits = Decimal("0")
+        withdrawals = Decimal("0")
+        for t in rows or []:
+            ttype = str(t.get("transaction_type", "")).lower()
+            try:
+                amount = Decimal(str(t.get("amount", "0")))
+            except ArithmeticError:
+                continue
+            if "deposit" in ttype:
+                deposits += abs(amount)
+            elif "withdrawal" in ttype:
+                withdrawals += abs(amount)
+            elif "transfer" in ttype:
+                if amount >= 0:
+                    deposits += amount
+                else:
+                    withdrawals += -amount
+        return deposits, withdrawals
+
     @staticmethod
     def _to_open_order(o: dict[str, Any]) -> OpenOrder:
         return OpenOrder(

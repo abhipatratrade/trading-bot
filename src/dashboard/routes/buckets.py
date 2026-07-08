@@ -32,8 +32,9 @@ from src.core.models import (
     RegimeSnapshot,
     Trade,
 )
-from src.order_manager.pnl import bucket_cumulative_pnl
-from src.shared.bucket import load_buckets
+from src.order_manager.pnl import bucket_cumulative_pnl, realized_totals
+from src.shared.allocator.sizer import load_allocator_config
+from src.shared.bucket import Bucket, load_buckets
 from src.shared.strategy_loader import discover_strategies
 from src.shared.strategy_master.loader import load_strategy_master
 
@@ -135,6 +136,64 @@ def _bucket_pnl(
 
 def _age_minutes(ts: datetime) -> int:
     return int((datetime.now(tz=UTC) - ts).total_seconds() // 60)
+
+
+def _money_stats(bucket: Bucket, state: BucketState | None) -> dict[str, float | None]:
+    """The five header numbers, all in INR at the bucket's fixed fx.
+
+    - deposited / withdrawn: lifetime wallet flows cached by the
+      reconciler in ``bucket_state.extra`` (USD, from the exchange's
+      transaction history).
+    - profit / loss: realized round-trips only — reduce-only exit trades
+      whose P&L enrichment stamped ``pnl_kind == "realized"``. Winners
+      and losers summed separately.
+    - fees: Σ ``Trade.fees`` for the bucket.
+    """
+    try:
+        fx = load_allocator_config(bucket.allocator_yaml_path).fx_inr_per_usd
+    except Exception:
+        fx = Decimal("1")
+
+    extra = (state.extra or {}) if state else {}
+
+    def _inr(key: str) -> float | None:
+        raw = extra.get(key)
+        if raw is None:
+            return None
+        try:
+            return float(Decimal(str(raw)) * fx)
+        except ArithmeticError:
+            return None
+
+    pnls: list[Decimal] = []
+    fees = Decimal("0")
+    with session_scope() as session:
+        trades = session.execute(
+            select(Trade).where(Trade.bucket_id == bucket.id)
+        ).scalars()
+        for t in trades:
+            if t.fees:
+                fees += t.fees
+            e = t.extra or {}
+            # Realized stamps are copied onto BOTH legs; count exits only.
+            if (
+                e.get("reduce_only")
+                and e.get("pnl_kind") == "realized"
+                and e.get("pnl_usd") is not None
+            ):
+                try:
+                    pnls.append(Decimal(str(e["pnl_usd"])))
+                except ArithmeticError:
+                    pass
+
+    profit, loss = realized_totals(pnls)
+    return {
+        "deposited_inr": _inr("wallet_deposits_usd"),
+        "withdrawn_inr": _inr("wallet_withdrawals_usd"),
+        "profit_inr": float(profit * fx),
+        "loss_inr": float(loss * fx),
+        "fees_inr": float(fees * fx),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +303,7 @@ def bucket_detail(bucket_id: str, request: Request):
                 "pnl_amt": pnl_amt,
                 "pnl_pct": pnl_pct,
             },
+            "money": _money_stats(bucket, state),
             "regimes": _regimes_table(regimes_by_symbol),
             "running": running,
             "scanning": scanning,

@@ -120,3 +120,28 @@ class TestBucketCumulativePnl:
         )
         assert amt == D("100")
         assert pct is None
+
+
+class TestRealizedTotals:
+    """Dashboard cumulative profit / loss split (header rework)."""
+
+    def test_mixed_wins_and_losses(self) -> None:
+        from src.order_manager.pnl import realized_totals
+
+        profit, loss = realized_totals(
+            [Decimal("10"), Decimal("-4"), Decimal("2.5"), Decimal("-1")]
+        )
+        assert profit == Decimal("12.5")
+        assert loss == Decimal("-5")
+
+    def test_empty_is_zero_zero(self) -> None:
+        from src.order_manager.pnl import realized_totals
+
+        assert realized_totals([]) == (Decimal("0"), Decimal("0"))
+
+    def test_zero_pnl_counts_as_neither(self) -> None:
+        from src.order_manager.pnl import realized_totals
+
+        profit, loss = realized_totals([Decimal("0")])
+        assert profit == Decimal("0")
+        assert loss == Decimal("0")

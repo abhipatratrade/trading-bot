@@ -196,5 +196,15 @@ class Broker(ABC):
         """
         return None
 
+    def wallet_flow_totals(self) -> tuple[Decimal, Decimal] | None:  # noqa: B027
+        """(total_deposited, total_withdrawn) in the account's settlement
+        currency, summed over the venue's wallet-transaction history.
+
+        Counts external deposits/withdrawals and sub-account transfers;
+        trading cashflows (pnl, fees, funding) are excluded. None when the
+        venue doesn't expose a transaction history.
+        """
+        return None
+
     def close(self) -> None:  # noqa: B027
         """Release resources.  Default no-op; override if needed."""
