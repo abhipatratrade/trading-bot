@@ -241,6 +241,27 @@ top-to-bottom.
 ## Phase 4 — Stocks Swing [priority 4]
 *(Detailed checklist added when Phase 3 completes. Activates Portfolio Allocator.)*
 
+### Phase 4-interim — Blasting Momentum swing bridge (Dhan sandbox)
+Standalone runner in `scripts/dhan-scanner/`, OUTSIDE the deterministic bot loop
+(no Postgres / kill switch / idempotent ids / audit rows). Runs the swing-indian
+spec on the Dhan **sandbox** until the real Phase-3/4 Dhan adapter + bucket_runner
+land, then RETIRE it. `swing-indian` stays `enabled: false` in buckets.yaml.
+
+- [x] Strategy files: scanner.yaml (all NSE+BSE, gap≥2%/RSI≥65↑/EMA10>20/CCI≥200/floors),
+      allocator.yaml (pooled μ/σ from backtest), strategy_master.csv, blasting_momentum.py
+      (ST(10,3) flip / 30d exit; indicators ported from Backtesting Engine)
+- [x] Interim runner: prepare/scan/manage/status, live data + sandbox orders
+- [x] Token auto-refresh via TOTP (Dhan 24h cap since 2025-10-01) — pyotp, verified live
+- [x] Sandbox endpoint fixed: `sandbox.dhan.co` (was dead `api-sandbox.dhan.co`), auth 200
+- [x] Dry-run made state-safe (no positions.json write); pipeline validated end-to-end
+- [x] Windows Task Scheduler: DhanSwing_Prepare 18:00 / _Scan 09:44 / _Manage 15:15 IST Mon-Fri
+- [ ] **OPEN — reliability**: tasks are Interactive logon (only fire when logged in);
+      move to always-on VM for unattended runs (spawn-task chip raised)
+- [ ] **OPEN — backtest fidelity**: backtest was Nifty 500; live universe is all NSE+BSE
+      (untested microcaps). Watch candidate counts / fill quality before scaling
+- [ ] **OPEN — Decision 022**: strategy has NO protective stop by design; swing-indian
+      has no stop_loss_pct. Needs a Decision 022 amendment before real money
+
 ## Phase 5 — Crypto Scalp [priority 5]
 *(Detailed checklist added when Phase 4 completes. Latency-tuned path.)*
 
@@ -275,6 +296,7 @@ Append a one-liner per session for traceability.
 - 2026-06-12 — Deployed restructure to prod. Ran migration 0002 on Railway Postgres (4 new tables, 6 bucket_state rows seeded). git push origin main triggered Railway dashboard + scheduler auto-deploy. GCP VM bot-worker.service: git pull, pip install hmmlearn+scipy, systemctl restart → active, BucketRunner now driving longterm-crypto with top5_volume. Hit psycopg2 InvalidTextRepresentation on audit_log writes because SAEnum serialises Python member NAMES (uppercase) while migration 0002 added new values in lowercase; fixed via manual ALTER TYPE on prod + migration 0003 (UPPERCASE versions) committed for fresh-install correctness. Railway dashboard verified serving new /buckets routes. 43 unit tests still green.
 - 2026-07-08 (cont.) — GCP cleanup completed per user: old `trading-bot-worker` VM (us-central1-f) DELETED with its boot disk and its static IP 35.184.66.247 RELEASED ("Address released" confirmed). Only `trading-bot-worker-mumbai` (34.14.200.220) remains. The 24h-soak grace period from the 2026-06-15 migration had long expired.
 - 2026-07-08 — Three user asks shipped: (1) bucket-header rework — Regime cell replaced by Deposited / Withdrawn (Delta wallet-transaction history via new `Broker.wallet_flow_totals`, cached in bucket_state.extra by a reconciler sweep step), Cumulative Profit / Loss (realized round-trips split by sign; pairing fixed to match on bucket+symbol so breaker_flatten / stop exits pair, with out-of-window entry lookup), Total Fees — all INR at fx 85. (2) Decision 026: multiple named scanner sets per bucket (scanner_<name>.yaml + allocator_<name>.yaml, `scanner` column in strategy_master.csv, one scan per set per pass, per-set allocation). (3) GCP via browser: stopped idle us-central VM `trading-bot-worker` (running since June migration!); Mumbai VM already e2-micro (minimal) — recommended deleting old VM + releasing static IP 35.184.66.247 for the real saving. Root cause of the broken reconcile sweep was fixed earlier this day (d04e20f: Delta HMAC prehash needs '?' before query string) — wallet mirror + fills enrichment verified healthy. 202 unit tests green.
+- 2026-07-10 — Phase 4-interim: took the Blasting Momentum swing-indian bridge tool live on Dhan **sandbox**. `scripts/dhan-scanner/` (from a prior session) validated + hardened: (1) Dhan capped access tokens at 24h (SEBI, 2025-10-01) — added TOTP auto-refresh (`auth.dhan.co/app/generateAccessToken` via pyotp; user enabled TOTP in web.dhan.co, creds in gitignored .env), verified minting live 24h tokens. (2) Fixed dead sandbox host `api-sandbox.dhan.co` → `sandbox.dhan.co` (DNS+auth probed, was never tested before). (3) Made `--dry-run` state-safe (no longer writes positions.json — would have blocked the next live scan). First full `prepare` sweep: 4,661 symbols → scanned 2,933, **shortlist 26**, errors 1,655 (delisted/illiquid — effective universe ~2,933). Dry-run scan validated end-to-end: 8 pass the 09:45 gap filter, top-5 sized + routed to sandbox. Scheduled via Windows Task Scheduler (DhanSwing_Prepare/Scan/Manage @ 18:00/09:44/15:15 IST Mon-Fri, pinned to Python 3.14). OPEN: Interactive-logon tasks (need always-on VM — chip raised); backtest was Nifty 500 vs live all-NSE+BSE; no protective stop vs Decision 022. First live sandbox entries: Mon 2026-07-13 09:44.
 - 2026-07-07 (later) — Decision 025 (user): Kelly now sizes on live sub-account equity (available+locked mirror); capital_inr is only the P&L baseline. New `scripts/record_capital_adjustment.py` (--amount ±X on deposits/withdrawals, --rebase to zero P&L at current wallet); longterm-crypto adjustments set to −31,736.34, writing off June testnet losses (dup-order bug + liquidations, confirmed via audit trail; funding_extreme kill switch from 07-06 still engaged). Flagged: reconcile sweep appears to be failing on the VM since the `states=open,pending` change (stale wallet mirror + no fill enrichment) — spawn-task chip raised.
 - 2026-07-07 (final) — Phase 1c COMPLETE. Decision 024 shipped (user chose option c): strategy exits run while killed (reduce-only, allow_when_killed) and breakers stay watched while killed (act-gated to avoid re-flatten/alert spam; per-breaker alerts dedup-capped; recovery ping). FX switched to FIXED 85 INR/USD per user (allocator.yaml source of truth; fx.py live feed removed same-day). 188 unit tests green.
 - 2026-07-07 (cont.) — Phase 1c item 13 shipped: config cleanup (kite_* → dhan_* settings + .env.example). Phase 1c backlog now complete except the kill-switch-semantics item, which is explicitly waiting on a user decision. 191 unit tests green.

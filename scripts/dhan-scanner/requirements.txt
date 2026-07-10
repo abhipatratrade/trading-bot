@@ -1,0 +1,5 @@
+requests>=2.31
+pandas>=2.0
+numpy>=1.24
+python-dotenv>=1.0
+pyotp>=2.9        # TOTP codes for daily Dhan access-token refresh (24h cap)

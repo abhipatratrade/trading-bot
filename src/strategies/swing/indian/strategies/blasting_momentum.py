@@ -1,0 +1,152 @@
+"""
+Blasting Momentum — swing-indian strategy (Phase 4, Dhan).
+
+backtest_ref:
+    Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md
+    Nifty 500, ~1yr: +23.5% unlevered (PF 1.71, win 54%, DD 7.3%, 41 trades,
+    OOS halves +9.7%/+10.5%). Live mode: 3x MTF (bucket leverage_max=4).
+
+Division of labour (mirrors the backtest exactly):
+  * scanner.yaml does ALL entry filtering at 09:45 IST (gap>=2% vs prev close,
+    daily RSI(14)>=65 & rising, EMA10>EMA20, CCI(14)>=200, volume/price/turnover
+    floors) and ranks by gap %. By the time ``select_entries`` runs, candidates
+    are already the ranked survivors — the strategy just claims free slots.
+  * ``select_exits`` owns the exit: daily Supertrend(10,3) flip below the close,
+    or a 30-calendar-day hold cap. NO intraday stop — the backtest showed tight
+    stops destroy this edge (day-1 noise knocks out eventual winners).
+
+The Supertrend implementation is ported line-for-line from the backtest
+engine's ``calc_supertrend`` so live exits match backtested exits bit-for-bit
+(the backtester repo is separate — Decision "Backtest engine out of scope" —
+hence the port rather than an import).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+from src.core.logging import get_logger
+from src.data_sources.base import MarketData
+from src.shared.base_strategy import EntryCandidate, Strategy
+
+if TYPE_CHECKING:
+    from src.core.models import MarketRegime, Position
+
+_log = get_logger("strategies.swing.indian.blasting_momentum")
+
+_ST_PERIOD: int = 10
+_ST_MULT: float = 3.0
+_MAX_HOLD_DAYS: int = 30
+_MIN_BARS: int = _ST_PERIOD + 5
+
+
+def _supertrend(df: pd.DataFrame, period: int = _ST_PERIOD,
+                multiplier: float = _ST_MULT) -> pd.Series:
+    """Supertrend — ported verbatim from backtest_engine.calc_supertrend."""
+    high, low = df["high"], df["low"]
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    hl2 = (df["high"] + df["low"]) / 2
+    ub = (hl2 + multiplier * atr).values.copy()
+    lb = (hl2 - multiplier * atr).values.copy()
+    close = df["close"].values
+    n = len(df)
+    st = np.full(n, np.nan)
+    d = np.ones(n, dtype=int)
+    for i in range(period, n):
+        if close[i] > ub[i - 1]:
+            d[i] = 1
+        elif close[i] < lb[i - 1]:
+            d[i] = -1
+        else:
+            d[i] = d[i - 1]
+        if d[i] == 1:
+            if d[i - 1] == 1:
+                lb[i] = max(lb[i], lb[i - 1])
+            st[i] = lb[i]
+        else:
+            if d[i - 1] == -1:
+                ub[i] = min(ub[i], ub[i - 1])
+            st[i] = ub[i]
+    return pd.Series(st, index=df.index)
+
+
+def _bars_to_df(bars: list) -> pd.DataFrame:
+    return pd.DataFrame({
+        "high": [float(b.high) for b in bars],
+        "low": [float(b.low) for b in bars],
+        "close": [float(b.close) for b in bars],
+    })
+
+
+class BlastingMomentum(Strategy):
+    """Buy the scanner's ranked gap-momentum basket; exit on daily ST flip / 30d."""
+
+    name: str = "blasting_momentum"
+    tf: str = "1d"
+    trading_type: str = "swing"
+
+    def select_entries(
+        self,
+        candidates: list[str],
+        data: MarketData,
+    ) -> list[EntryCandidate]:
+        # scanner.yaml has already filtered AND ranked (gap_up_pct_desc);
+        # order is preserved so the runner fills slots from the strongest gap.
+        out: list[EntryCandidate] = []
+        for sym in candidates:
+            out.append(EntryCandidate(symbol=sym, side="buy",
+                                      hint={"signal": "blasting_momentum_scan"}))
+            _log.info("entry_candidate", symbol=sym)
+        return out
+
+    def select_exits(
+        self,
+        held: dict[str, Position],
+        data: MarketData,
+        regimes: Mapping[str, MarketRegime | None] | None = None,  # noqa: ARG002
+    ) -> list[str]:
+        """Exit when today's daily close < Supertrend(10,3), or held >= 30 days.
+
+        State-based (close below the trail), not cross-based, so a missed tick
+        or bot restart still exits on the next evaluation.
+        """
+        exits: list[str] = []
+        now = datetime.now(timezone.utc)
+        for sym, pos in held.items():
+            # --- 30-day hold cap (backtest-optimal: 30d beat 20d and infinity)
+            opened = getattr(pos, "opened_at", None) or getattr(pos, "created_at", None)
+            if opened is not None:
+                opened_utc = opened if opened.tzinfo else opened.replace(tzinfo=timezone.utc)
+                if (now - opened_utc).days >= _MAX_HOLD_DAYS:
+                    exits.append(sym)
+                    _log.info("exit_max_days", symbol=sym, days=(now - opened_utc).days)
+                    continue
+
+            # --- daily Supertrend flip
+            try:
+                bars = data.get_ohlcv(sym, self.tf, limit=_MIN_BARS + 60)
+            except Exception:
+                _log.warning("exit_ohlcv_fetch_failed", symbol=sym, exc_info=True)
+                continue
+            if len(bars) < _MIN_BARS:
+                continue
+            df = _bars_to_df(bars)
+            st = _supertrend(df)
+            close = float(df["close"].iloc[-1])
+            trail = float(st.iloc[-1])
+            if np.isnan(trail):
+                continue
+            if close < trail:
+                exits.append(sym)
+                _log.info("exit_st_flip", symbol=sym,
+                          close=round(close, 2), supertrend=round(trail, 2))
+        return exits

@@ -1,8 +1,42 @@
-﻿# Stub. Populate before enabling in buckets.yaml.
-universe_size: 5
+# swing-indian scanner — Blasting Momentum v1.
+#
+# backtest_ref: Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md
+#   (Nifty 500 ~1yr: +23.5% unlevered, PF 1.71, DD 7.3%, 41 trades,
+#    OOS halves +9.7%/+10.5%. At 3x MTF ~ +54% on margin, margin-DD ~22%.)
+#
+# Universe: the ENTIRE tradeable NSE + BSE cash-equity universe (user decision
+# 2026-07-10), resolved from the Dhan scrip master (NSE SEGMENT=E SERIES=EQ +
+# BSE equities, deduped preferring the NSE listing). NOTE: the backtest was run
+# on Nifty 500 only — whole-market adds untested micro-caps; the price/turnover
+# floors below are the guardrails. Watch live fill quality before trusting.
+#
+# Filter/ranker names below are the Phase-4 contract: implementations register
+# in src/shared/scanner/filters/ when the Dhan data adapter lands (Decision 012,
+# Phase 3/4). Until then the bucket stays disabled in buckets.yaml and the
+# interim runner (scripts/dhan-scanner/) executes the same spec on the sandbox.
+#
+# Scan moment: 09:45 IST. Daily-side indicators are as of the PRIOR close
+# (no look-ahead); gap/volume confirm on the morning's 15m bars.
+
+universe: nse_bse_all_equities
+universe_size: 5                    # top-5 basket (max_positions)
+
 filters:
-  - name: min_24h_volume_usd
-    params: { threshold: 5000000 }
+  - name: gap_up_pct_min            # (09:45 price / prev daily close - 1)*100
+    params: { threshold: 2.0 }
+  - name: daily_rsi_min_rising      # RSI(14) as of prior close, and rising d/d
+    params: { period: 14, threshold: 65.0 }
+  - name: daily_ema_stack           # EMA(fast) > EMA(slow), prior close
+    params: { fast: 10, slow: 20 }
+  - name: daily_cci_min             # CCI(14) as of prior close
+    params: { period: 14, threshold: 200.0 }
+  - name: cum_volume_min            # shares traded 09:15 -> 09:45
+    params: { threshold: 20000 }
+  - name: price_band_inr
+    params: { low: 100.0, high: 2000.0 }
+  - name: turnover_min_inr          # price x cum_vol (size proxy)
+    params: { threshold: 500000 }
+
 ranker:
-  name: volume_24h_desc
+  name: gap_up_pct_desc             # strongest gappers first
   params: {}

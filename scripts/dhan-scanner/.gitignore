@@ -1,0 +1,5 @@
+# Interim Dhan scanner — runtime artifacts, never committed.
+.env
+state/
+__pycache__/
+*.log
