@@ -1,0 +1,23 @@
+# VM-side daily equity-scanner prepare (Phase 4, swing-indian).
+#
+# Runs the heavy ~4,600-symbol daily indicator pass for the Dhan equity
+# scanner AFTER the NSE close and writes the passing shortlist to
+# ScannerSnapshot, so the bot's per-tick 09:45 scan only does the light
+# intraday confirm. Mirrors the regime-retrain timer pattern (Decision 020).
+# ``--due`` runs only on weekdays (the job decides).
+#
+# NOT auto-applied by the deploy timer. After editing, re-copy by hand:
+#   sudo cp ops/dhan-prepare.service ops/dhan-prepare.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dhan-prepare.timer
+
+[Unit]
+Description=Dhan equity-scanner daily prepare (swing-indian shortlist)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kohinoor_abhi
+WorkingDirectory=/home/kohinoor_abhi/trading-bot
+ExecStart=/home/kohinoor_abhi/trading-bot/.venv/bin/python -m src.shared.scanner.prepare_job --due
+EnvironmentFile=/home/kohinoor_abhi/.env

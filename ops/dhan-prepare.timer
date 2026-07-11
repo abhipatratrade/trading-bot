@@ -1,0 +1,24 @@
+# Fires dhan-prepare.service daily at 12:30 UTC = 18:00 IST — after the
+# 15:30 IST NSE close, so the day's SETTLED daily close feeds the shortlist,
+# ready for the next morning's 09:45 IST scan. The job (--due) skips weekends
+# itself; the bot's run_equity_scan tolerates a shortlist up to a few days old
+# (Fri prepare → Mon scan). See dhan-prepare.service.
+#
+# Install + enable:
+#   sudo cp ops/dhan-prepare.service ops/dhan-prepare.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dhan-prepare.timer
+#   systemctl list-timers | grep dhan-prepare   # confirm next-fire
+#
+# Run once on demand:  sudo systemctl start dhan-prepare.service
+
+[Unit]
+Description=Daily trigger for dhan-prepare.service (18:00 IST / 12:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 12:30:00 UTC
+Persistent=true
+Unit=dhan-prepare.service
+
+[Install]
+WantedBy=timers.target

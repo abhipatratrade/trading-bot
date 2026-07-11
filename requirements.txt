@@ -8,6 +8,7 @@ psycopg2-binary>=2.9
 pyarrow>=15.0
 pydantic>=2.6
 pydantic-settings>=2.2
+pyotp>=2.9
 python-multipart>=0.0.9
 PyYAML>=6.0
 SQLAlchemy>=2.0

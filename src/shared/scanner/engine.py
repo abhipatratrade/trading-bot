@@ -18,12 +18,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date as date_type
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from src.core.db import session_scope
 from src.core.logging import get_logger
@@ -37,6 +38,11 @@ from src.core.models import (
 from src.data_sources.base import MarketData, Ticker
 
 _log = get_logger("shared.scanner.engine")
+
+# Equity shortlist staleness (days): the daily prepare runs the evening before,
+# so the morning scan reads a 1-day-old shortlist normally, up to ~3 over a
+# weekend (Fri prepare → Mon scan). Beyond this, treat as no shortlist.
+_SHORTLIST_MAX_AGE_DAYS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -329,16 +335,32 @@ def run_equity_scan(
     ecfg = EquityScanConfig.from_scanner_config(config)
 
     with session_scope() as session:
+        # The prepare job runs the evening BEFORE (18:00 IST = 12:30 UTC), so its
+        # ScannerSnapshot rows carry the prior UTC date. Match the most recent
+        # shortlist within a small staleness window rather than == scan_date, or
+        # the morning scan (next UTC day) would never find survivors. Bias: a
+        # stale-but-present shortlist is fine (same as the interim tool's age≤3);
+        # nothing recent → empty (no entries), which is safe.
+        latest_date = session.execute(
+            select(func.max(ScannerSnapshot.date)).where(
+                ScannerSnapshot.strategy_id == bucket_id,
+                ScannerSnapshot.passed.is_(True),
+                ScannerSnapshot.date <= scan_date,
+                ScannerSnapshot.date >= scan_date - timedelta(days=_SHORTLIST_MAX_AGE_DAYS),
+            )
+        ).scalar_one_or_none()
         rows = (
             session.execute(
                 select(ScannerSnapshot).where(
-                    ScannerSnapshot.date == scan_date,
+                    ScannerSnapshot.date == latest_date,
                     ScannerSnapshot.strategy_id == bucket_id,
                     ScannerSnapshot.passed.is_(True),
                 )
             )
             .scalars()
             .all()
+            if latest_date is not None
+            else []
         )
         survivors = [
             Survivor(
