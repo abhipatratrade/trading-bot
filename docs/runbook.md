@@ -116,6 +116,64 @@ cd ~/trading-bot && set -a && . ~/.env && set +a && \
 
 ---
 
+## Swing-Indian bucket (Dhan sandbox) — Phase 4
+
+`swing-indian` runs the Blasting Momentum strategy on Dhan equities + MTF,
+inside the same deterministic `BucketRunner` loop as the crypto buckets. It's
+**sandbox-only** for now (`TRADING_MODE=testnet` → Dhan sandbox orders +
+`api.dhan.co` live data; the sandbox has no data feed). The old standalone
+`scripts/dhan-scanner/` tool is retired once this soaks clean.
+
+Two moving parts beyond the bot loop:
+
+| Piece | What |
+|---|---|
+| `dhan-prepare.timer` | Fires daily 12:30 UTC (18:00 IST). |
+| `dhan-prepare.service` | `oneshot`: `python -m src.shared.scanner.prepare_job --due` — the heavy ~4,600-symbol daily indicator pass; writes the passing shortlist to `ScannerSnapshot`. The per-tick `run_equity_scan` reads it (tolerates a shortlist up to ~4 days old, so Fri→Mon is fine). |
+| regime | The **existing** `regime-retrain.timer` already covers swing-indian (NIFTYBEES-proxy HMM, weekly Mondays) — no separate timer. |
+
+**Fail-soft:** if the Dhan creds are missing/broken on the VM, `run_bot` alerts
+`Dhan account init FAILED` and skips the bucket — **the crypto buckets keep
+running**. So enabling swing-indian can never take down live crypto.
+
+### First-time setup (one-off, on the VM)
+
+```bash
+# 1. Add the Dhan creds to the bot's env (same values as your local .env):
+#    DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET,
+#    DHAN_SANDBOX_CLIENT_ID, DHAN_SANDBOX_ACCESS_TOKEN
+nano ~/.env
+
+# 2. Pull the latest code, then run the idempotent setup (checks env-var
+#    presence, ensures pyotp, installs+enables the prepare timer):
+cd ~/trading-bot && git pull origin main
+bash ops/setup-dhan.sh
+```
+
+The VM's outbound IP `34.14.200.220` must be whitelisted in the Dhan DevPortal
+(Static IP Setting) for the live data account.
+
+### Verify + soak
+
+```bash
+# Bot picked up the Dhan account on restart:
+sudo journalctl -u bot-worker -n 60 --no-pager | grep -iE "dhan|swing-indian"
+#   expect "dhan_account_ready"; a "Dhan account init FAILED" alert = a bad cred.
+
+# Build today's shortlist on demand (~40-60 min):
+sudo systemctl start dhan-prepare.service
+sudo journalctl -u dhan-prepare -n 30 --no-pager
+
+# During 09:45-10:30 IST, watch entries fire (only in the entry window):
+sudo journalctl -u bot-worker -f | grep -iE "equity_scan|swing-indian"
+```
+
+Then confirm on the dashboard `/buckets` page: swing-indian shows positions,
+the wide (20%) protective stop rests on each, and exits fire on Supertrend
+flip / 30-day cap. The reconciler should agree with the sandbox each sweep.
+
+---
+
 ## Common checks
 
 ```bash
