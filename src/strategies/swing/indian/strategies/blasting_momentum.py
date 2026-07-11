@@ -15,24 +15,24 @@ Division of labour (mirrors the backtest exactly):
     or a 30-calendar-day hold cap. NO intraday stop — the backtest showed tight
     stops destroy this edge (day-1 noise knocks out eventual winners).
 
-The Supertrend implementation is ported line-for-line from the backtest
-engine's ``calc_supertrend`` so live exits match backtested exits bit-for-bit
-(the backtester repo is separate — Decision "Backtest engine out of scope" —
-hence the port rather than an import).
+Supertrend (and the other indicators) live in ``src.shared.scanner.indicators``
+— a vendored byte-for-byte copy of the backtest engine's ``calc_*`` — so the
+scanner and this strategy share one implementation and live exits match
+backtested exits bit-for-bit.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 
 from src.core.logging import get_logger
 from src.data_sources.base import MarketData
 from src.shared.base_strategy import EntryCandidate, Strategy
+from src.shared.scanner.indicators import bars_to_df, supertrend
 
 if TYPE_CHECKING:
     from src.core.models import MarketRegime, Position
@@ -43,48 +43,6 @@ _ST_PERIOD: int = 10
 _ST_MULT: float = 3.0
 _MAX_HOLD_DAYS: int = 30
 _MIN_BARS: int = _ST_PERIOD + 5
-
-
-def _supertrend(df: pd.DataFrame, period: int = _ST_PERIOD,
-                multiplier: float = _ST_MULT) -> pd.Series:
-    """Supertrend — ported verbatim from backtest_engine.calc_supertrend."""
-    high, low = df["high"], df["low"]
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(),
-                    (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-    hl2 = (df["high"] + df["low"]) / 2
-    ub = (hl2 + multiplier * atr).values.copy()
-    lb = (hl2 - multiplier * atr).values.copy()
-    close = df["close"].values
-    n = len(df)
-    st = np.full(n, np.nan)
-    d = np.ones(n, dtype=int)
-    for i in range(period, n):
-        if close[i] > ub[i - 1]:
-            d[i] = 1
-        elif close[i] < lb[i - 1]:
-            d[i] = -1
-        else:
-            d[i] = d[i - 1]
-        if d[i] == 1:
-            if d[i - 1] == 1:
-                lb[i] = max(lb[i], lb[i - 1])
-            st[i] = lb[i]
-        else:
-            if d[i - 1] == -1:
-                ub[i] = min(ub[i], ub[i - 1])
-            st[i] = ub[i]
-    return pd.Series(st, index=df.index)
-
-
-def _bars_to_df(bars: list) -> pd.DataFrame:
-    return pd.DataFrame({
-        "high": [float(b.high) for b in bars],
-        "low": [float(b.low) for b in bars],
-        "close": [float(b.close) for b in bars],
-    })
 
 
 class BlastingMomentum(Strategy):
@@ -120,12 +78,12 @@ class BlastingMomentum(Strategy):
         or bot restart still exits on the next evaluation.
         """
         exits: list[str] = []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for sym, pos in held.items():
             # --- 30-day hold cap (backtest-optimal: 30d beat 20d and infinity)
             opened = getattr(pos, "opened_at", None) or getattr(pos, "created_at", None)
             if opened is not None:
-                opened_utc = opened if opened.tzinfo else opened.replace(tzinfo=timezone.utc)
+                opened_utc = opened if opened.tzinfo else opened.replace(tzinfo=UTC)
                 if (now - opened_utc).days >= _MAX_HOLD_DAYS:
                     exits.append(sym)
                     _log.info("exit_max_days", symbol=sym, days=(now - opened_utc).days)
@@ -139,8 +97,8 @@ class BlastingMomentum(Strategy):
                 continue
             if len(bars) < _MIN_BARS:
                 continue
-            df = _bars_to_df(bars)
-            st = _supertrend(df)
+            df = bars_to_df(bars)
+            st = supertrend(df, _ST_PERIOD, _ST_MULT)
             close = float(df["close"].iloc[-1])
             trail = float(st.iloc[-1])
             if np.isnan(trail):

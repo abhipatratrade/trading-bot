@@ -37,6 +37,28 @@ class DeltaAccount(NamedTuple):
     ws_url: str
 
 
+class DhanAccount(NamedTuple):
+    """Resolved Dhan config for the active mode.
+
+    Two token surfaces (see config notes): market DATA always hits the live
+    ``data_base_url`` with the live account (TOTP-refreshed from
+    ``data_client_id`` + ``pin`` + ``totp_secret``, or the static
+    ``data_token`` fallback). ORDERS hit ``order_base_url`` with
+    ``order_client_id`` + ``order_token`` — the DevPortal sandbox token in
+    testnet, or the (refreshed) live token in live mode (``order_token`` is
+    None then, signalling "reuse the data token").
+    """
+
+    data_base_url: str
+    data_client_id: str | None
+    data_token: str | None
+    pin: str | None
+    totp_secret: str | None
+    order_base_url: str
+    order_client_id: str | None
+    order_token: str | None
+
+
 class LogFormat(StrEnum):
     JSON = "json"
     CONSOLE = "console"
@@ -96,10 +118,22 @@ class Settings(BaseSettings):
     binance_rest_url: str = "https://fapi.binance.com"
     binance_ws_url: str = "wss://fstream.binance.com"
 
-    # -- Dhan (DhanHQ API — stocks, Decision 012; Phase 3) -------------------
-    # 30-day access tokens generated from the Dhan web console.
-    dhan_client_id: str | None = None
-    dhan_access_token: SecretStr | None = None
+    # -- Dhan (DhanHQ API — stocks, Decision 012; Phase 3/4) ----------------
+    # Access tokens are capped at 24h (SEBI, 2025-10-01), so the live data
+    # token is auto-minted from client_id + PIN + TOTP each run rather than
+    # pasted in. dhan_access_token is only an optional static fallback.
+    #
+    # Market DATA always uses the LIVE api.dhan.co (the sandbox has no data
+    # feed). ORDERS go to sandbox.dhan.co (testnet) or api.dhan.co (live),
+    # gated by trading_mode (House Rule #6).
+    dhan_client_id: str | None = None          # live account client id
+    dhan_access_token: SecretStr | None = None  # optional static live token
+    dhan_pin: SecretStr | None = None           # login PIN (TOTP refresh)
+    dhan_totp_secret: SecretStr | None = None   # base32 TOTP secret
+    dhan_data_base_url: str = "https://api.dhan.co"
+    dhan_sandbox_base_url: str = "https://sandbox.dhan.co"
+    dhan_sandbox_client_id: str | None = None
+    dhan_sandbox_access_token: SecretStr | None = None  # DevPortal sandbox token
 
     # -- Telegram (optional) ------------------------------------------------
     telegram_bot_token: SecretStr | None = None
@@ -230,6 +264,50 @@ class Settings(BaseSettings):
             api_secret=secret.get_secret_value(),
             base_url=self.delta_base_url,
             ws_url=self.delta_ws_url,
+        )
+
+    def dhan_account(self) -> DhanAccount:
+        """Resolve Dhan config for the active mode (fail-fast, House Rule #6).
+
+        Requires the TOTP refresh trio (client_id + PIN + TOTP secret) OR a
+        static live data token; and, in testnet, the sandbox order creds.
+        """
+        def _sv(s: SecretStr | None) -> str | None:
+            return s.get_secret_value() if s is not None else None
+
+        pin = _sv(self.dhan_pin)
+        totp = _sv(self.dhan_totp_secret)
+        data_token = _sv(self.dhan_access_token)
+        can_refresh = bool(self.dhan_client_id and pin and totp)
+        if not (can_refresh or data_token):
+            raise ValueError(
+                "Dhan data auth missing: set DHAN_CLIENT_ID + DHAN_PIN + "
+                "DHAN_TOTP_SECRET (auto-refresh) or DHAN_ACCESS_TOKEN (static)"
+            )
+
+        if self.trading_mode == TradingMode.TESTNET:
+            if not (self.dhan_sandbox_client_id and self.dhan_sandbox_access_token):
+                raise ValueError(
+                    "TRADING_MODE=testnet requires DHAN_SANDBOX_CLIENT_ID "
+                    "and DHAN_SANDBOX_ACCESS_TOKEN"
+                )
+            order_base = self.dhan_sandbox_base_url
+            order_client = self.dhan_sandbox_client_id
+            order_token = _sv(self.dhan_sandbox_access_token)
+        else:
+            order_base = self.dhan_data_base_url
+            order_client = self.dhan_client_id
+            order_token = None  # live orders reuse the (refreshed) data token
+
+        return DhanAccount(
+            data_base_url=self.dhan_data_base_url,
+            data_client_id=self.dhan_client_id,
+            data_token=data_token,
+            pin=pin,
+            totp_secret=totp,
+            order_base_url=order_base,
+            order_client_id=order_client,
+            order_token=order_token,
         )
 
     @property

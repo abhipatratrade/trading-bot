@@ -27,6 +27,9 @@ dependencies = [
     # Brokers / data
     "kiteconnect>=4.2",
     # Delta India: no official Python SDK — we'll write a thin HMAC client.
+    # Dhan: no SDK either — thin REST client. pyotp mints the daily TOTP that
+    # refreshes Dhan's 24h access token (SEBI cap, 2025-10-01).
+    "pyotp>=2.9",
 
     # Data handling / archive
     "pandas>=2.2",

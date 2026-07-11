@@ -56,6 +56,14 @@ class ScannerConfig(BaseModel):
     universe_size: int = Field(ge=1, le=100)
     filters: list[FilterSpec] = Field(default_factory=list)
     ranker: RankerSpec
+    # Which scan engine runs this config. "generic" = the crypto ticker-snapshot
+    # path below (default, so every existing crypto config is unchanged);
+    # "equity_daily" = the two-phase Dhan equity path (daily-prepare shortlist +
+    # intraday confirm), dispatched to ``run_equity_scan``.
+    engine: str = "generic"
+    # Free-text universe label for equity configs (e.g. nse_bse_all_equities);
+    # informational — the equity universe comes from the Dhan data adapter.
+    universe: str | None = None
 
 
 def load_scanner_config(path: Path) -> ScannerConfig:
@@ -146,7 +154,16 @@ def run_scan(
     For crypto buckets we additionally constrain candidates to symbols
     that exist on both Delta India AND Binance (Decision 004) so we have
     a signal feed for every executed symbol.
+
+    Equity configs (``engine: equity_daily``) take the two-phase Dhan path
+    instead — a daily-prepare shortlist (written by ``prepare_job``) plus an
+    intraday gap/volume confirm — via ``run_equity_scan``.
     """
+    if config.engine == "equity_daily":
+        return run_equity_scan(
+            bucket_id=bucket_id, data=data, config=config, scan_date=scan_date
+        )
+
     # 1. eligible symbols (joined to symbol mapping)
     with session_scope() as session:
         q = select(SymbolMapping).where(SymbolMapping.listed_on_delta.is_(True))
@@ -278,4 +295,132 @@ def run_scan(
         date=scan_date,
         universe=chosen_symbols,
         evaluated_count=len(evaluated),
+    )
+
+
+def run_equity_scan(
+    *,
+    bucket_id: str,
+    data: MarketData,
+    config: ScannerConfig,
+    scan_date: date_type,
+) -> ScanResult:
+    """Two-phase equity scan: read the daily-prepare shortlist, confirm intraday.
+
+    The heavy daily indicator pass runs once/day in ``prepare_job`` and lands as
+    ``ScannerSnapshot`` survivor rows (``passed=True`` + indicator metrics). Here,
+    per tick during the entry window, we read those survivors, confirm the 09:45
+    gap/volume on the morning 15m bars, rank by gap %, and persist the top-N to
+    ``DailyUniverse``. ``ScannerSnapshot`` is left intact — the prepare job owns
+    it, so a per-tick scan never clobbers the day's shortlist.
+    """
+    from datetime import timedelta as _td
+    from datetime import timezone as _tz
+
+    from src.shared.scanner.equity import (
+        Candidate,
+        EquityScanConfig,
+        Survivor,
+        intraday_confirm,
+        rank_top,
+    )
+
+    ist = _tz(_td(hours=5, minutes=30))
+    ecfg = EquityScanConfig.from_scanner_config(config)
+
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(ScannerSnapshot).where(
+                    ScannerSnapshot.date == scan_date,
+                    ScannerSnapshot.strategy_id == bucket_id,
+                    ScannerSnapshot.passed.is_(True),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        survivors = [
+            Survivor(
+                symbol=r.symbol,
+                prev_close=Decimal(str(r.metrics.get("prev_close", "0"))),
+                rsi=Decimal(str(r.metrics.get("rsi", "0"))),
+                cci=Decimal(str(r.metrics.get("cci", "0"))),
+                supertrend=Decimal(str(r.metrics.get("supertrend", "0"))),
+            )
+            for r in rows
+        ]
+
+    if not survivors:
+        _log.info("equity_scan_no_survivors", bucket_id=bucket_id, date=str(scan_date))
+
+    candidates: list[Candidate] = []
+    for s in survivors:
+        try:
+            bars = data.get_ohlcv(s.symbol, "15m")
+        except Exception:
+            _log.warning(
+                "equity_intraday_fetch_failed", symbol=s.symbol, exc_info=True
+            )
+            continue
+        # 15m fetch can span several sessions — keep only today's bars so the
+        # 09:15→09:45 window isn't polluted by prior days at the same wall-clock.
+        today = [b for b in bars if b.timestamp.astimezone(ist).date() == scan_date]
+        c = intraday_confirm(s, today, ecfg)
+        if c is not None:
+            candidates.append(c)
+
+    chosen = rank_top(candidates, ecfg.universe_size)
+    chosen_symbols = [c.symbol for c in chosen]
+    weight = Decimal("1") / Decimal(str(len(chosen))) if chosen else Decimal("0")
+
+    with session_scope() as session:
+        session.execute(
+            delete(DailyUniverse).where(
+                DailyUniverse.date == scan_date,
+                DailyUniverse.strategy_id == bucket_id,
+            )
+        )
+        for rank, c in enumerate(chosen, start=1):
+            session.add(
+                DailyUniverse(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=c.symbol,
+                    rank=rank,
+                    target_weight=weight,
+                    notes=f"gap={c.gap_pct:.2f}% price={c.price}",
+                )
+            )
+        session.add(
+            AuditLog(
+                strategy_id=bucket_id,
+                event_type=AuditEventType.SCANNER_RUN,
+                message=(
+                    f"equity scan: {len(chosen)}/{len(survivors)} confirmed, "
+                    f"top-{ecfg.universe_size}"
+                ),
+                payload={
+                    "bucket_id": bucket_id,
+                    "date": str(scan_date),
+                    "universe": chosen_symbols,
+                    "survivors": len(survivors),
+                    "confirmed": len(candidates),
+                },
+            )
+        )
+
+    _log.info(
+        "equity_scan_complete",
+        bucket_id=bucket_id,
+        date=str(scan_date),
+        universe=chosen_symbols,
+        survivors=len(survivors),
+        confirmed=len(candidates),
+    )
+    return ScanResult(
+        bucket_id=bucket_id,
+        date=scan_date,
+        universe=chosen_symbols,
+        evaluated_count=len(survivors),
     )

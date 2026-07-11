@@ -64,7 +64,8 @@ from src.shared.allocator.sizer import (
     size_positions,
 )
 from src.shared.base_strategy import Strategy
-from src.shared.bucket import Bucket
+from src.shared.bucket import Bucket, Market
+from src.shared.market_calendar import NseSession, nse_session
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
 from src.shared.scanner.engine import (
@@ -191,6 +192,14 @@ class BucketRunner:
             )
             return _empty_summary(self.bucket.id)
 
+        # Market-hours gate (equity buckets only; crypto is 24/7). When the NSE
+        # session is CLOSED there is nothing to do — we can't even place exits —
+        # so skip the whole pass. OPEN_NO_ENTRY runs exits but no new entries.
+        session_state = self._equity_session_state()
+        if session_state is NseSession.CLOSED:
+            _log.info("bucket_market_closed", bucket_id=self.bucket.id)
+            return _empty_summary(self.bucket.id)
+
         # 0. Exits — strategy-driven closes run before any entry logic
         # (Decision 021). A failed exit must not block other strategies.
         # Decision 024: exits also run while the kill switch is engaged —
@@ -210,6 +219,26 @@ class BucketRunner:
                 skipped={},
                 eligible_strategies=[],
                 blocked_strategies={"*": "kill switch engaged"},
+                universe=[],
+                regime=None,
+                exited=exited,
+            )
+
+        # Entry-window gate: session is open but, for an equity bucket outside
+        # the morning entry window, we manage exits only — never open a position
+        # on a gap that has gone stale since the 09:45 open.
+        if session_state is not NseSession.ENTRY_WINDOW:
+            _log.info(
+                "bucket_exits_only_outside_entry_window",
+                bucket_id=self.bucket.id,
+                exited=exited,
+            )
+            return RunSummary(
+                bucket_id=self.bucket.id,
+                placed=0,
+                skipped={},
+                eligible_strategies=[],
+                blocked_strategies={"*": f"market: {session_state.value}"},
                 universe=[],
                 regime=None,
                 exited=exited,
@@ -375,6 +404,16 @@ class BucketRunner:
         )
 
     # ── Internals ──────────────────────────────────────────────────────
+    def _equity_session_state(self) -> NseSession:
+        """NSE session state for this bucket's market.
+
+        Crypto is 24/7, so it is always in the entry window (path unchanged).
+        Indian buckets defer to the NSE calendar (hours + holidays).
+        """
+        if self.bucket.market != Market.INDIAN:
+            return NseSession.ENTRY_WINDOW
+        return nse_session(self._clock.now())
+
     def _run_exits(self, om: OrderManager) -> int:
         """Step 0: ask every discovered strategy which held positions to close.
 

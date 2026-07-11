@@ -1,7 +1,15 @@
-﻿# Stub.
-enabled: false
-proxy_symbol: BTCUSDT
-tf: 1h
-training_window_days: 90
-inference_lookback_bars: 200
-retrain_cadence: manual
+# swing-indian regime — broad-market HMM on a NIFTY-50 proxy (Decision 014).
+#
+# The strategy_master gate is bull/neutral, so we only need the broad-market
+# label (symbols: [] ⇒ no per-name models; the sizer uses the market regime
+# via MARKET_SENTINEL fallback). proxy_symbol is a cash-equity ETF that tracks
+# NIFTY 50 and resolves in the DhanData universe, so no index-instrument
+# support is needed. Retrain runs on the VM (Decision 020) — an indian-regime
+# systemd timer, weekly (NSE daily bars).
+enabled: true
+proxy_symbol: NIFTYBEES        # NIFTY-50 ETF (NSE cash equity)
+tf: 1d
+training_window_days: 1100     # ~4.5y of daily bars → 3-state-full tier
+inference_lookback_bars: 250
+retrain_cadence: weekly
+symbols: []                    # broad-market only (market gate is bull/neutral)

@@ -18,6 +18,9 @@
 # Scan moment: 09:45 IST. Daily-side indicators are as of the PRIOR close
 # (no look-ahead); gap/volume confirm on the morning's 15m bars.
 
+# engine: which scan path in src/shared/scanner/engine.py runs this config.
+# equity_daily = two-phase Dhan path (daily-prepare shortlist + intraday confirm).
+engine: equity_daily
 universe: nse_bse_all_equities
 universe_size: 5                    # top-5 basket (max_positions)
 

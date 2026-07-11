@@ -19,11 +19,13 @@ The bot continues to use the previously-saved model until
 ``brain.predict_regime`` runs next and finds a newer ``trained_at`` —
 retrains are non-blocking.
 
-Data source: Binance Futures public klines. We translate each
-Delta-format ``bucket_symbol`` (e.g. BTCUSD) to its Binance equivalent
-(BTCUSDT) via the ``symbol_mapping`` table. Binance has ~6 years of
-daily history vs Delta India's ~1090 days — see the per-coin regime
-plan for context.
+Data source (per market):
+  * crypto — Binance Futures public klines; each Delta-format ``bucket_symbol``
+    (e.g. BTCUSD) is translated to its Binance equivalent (BTCUSDT) via the
+    ``symbol_mapping`` table (Binance has ~6y of daily history vs Delta's ~1090d).
+  * indian — Dhan daily bars via ``DhanData``; symbols are direct tickers (no
+    translation). The broad-market proxy is a NIFTY-50 ETF (``proxy_symbol``,
+    e.g. NIFTYBEES) trained under ``MARKET_SENTINEL``.
 """
 
 from __future__ import annotations
@@ -42,7 +44,9 @@ from src.core.clock import RealClock
 from src.core.db import session_scope
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, SymbolMapping
+from src.data_sources.base import MarketData
 from src.data_sources.binance import BinanceData
+from src.data_sources.dhan import DhanData
 from src.shared.bucket import Market, load_bucket, load_buckets
 from src.shared.regime.brain import RegimeConfig, load_regime_config
 from src.shared.regime.diagnostics import persistence_diagnostic
@@ -126,13 +130,14 @@ def pick_tier(n_bars: int) -> TrainTier | None:
 # ---------------------------------------------------------------------------
 # Data fetch (Binance Futures public klines)
 # ---------------------------------------------------------------------------
-def _fetch_bars(data: BinanceData, symbol: str, tf: str, limit: int):
+def _fetch_bars(data: MarketData, symbol: str, tf: str, limit: int):
     """Fetch OHLCV. Returns [] on errors (caller skips the symbol).
 
-    ``limit`` is capped at 1500 by Binance per request; the bot's
-    default training window (1100 daily bars) fits in one call.
+    ``limit`` is capped at 1500 (Binance's per-request cap); the bot's
+    default training window (1100 daily bars) fits in one call. Dhan's
+    daily endpoint returns the full requested window in one call too.
 
-    The last bar is dropped: Binance includes the in-progress candle,
+    The last bar is dropped: the venue includes the in-progress candle,
     and training on a partial bar skews the newest observation.
     """
     try:
@@ -175,7 +180,7 @@ def _retrain_one(
     bucket_symbol: str,
     fetch_symbol: str,
     cfg: RegimeConfig,
-    data: BinanceData,
+    data: MarketData,
 ) -> RetrainResult:
     """Train and persist one regime model for (bucket_id, bucket_symbol).
 
@@ -357,27 +362,11 @@ def _retrain_one(
 # ---------------------------------------------------------------------------
 # Public — bucket retrain (all symbols + broad-market fallback)
 # ---------------------------------------------------------------------------
-def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
-    """Train per-symbol HMMs for ``bucket_id`` plus the market fallback.
-
-    Returns one RetrainResult per attempted symbol.
-    """
-    bucket = load_bucket(bucket_id)
-    cfg = load_regime_config(bucket.regime_yaml_path)
-
-    if bucket.market != Market.CRYPTO:
-        raise NotImplementedError(
-            f"Retrain not implemented for market={bucket.market}. "
-            "Indian-market HMM lands when the Dhan data adapter ships."
-        )
-
-    # Always train the broad-market fallback under MARKET_SENTINEL.
-    # Per-coin models live under their own symbol. Delta-format symbols
-    # in regime.yaml (e.g. BTCUSD) are translated to Binance symbols
-    # (e.g. BTCUSDT) for the OHLCV fetch; storage still keys on the
-    # Delta-format ``bucket_symbol`` so ``brain.predict_regime`` finds
-    # the right model at inference time.
-    symbols_to_train: list[tuple[str, str]] = []   # (bucket_symbol, fetch_symbol)
+def _crypto_symbols_to_train(
+    bucket_id: str, cfg: RegimeConfig
+) -> list[tuple[str, str]]:
+    """(bucket_symbol, binance_fetch_symbol) pairs for a crypto bucket."""
+    out: list[tuple[str, str]] = []
     market_fetch = _delta_to_binance(cfg.proxy_symbol)
     if market_fetch is None:
         _log.warning(
@@ -387,7 +376,7 @@ def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
             note="market fallback model will be skipped",
         )
     else:
-        symbols_to_train.append((MARKET_SENTINEL, market_fetch))
+        out.append((MARKET_SENTINEL, market_fetch))
     for sym in cfg.symbols:
         fetch = _delta_to_binance(sym)
         if fetch is None:
@@ -397,10 +386,49 @@ def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
                 delta_symbol=sym,
             )
             continue
-        symbols_to_train.append((sym, fetch))
+        out.append((sym, fetch))
+    return out
+
+
+def _indian_symbols_to_train(cfg: RegimeConfig) -> list[tuple[str, str]]:
+    """(bucket_symbol, dhan_fetch_symbol) pairs for an Indian bucket.
+
+    Dhan tickers are direct, so ``fetch_symbol == bucket_symbol``; the proxy
+    ETF is the broad-market source under ``MARKET_SENTINEL``.
+    """
+    out: list[tuple[str, str]] = [(MARKET_SENTINEL, cfg.proxy_symbol)]
+    out += [(sym, sym) for sym in cfg.symbols]
+    return out
+
+
+def retrain_bucket(bucket_id: str) -> list[RetrainResult]:
+    """Train per-symbol HMMs for ``bucket_id`` plus the market fallback.
+
+    Returns one RetrainResult per attempted symbol.
+    """
+    bucket = load_bucket(bucket_id)
+    cfg = load_regime_config(bucket.regime_yaml_path)
+
+    # (bucket_symbol, fetch_symbol) pairs + the MarketData source, per market.
+    # We always train the broad-market fallback under MARKET_SENTINEL; per-coin
+    # models (if any) live under their own symbol. Storage always keys on
+    # ``bucket_symbol`` so ``brain.predict_regime`` finds the right model.
+    symbols_to_train: list[tuple[str, str]]
+    data: MarketData
+    if bucket.market == Market.CRYPTO:
+        # Delta-format symbols (e.g. BTCUSD) → Binance symbols (BTCUSDT) for the
+        # fetch; Binance has far more daily history than Delta India.
+        symbols_to_train = _crypto_symbols_to_train(bucket_id, cfg)
+        data = BinanceData()
+    elif bucket.market == Market.INDIAN:
+        # Dhan tickers are direct — no translation. The NIFTY-proxy ETF
+        # (cfg.proxy_symbol, e.g. NIFTYBEES) is the broad-market source.
+        symbols_to_train = _indian_symbols_to_train(cfg)
+        data = DhanData.from_settings()
+    else:  # pragma: no cover — only crypto/indian exist
+        raise NotImplementedError(f"Retrain not implemented for {bucket.market}")
 
     results: list[RetrainResult] = []
-    data = BinanceData()
     try:
         for bucket_symbol, fetch_symbol in symbols_to_train:
             results.append(
@@ -456,7 +484,10 @@ def retrain_enabled_buckets(*, due_only: bool) -> dict[str, list[RetrainResult]]
     now = RealClock().now()
     out: dict[str, list[RetrainResult]] = {}
     for bucket in load_buckets():
-        if not bucket.config.enabled or bucket.market != Market.CRYPTO:
+        if not bucket.config.enabled or bucket.market not in (
+            Market.CRYPTO,
+            Market.INDIAN,
+        ):
             continue
         try:
             cfg = load_regime_config(bucket.regime_yaml_path)
