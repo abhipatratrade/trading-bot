@@ -176,6 +176,28 @@ def test_error_envelope_raises() -> None:
         _client(http).get_balances()
 
 
+def test_non_json_403_raises_clean_error() -> None:
+    # A 403 IP-block page has an empty/non-JSON body — must surface as a clean
+    # DhanAPIError with the status code, not a leaked JSONDecodeError.
+    class _RawResp:
+        status_code = 403
+        text = ""
+
+        def json(self):
+            raise ValueError("no json")
+
+    class _RawHttp:
+        def request(self, *a, **k):
+            return _RawResp()
+
+    client = DhanClient(
+        token_manager=DhanTokenManager(static_token="TOK"), client_id="C1",
+        resolve_symbol=_resolve, http=_RawHttp(),
+    )
+    with pytest.raises(DhanAPIError, match="403"):
+        client.get_balances()
+
+
 def test_set_leverage_is_noop() -> None:
     http = _FakeHttp({})  # no routes → any HTTP call would AssertionError
     _client(http).set_leverage("SWIGGY", Decimal("3"))  # must not hit the wire

@@ -170,9 +170,12 @@ class DhanClient(Broker):
     def _handle(resp: httpx.Response) -> Any:
         try:
             data = resp.json()
-        except ValueError as exc:
-            resp.raise_for_status()
-            raise DhanAPIError("parse_error", f"non-JSON (HTTP {resp.status_code})") from exc
+        except ValueError:
+            # Non-JSON body — e.g. a 403 IP-block page or an empty error
+            # response. Surface it as a clean DhanAPIError (with the status
+            # code) instead of leaking httpx/json internals into the logs.
+            body = resp.text[:200] or f"empty body (HTTP {resp.status_code})"
+            raise DhanAPIError(str(resp.status_code), body) from None
         # Dhan error envelope: {"errorType":..,"errorCode":..,"errorMessage":..}
         if isinstance(data, dict) and (data.get("errorType") or data.get("errorCode")):
             raise DhanAPIError(
