@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
+from src.brokers.dhan.client import DhanClient
 from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
 from src.core.clock import RealClock
 from src.core.config import get_settings
@@ -28,8 +29,10 @@ from src.core.db import session_scope
 from src.core.heartbeat import SERVICE_BOT_WORKER, beat
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
+from src.data_sources.base import MarketData
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
+from src.data_sources.dhan import DhanData
 from src.data_sources.symbol_loader import (
     DEFAULT_CSV,
     fetch_mappings,
@@ -174,25 +177,86 @@ def main() -> None:
         )
         _log.info("delta_account_ready", account_ref=ref, buckets=ref_bucket_ids)
 
+    # Per-account market-data source: crypto accounts use the shared Delta feed;
+    # Dhan accounts use the Dhan feed (built below).
+    data_by_ref: dict[str, MarketData] = dict.fromkeys(accounts, delta_data)
+
+    # ── Dhan account (Indian equity buckets, Phase 3/4) ─────────────────
+    # FAIL-SOFT: if Dhan creds/data are unavailable, the Indian bucket is
+    # skipped and the crypto bot keeps running. Enabling swing-indian in
+    # buckets.yaml must never be able to take down the live crypto path.
+    dhan_data: DhanData | None = None
+    dhan_accounts: dict[str, list[str]] = {}
+    for bucket in all_buckets:
+        if (
+            bucket.config.enabled
+            and bucket.market == Market.INDIAN
+            and bucket.config.broker == BrokerName.DHAN
+        ):
+            dhan_accounts.setdefault(bucket.config.account_ref, []).append(bucket.id)
+            bucket_fx[bucket.id] = Decimal("1")  # Dhan wallet is INR-native
+            if bucket.config.stop_loss_pct is not None:
+                stop_pcts[bucket.id] = bucket.config.stop_loss_pct
+    if dhan_accounts:
+        try:
+            dhan_data = DhanData.from_settings(settings)
+            for ref, ref_bucket_ids in dhan_accounts.items():
+                client = DhanClient.from_settings(
+                    dhan_data.resolve,
+                    settings,
+                    data_token_manager=dhan_data.token_manager,
+                )
+                brokers[ref] = client
+                order_managers[ref] = OrderManager(client, BrokerName.DHAN, clock)
+                reconcilers[ref] = Reconciler(
+                    client,
+                    BrokerName.DHAN,
+                    clock,
+                    bucket_ids=ref_bucket_ids,
+                    bucket_fx={b: Decimal("1") for b in ref_bucket_ids},
+                )
+                accounts[ref] = ref_bucket_ids  # breakers/stops/reconcile loops
+                data_by_ref[ref] = dhan_data
+                _log.info(
+                    "dhan_account_ready", account_ref=ref, buckets=ref_bucket_ids
+                )
+        except Exception:
+            _log.error("dhan_account_init_failed", exc_info=True)
+            send_alert(
+                "[bot] Dhan account init FAILED — swing-indian will NOT run "
+                "(crypto buckets unaffected). Check Dhan creds on the VM."
+            )
+            dhan_data = None
+            # Roll back partial Dhan wiring so the runner loop skips Indian buckets.
+            for ref in list(dhan_accounts):
+                brokers.pop(ref, None)
+                order_managers.pop(ref, None)
+                reconcilers.pop(ref, None)
+                accounts.pop(ref, None)
+                data_by_ref.pop(ref, None)
+
     runners: list[BucketRunner] = []
     for bucket in all_buckets:
         if not bucket.config.enabled:
             _log.info("bucket_skipped_disabled", bucket_id=bucket.id)
             continue
-        # For now, only crypto buckets have a data source (Delta India).
-        # Indian buckets will need a Dhan data source in Phase 3.
-        if bucket.market != Market.CRYPTO:
+        # A bucket runs only if its account has a data source wired above
+        # (crypto → Delta; Indian → Dhan). Missing ⇒ skip (e.g. Dhan creds
+        # absent), never crash the loop.
+        bucket_data = data_by_ref.get(bucket.config.account_ref)
+        if bucket_data is None:
             _log.warning(
                 "bucket_skipped_no_data_source",
                 bucket_id=bucket.id,
                 market=bucket.market.value,
+                account_ref=bucket.config.account_ref,
             )
             continue
         try:
             runner = BucketRunner(
                 bucket=bucket,
                 brokers=brokers,
-                data=delta_data,
+                data=bucket_data,
                 order_managers=order_managers,
                 clock=clock,
             )
@@ -313,7 +377,7 @@ def main() -> None:
                     bucket_ids=ref_bucket_ids,
                     broker=brokers[ref],
                     order_manager=order_managers[ref],
-                    data=delta_data,
+                    data=data_by_ref.get(ref, delta_data),
                     max_drawdown_pct=dd_pct,
                     min_liq_distance_pct=liq_pct,
                     max_funding_rate=funding_max,
@@ -399,6 +463,8 @@ def main() -> None:
         except Exception:
             _log.warning("client_close_failed", exc_info=True)
     delta_data.close()
+    if dhan_data is not None:
+        dhan_data.close()
     _log.info("bot_stopped")
 
 

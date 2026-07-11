@@ -82,6 +82,12 @@ class DhanData(MarketData):
         )
         return cls(token_manager=token, data_base_url=acct.data_base_url)
 
+    @property
+    def token_manager(self) -> DhanTokenManager:
+        """The shared token manager — reused by the Dhan broker in live mode
+        (live orders ride the refreshed data token)."""
+        return self._token
+
     # ── universe resolution ─────────────────────────────────────────────
     @property
     def universe(self) -> dict[str, dict[str, str]]:

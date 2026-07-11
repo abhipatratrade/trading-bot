@@ -60,4 +60,10 @@ buckets:
     capital_inr: 50000
     broker: dhan
     leverage_max: 4
-    enabled: false   # Phase 4
+    enabled: true    # Phase 4 — full integration (Dhan sandbox)
+    account_ref: dhan
+    # Decision 022 (amended for swing-indian): this strategy's edge dies with
+    # tight stops, so instead of the 0.5/leverage rule it rests a WIDE
+    # catastrophe stop — 20% below entry, far outside the Supertrend/30-day
+    # exits, catching only a crash while the bot is down.
+    stop_loss_pct: 20
