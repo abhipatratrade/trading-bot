@@ -718,3 +718,52 @@ Decision (Option A — CSV column, not scanner-owned subfolders):
    rows under ``strategy_id = "<bucket_id>:<name>"`` so they don't
    collide with the default scan's (date, strategy_id, symbol) unique
    key. Regime (per bucket), exits, breakers, and stops are unaffected.
+
+## 027 — Indian buckets size on a capped allocation, not the raw wallet
+Date: 2026-07-12
+Status: Accepted
+Amends: 025 (for Market.INDIAN only) · Context: 013, 019
+
+Context: crypto buckets are isolated by FUNDING — each has its own Delta
+sub-account (Decision 019), so "size on live wallet equity" (Decision 025)
+naturally equals "size on the bucket". **Dhan has no sub-accounts.** The
+Indian buckets share one brokerage account, and the Dhan sandbox wallet is
+a fixed ₹10,00,000 that resets daily. Unmodified Decision 025 would have
+swing-indian Kelly-sizing on ₹10L (sandbox) or on whatever the shared live
+account holds — 20× the intended ₹50k bucket, and no isolation from a
+future longterm-indian bucket in the same account.
+
+Decision: ``sizing_equity()`` in ``src/shared/allocator/sizer.py``:
+
+- **Crypto** — unchanged: live sub-account wallet (available + locked
+  mirror); profits compound into sizing automatically.
+- **Indian** — ``min(wallet_equity, capital_inr + capital_adjustments)``.
+  The bucket sizes on its allocation, never on shared/simulated money it
+  doesn't own; a wallet below the allocation still floors at the wallet.
+  Compounding is deliberate: record positive adjustments via
+  ``scripts/record_capital_adjustment.py`` (or raise ``capital_inr``,
+  YAML-audited).
+
+Consequences:
+- Sandbox soak numbers read exactly like the real ₹50k bucket.
+- When longterm-indian joins the same Dhan account, each Indian bucket is
+  bounded by its own allocation — capital isolation without sub-accounts.
+- P&L baseline semantics (Decision 025) are untouched; the same
+  adjustments field feeds both.
+
+## 028 — swing-indian: wide catastrophe stop (amends 022's 0.5/leverage rule)
+Date: 2026-07-12
+Status: Accepted (user chose "wide catastrophe stop", 2026-07-12 session)
+Amends: 022 (for swing-indian only)
+
+Context: Decision 022 mandates an exchange-resident protective stop per
+position at 0.5/leverage distance (≈ 50% of margin). The Blasting Momentum
+backtest showed tight stops DESTROY this edge — day-1 noise knocks out
+eventual winners; exits belong to the strategy (Supertrend(10,3) flip or
+the 30-day cap).
+
+Decision: swing-indian keeps a broker-side stop, but WIDE:
+``stop_loss_pct: 20`` in buckets.yaml (~60% of margin at 3× MTF). It is a
+crash net for when the bot/VM is down, deliberately far outside normal
+strategy exits so it never interferes with the backtested behaviour.
+All other buckets keep the 0.5/leverage rule.

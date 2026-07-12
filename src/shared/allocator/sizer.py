@@ -59,7 +59,7 @@ from src.core.models import (
 from src.shared.allocator.caps import apply_aggregate_cap, apply_per_symbol_cap
 from src.shared.allocator.kelly import fractional_kelly as scale_kelly
 from src.shared.allocator.kelly import kelly_fraction
-from src.shared.bucket import Bucket
+from src.shared.bucket import Bucket, Market
 
 _log = get_logger("shared.allocator.sizer")
 
@@ -173,6 +173,36 @@ def notional_inr_to_contracts(
     )
 
 
+def sizing_equity(
+    *,
+    market: Market,
+    wallet_equity_inr: Decimal,
+    capital_inr: Decimal,
+    adjustments_inr: Decimal = Decimal("0"),
+) -> Decimal:
+    """The equity Kelly sizes against, per market (pure math).
+
+    Crypto (Decision 025): the LIVE sub-account wallet, untouched —
+    Decision 019 isolates each bucket by funding its own sub-account, so
+    wallet == bucket and profits compound into sizing automatically.
+
+    Indian (Decision 027): Dhan has NO sub-accounts, so the (possibly
+    shared) wallet cannot define the bucket. Sizing equity is capped at
+    the bucket's allocation — ``capital_inr`` plus recorded capital
+    adjustments — so a bucket never sizes on money that isn't its own.
+    This also makes the Dhan sandbox (fixed ₹10L wallet, resets daily)
+    size exactly like the real ₹50k bucket. Compounding is deliberate
+    there: record positive adjustments via
+    ``scripts/record_capital_adjustment.py`` (or raise ``capital_inr``).
+
+    A wallet BELOW the allocation still floors sizing at the wallet —
+    you can never size on money the account doesn't hold.
+    """
+    if market == Market.INDIAN:
+        return min(wallet_equity_inr, capital_inr + adjustments_inr)
+    return wallet_equity_inr
+
+
 # ---------------------------------------------------------------------------
 # Sizing API
 # ---------------------------------------------------------------------------
@@ -244,6 +274,11 @@ def size_positions(
             )
         available_inr = state.available_balance_inr
         locked_inr = state.locked_margin_inr
+        # Decision 027: the Indian sizing cap needs the bucket's recorded
+        # capital adjustments (same extra field the P&L baseline uses).
+        adjustments_inr = Decimal(
+            str((state.extra or {}).get("capital_adjustments_inr", "0"))
+        )
 
         held_rows = session.execute(
             select(Position.symbol).where(
@@ -324,9 +359,15 @@ def size_positions(
     leverage = bucket.config.leverage_max
     # Decision 025 (amends 015): Kelly sizes against LIVE sub-account
     # equity (available + locked margin, mirrored from the exchange every
-    # reconcile sweep) — the book grows and shrinks with the account.
-    # ``capital_inr`` is only the P&L baseline / dashboard reference now.
-    capital = available_inr + locked_inr
+    # reconcile sweep). Decision 027: Indian buckets cap that at the
+    # bucket's allocation — Dhan has no sub-accounts, so the wallet alone
+    # cannot define the bucket (see ``sizing_equity``).
+    capital = sizing_equity(
+        market=bucket.market,
+        wallet_equity_inr=available_inr + locked_inr,
+        capital_inr=bucket.config.capital_inr,
+        adjustments_inr=adjustments_inr,
+    )
 
     for sym in candidates:
         if sym in held:
