@@ -73,6 +73,14 @@ ignore = ["S101"]  # allow asserts in tests
 [tool.ruff.lint.per-file-ignores]
 # Test fixtures legitimately assign fake credentials.
 "tests/**" = ["S105", "S106"]
+# ML convention: X = feature matrix; GaussianHMM = lazily-imported class alias.
+"src/shared/regime/hmm_model.py" = ["N806"]
+# Pre-existing strategy class name — discovery keys on the `name` attribute,
+# not the class name, so renaming is risk without benefit.
+"src/strategies/swing/crypto/strategies/ema_9_15.py" = ["N801"]
+"tests/unit/test_ema_strategy.py" = ["N801"]
+# Asserting the sizer re-raises *whatever* the broker throws is the point.
+"tests/unit/test_sizer_contracts.py" = ["B017"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

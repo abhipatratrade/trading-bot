@@ -28,6 +28,26 @@ A systemd timer (`bot-deploy.timer`) runs `ops/deploy.sh` every ~60s. Each cycle
 
 So the everyday workflow is just: **edit locally → `git push` → wait ~60s → read the Telegram confirmation.** No SSH.
 
+### CI deploy gate (Layer 1)
+
+Two guards sit between `git push` and the running bot:
+
+1. **GitHub Actions CI** (`.github/workflows/ci.yml`): every push runs ruff +
+   the full unit suite (which includes the bucket config-load smoke) on
+   Python 3.11 — the VM's runtime. `deploy.sh` polls the commit's check-runs
+   and **refuses to fast-forward until they're green**: pending → retries next
+   cycle; failed/missing → blocks and Telegrams
+   `🚨 Deploy BLOCKED for <sha>: CI status '…'` once, old code keeps running.
+2. **Selfcheck** (`python -m src.entrypoints.selfcheck`): before restarting,
+   deploy.sh boots the NEW code's settings + bucket configs + a DB ping. A
+   failure leaves the old (working) process untouched.
+
+Net effect: a commit that fails tests, lints dirty, has a broken bucket yaml,
+or can't reach the DB **physically cannot replace the running bot**. To deploy
+in an emergency while CI is red: fix the code — or, truly exceptionally, SSH in
+and `git pull && sudo systemctl restart bot-worker` by hand (the gate only
+guards the auto-deploy path).
+
 This covers **allocation** (`allocator.yaml`), **trading** (`strategy_master.csv`), **scanner** (`scanner.yaml`), **regime** (`regime.yaml`), and strategy code (`strategies/*.py`) — all live under `src/strategies/<bucket>/` and trigger a restart.
 
 ### Telegram deploy alerts — what they mean

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from hmmlearn.hmm import GaussianHMM
 
 
-def _import_gaussian_hmm() -> type["GaussianHMM"]:
+def _import_gaussian_hmm() -> type[GaussianHMM]:
     """Import hmmlearn on first use. Raises ImportError with a clear message
     if the dependency is missing in this environment."""
     try:
@@ -109,7 +109,7 @@ class RegimeModel:
         self.n_states = n_states
         self.covariance_type = covariance_type
         self.n_restarts = n_restarts
-        self._hmm: "GaussianHMM | None" = None
+        self._hmm: GaussianHMM | None = None
         self._labels: list[MarketRegime] | None = None
         # Diagnostics from the winning restart (runtime-only; not serialised).
         self.chosen_seed: int | None = None
@@ -129,7 +129,7 @@ class RegimeModel:
         return pool + extra
 
     # ------------------------------------------------------------------ fit
-    def fit(self, features: pd.DataFrame) -> "RegimeModel":
+    def fit(self, features: pd.DataFrame) -> RegimeModel:
         """Fit the HMM on a feature DataFrame and resolve state→label map.
 
         With ``n_restarts > 1`` the model is fit once per seed and the fit
@@ -140,7 +140,7 @@ class RegimeModel:
         X = features[self.feature_columns].to_numpy(dtype=float)
         GaussianHMM = _import_gaussian_hmm()
 
-        best_hmm: "GaussianHMM | None" = None
+        best_hmm: GaussianHMM | None = None
         best_score = float("-inf")
         best_seed: int | None = None
         last_err: Exception | None = None
@@ -247,7 +247,7 @@ class RegimeModel:
         }
 
     @classmethod
-    def from_dict(cls, blob: dict[str, Any]) -> "RegimeModel":
+    def from_dict(cls, blob: dict[str, Any]) -> RegimeModel:
         """Rebuild from a ``to_dict`` payload."""
         feature_columns = list(blob["feature_columns"])
         n_states = int(blob["n_states"])

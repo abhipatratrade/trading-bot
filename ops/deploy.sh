@@ -53,6 +53,29 @@ send_alert(sys.argv[1])
 PYEOF
 }
 
+# CI gate (Layer 1): GitHub check-runs for a SHA. Prints one of
+# success | pending | none | failure | error. Repo is public — no token.
+ci_status() {
+    "$PY" - "$1" <<'PYEOF' || echo error
+import sys
+import httpx
+sha = sys.argv[1]
+url = f"https://api.github.com/repos/abhipatratrade/trading-bot/commits/{sha}/check-runs"
+try:
+    r = httpx.get(url, headers={"Accept": "application/vnd.github+json"}, timeout=15)
+    r.raise_for_status()
+    runs = r.json().get("check_runs", [])
+except Exception:
+    print("error"); raise SystemExit(0)
+if not runs:
+    print("none"); raise SystemExit(0)
+if any(c.get("status") != "completed" for c in runs):
+    print("pending"); raise SystemExit(0)
+ok = all(c.get("conclusion") in ("success", "skipped", "neutral") for c in runs)
+print("success" if ok else "failure")
+PYEOF
+}
+
 BEFORE=$(git rev-parse HEAD)
 
 if ! git fetch --quiet origin "$BRANCH"; then
@@ -61,9 +84,27 @@ if ! git fetch --quiet origin "$BRANCH"; then
 fi
 
 # Nothing new on the remote → quiet no-op (the common case every minute).
-if [ "$(git rev-parse "origin/$BRANCH")" = "$BEFORE" ]; then
+REMOTE_SHA=$(git rev-parse "origin/$BRANCH")
+if [ "$REMOTE_SHA" = "$BEFORE" ]; then
     exit 0
 fi
+
+# ── CI gate: refuse to deploy a commit whose checks are not green ──────
+# pending/error → quiet retry next cycle (CI takes a few minutes).
+# failure/none  → block + notify ONCE per SHA (state file), keep old code.
+CI_STATE=/tmp/deploy-ci-notified
+CI=$(ci_status "$REMOTE_SHA")
+case "$CI" in
+    success) ;;
+    pending|error)
+        exit 0 ;;
+    failure|none)
+        if [ "$(cat "$CI_STATE" 2>/dev/null)" != "$REMOTE_SHA:$CI" ]; then
+            echo "$REMOTE_SHA:$CI" > "$CI_STATE"
+            notify "🚨 Deploy BLOCKED for ${REMOTE_SHA:0:7}: CI status '$CI' — old code keeps running. Fix and push (or check the Actions tab)."
+        fi
+        exit 0 ;;
+esac
 
 # Fast-forward only. If the VM has local commits the remote can't ff over,
 # refuse rather than clobber — surfaces the divergence loudly.
@@ -99,6 +140,13 @@ fi
 
 # Restart only when something the bot actually runs has changed.
 if printf '%s\n' "$CHANGED" | grep -qE "$RESTART_PATHS"; then
+    # Selfcheck with the NEW code before killing the old (working) process:
+    # settings, bucket configs, DB reachability. No broker/network probes —
+    # those are fail-soft inside run_bot itself.
+    if ! "$PY" -m src.entrypoints.selfcheck; then
+        notify "🚨 Deployed $SHA — selfcheck FAILED, bot NOT restarted (old code still running). journalctl -u bot-deploy for details."
+        exit 1
+    fi
     sudo systemctl restart "$SERVICE"
     sleep 6
     if systemctl is-active --quiet "$SERVICE"; then

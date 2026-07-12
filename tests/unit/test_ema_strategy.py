@@ -10,13 +10,11 @@ through a fake MarketData implementation.
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Sequence
-
-import pytest
 
 from src.data_sources.base import FundingRate, MarketData, OHLCVBar, Ticker
 
@@ -65,7 +63,7 @@ class FakeMarketData(MarketData):
 
 
 def _bars_from_closes(closes: Sequence[float]) -> list[OHLCVBar]:
-    base = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    base = datetime(2026, 6, 10, tzinfo=UTC)
     out: list[OHLCVBar] = []
     for i, c in enumerate(closes):
         out.append(
