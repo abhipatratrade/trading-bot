@@ -20,6 +20,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Minimal test env: parts of the suite exercise code that lazily calls
+    # get_settings() (alerts, dashboard app), which locally resolves from the
+    # developer's .env. CI provides the same contract with explicit dummies —
+    # no secrets, no live endpoints (sqlite DB, Telegram unset -> alerts no-op).
+    env:
+      TRADING_MODE: testnet
+      DATABASE_URL: sqlite:///./ci-test.db
+      DELTA_TESTNET_API_KEY: ci-dummy-key
+      DELTA_TESTNET_API_SECRET: ci-dummy-secret
     steps:
       - uses: actions/checkout@v4
 
