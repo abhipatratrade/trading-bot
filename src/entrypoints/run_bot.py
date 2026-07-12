@@ -206,6 +206,13 @@ def main() -> None:
                     settings,
                     data_token_manager=dhan_data.token_manager,
                 )
+                # Fail-fast reachability probe (one authed GET). Dhan's
+                # SANDBOX edge blocks datacenter IPs with a bodyless 403
+                # (confirmed from the GCP VM 2026-07-12: sandbox 403, live
+                # 401) — surface that here as a clean init failure (bucket
+                # skipped + one alert) instead of breaker/stop-sweep ERROR
+                # spam every tick against an unreachable host.
+                client.get_balances()
                 brokers[ref] = client
                 order_managers[ref] = OrderManager(client, BrokerName.DHAN, clock)
                 reconcilers[ref] = Reconciler(
@@ -224,7 +231,9 @@ def main() -> None:
             _log.error("dhan_account_init_failed", exc_info=True)
             send_alert(
                 "[bot] Dhan account init FAILED — swing-indian will NOT run "
-                "(crypto buckets unaffected). Check Dhan creds on the VM."
+                "(crypto buckets unaffected). Causes: bad Dhan creds on the "
+                "VM, or the Dhan sandbox edge-blocking this host's IP "
+                "(datacenter IPs get 403; awaiting Dhan support)."
             )
             dhan_data = None
             # Roll back partial Dhan wiring so the runner loop skips Indian buckets.
