@@ -1,7 +1,48 @@
-# Phase 2 stub.
-enabled: false
-proxy_symbol: BTCUSDT
+# Brain config for swing-crypto (1h HMM).
+#
+# Same per-(bucket, symbol) HMM structure as longterm-crypto — see that
+# bucket's regime.yaml for the full explanation. Differences here are all
+# timeframe-driven:
+#
+#   * tf is 1h, so ``training_window_days`` (really a BAR COUNT — the
+#     retrain job passes it straight to the fetch limit) is set to 1500,
+#     the Binance per-request cap: ~62 days of hourly bars, comfortably
+#     inside the 3-state-full tier (>= 700 bars).
+#   * min_mean_gap scales with the return horizon. The daily threshold is
+#     0.0005; hourly mean log-returns are ~24x smaller, so 0.00002.
+#   * persistence_diag_stride 24 = one day of hourly bars (diagnostic only).
+#
+# NOTE: enabled here only registers the bucket with the weekly VM retrain
+# timer once buckets.yaml flips the bucket on. Before first enable, run a
+# manual retrain on the VM so the brain has a model to serve:
+#   python -m src.shared.regime.retrain_job --bucket swing-crypto
+
+enabled: true
+proxy_symbol: BTCUSD              # Delta India format; trains the _market_ fallback
 tf: 1h
-training_window_days: 90
+training_window_days: 1500        # bar count at 1h — see header note
 inference_lookback_bars: 200
-retrain_cadence: weekly
+retrain_cadence: weekly           # Mon 02:00 UTC via the VM timer
+fallback_to_market: true
+
+# Markov 2.0 detection-layer knobs (retrain-time) — see longterm-crypto.
+n_restarts: 4
+verify_labels: true
+min_mean_gap: 0.00002             # hourly-scaled (daily 0.0005 / 24)
+min_state_occupancy: 0.03
+persistence_diag_stride: 24       # one day of 1h bars
+
+# Per-coin models for the scanner's top-10 universe (allocator.yaml stats
+# table). Coins missing a Delta<->Binance mapping are skipped with a
+# logged warning and fall back to the _market_ model.
+symbols:
+  - BTCUSD
+  - ETHUSD
+  - SOLUSD
+  - XRPUSD
+  - BNBUSD
+  - DOGEUSD
+  - ADAUSD
+  - AVAXUSD
+  - LINKUSD
+  - MATICUSD

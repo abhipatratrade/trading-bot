@@ -1,8 +1,22 @@
-# Phase 2 stub — enabled in buckets.yaml when ready.
+# Universe selection for swing-crypto.
+#
+# Top 10 perps on Delta India by 24h notional volume, min $5M/24h,
+# constrained (by the engine) to symbols also listed on Binance — the
+# 1h signal feed. Wider than longterm's top-5 because the EMA 9/15
+# crossover fires per-coin and wants more shots on goal.
+#
+# Values are the Phase-2 placeholders committed with the ema_9_15
+# strategy. GO-LIVE GATE: confirm universe_size / threshold against the
+# backtester run that produces this bucket's mu/sigma (Decision 006 —
+# cite the backtest_ref in the amending commit).
+
 universe_size: 10
+
 filters:
   - name: min_24h_volume_usd
-    params: { threshold: 5000000 }
+    params:
+      threshold: 5000000        # $5M/24h — matches strategy_master.csv min_vol
+
 ranker:
   name: volume_24h_desc
   params: {}

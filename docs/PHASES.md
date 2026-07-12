@@ -233,7 +233,36 @@ top-to-bottom.
 ---
 
 ## Phase 2 — Crypto Swing [priority 2]
-*(Detailed checklist added when Phase 1 completes.)*
+Started 2026-07-12 (user decision: bring remaining buckets up in parallel;
+gambling-crypto deferred). Reuses every shared engine; the strategy
+(`ema_9_15.py`) has existed since Phase 1a.
+
+### 2a — Configs to live spec (2026-07-12)
+- [x] `regime.yaml` real config: 1h HMM, 1500 training bars (field is a
+      bar count at non-1d TF — see yaml header), hourly-scaled
+      `min_mean_gap`, per-coin models for the top-10 universe
+- [x] `scanner.yaml` promoted from stub (top-10 by 24h vol, $5M floor) —
+      values unchanged pending backtest_ref
+- [x] `strategy_master.csv` verified (ema_9_15, 1h, bull|neutral gate)
+- [x] Full unit suite green (276 passed)
+
+### 2b — Provisioning + soak (sequence matters: keys BEFORE enable —
+missing `DELTA_SWING_*` creds fail the whole bot at boot by design)
+- [ ] USER: create Delta India sub-account for `account_ref: swing`,
+      generate testnet+live API keys, add `DELTA_SWING_TESTNET_API_KEY`
+      / `_SECRET` (and `_LIVE_`) env vars on the VM
+- [ ] USER (or next session): initial HMM train on the VM:
+      `python -m src.shared.regime.retrain_job --bucket swing-crypto`
+      (works while bucket still disabled; weekly timer takes over after
+      enable)
+- [ ] Flip `swing-crypto.enabled: true` in buckets.yaml, push (VM
+      auto-deploys), verify: reconciler sweep, stop placement
+      (stop_loss_pct 5), regime served, no breaker trips
+- [ ] Soak 2-3 days on testnet (user's policy, 2026-07-12)
+- [!] `allocator.yaml` μ/σ + backtest_ref from the backtester — BLOCKED
+      on user's backtester run; placeholders are documented as such.
+      Required before live capital (Decision 006)
+- [ ] Go live (user decision, after soak + μ/σ)
 
 ## Phase 3 — Stocks Long-term integration [priority 3]
 *(Detailed checklist added when Phase 2 completes. Wraps existing Kite system.)*
