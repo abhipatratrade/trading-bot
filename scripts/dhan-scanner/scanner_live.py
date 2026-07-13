@@ -33,8 +33,11 @@ Design notes
   ~40-60 min: 0.25s/req delay + network round-trip x ~4.6k symbols) the evening
   before; `scan` then only needs intraday
   bars for the (small) shortlist, so 09:45 entries land within seconds.
-* MTF orders on non-approved scrips are rejected by Dhan; with
-  MTF_FALLBACK_CNC=true the runner retries the same order as CNC (1x).
+* MTF orders on non-approved scrips are rejected by Dhan's RMS
+  **asynchronously**: the POST returns 2xx with an orderId and the rejection
+  only appears in the order book (day-one soak finding, 2026-07-13). Every
+  order is therefore verified against the order book after placement; with
+  MTF_FALLBACK_CNC=true a rejected MTF order is retried as CNC (1x).
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,6 +76,8 @@ UNIVERSE_F = STATE_DIR / "universe_all.json"
 SHORTLIST_F = STATE_DIR / "shortlist.json"
 POSITIONS_F = STATE_DIR / "positions.json"
 TRADES_F = STATE_DIR / "trades.csv"
+LOG_F = STATE_DIR / "scanner.log"
+TOKEN_CACHE_F = STATE_DIR / "token_cache.json"
 
 POSITION_SIZE = float(os.environ.get("POSITION_SIZE", 10_000))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", 5))
@@ -118,7 +124,16 @@ REQ_DELAY = 0.25                                          # data API politeness
 
 
 def _log(msg: str):
-    print(f"[{datetime.now(IST):%Y-%m-%d %H:%M:%S} IST] {msg}", flush=True)
+    line = f"[{datetime.now(IST):%Y-%m-%d %H:%M:%S} IST] {msg}"
+    print(line, flush=True)
+    # Task Scheduler discards stdout, so every run also appends to state/
+    # scanner.log — the only forensic trail for scheduled runs.
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_F, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # --- Access-token refresh (Dhan 24h cap, 2025-10-01) ----------------------------
@@ -139,23 +154,26 @@ def refresh_access_token(client_id: str, pin: str, totp_secret: str) -> str | No
     except ImportError:
         _log("pyotp not installed -- skipping token refresh (pip install pyotp)")
         return None
-    try:
-        code = pyotp.TOTP(totp_secret).now()
-        r = requests.post(
-            f"{AUTH_BASE}/app/generateAccessToken",
-            params={"dhanClientId": client_id, "pin": pin, "totp": code},
-            timeout=30,
-        )
-        r.raise_for_status()
-        tok = r.json().get("accessToken")
-        if not tok:
-            _log(f"token refresh: no accessToken in response ({r.text[:200]})")
-            return None
-        _log("access token refreshed (valid ~24h)")
-        return tok
-    except Exception as e:                        # noqa: BLE001
-        _log(f"token refresh failed ({e}) -- falling back to static .env token")
-        return None
+    for attempt in (1, 2, 3):
+        try:
+            code = pyotp.TOTP(totp_secret).now()
+            r = requests.post(
+                f"{AUTH_BASE}/app/generateAccessToken",
+                params={"dhanClientId": client_id, "pin": pin, "totp": code},
+                timeout=30,
+            )
+            r.raise_for_status()
+            tok = r.json().get("accessToken")
+            if not tok:
+                _log(f"token refresh: no accessToken in response ({r.text[:200]})")
+                return None
+            _log("access token refreshed (valid ~24h)")
+            return tok
+        except Exception as e:                    # noqa: BLE001
+            _log(f"token refresh attempt {attempt}/3 failed ({e})")
+            if attempt < 3:
+                time.sleep(5 * attempt)
+    return None
 
 
 def resolve_tokens() -> None:
@@ -171,6 +189,21 @@ def resolve_tokens() -> None:
         DATA_TOKEN = fresh
         if DHAN_ENV != "sandbox":
             ORDER_TOKEN = fresh                   # live orders share the data token
+        _save(TOKEN_CACHE_F, {"token": fresh,
+                              "minted_at": datetime.now(timezone.utc).isoformat()})
+        return
+    # Refresh failed (a 15:15 run died on exactly this, 2026-07-13): fall back
+    # to the last minted token while it's still inside Dhan's 24h validity.
+    # The static .env DHAN_ACCESS_TOKEN, if set, remains the final fallback.
+    cache = _load(TOKEN_CACHE_F, None)
+    if cache:
+        age_h = (datetime.now(timezone.utc)
+                 - datetime.fromisoformat(cache["minted_at"])).total_seconds() / 3600
+        if age_h < 23:
+            _log(f"token refresh unavailable -- using cached token ({age_h:.1f}h old)")
+            DATA_TOKEN = cache["token"]
+            if DHAN_ENV != "sandbox":
+                ORDER_TOKEN = cache["token"]
 
 
 # --- Universe: entire tradeable NSE + BSE ---------------------------------------
@@ -265,13 +298,57 @@ def _post_order(payload: dict) -> requests.Response:
                                   "access-token": ORDER_TOKEN}, timeout=30)
 
 
+def _order_status(order_id: str) -> dict | None:
+    try:
+        r = requests.get(f"{ORDER_BASE}/v2/orders/{order_id}",
+                         headers={"access-token": ORDER_TOKEN,
+                                  "client-id": CLIENT_ID}, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        if isinstance(d, list):
+            d = d[0] if d else None
+        return d if isinstance(d, dict) else None
+    except Exception:                             # noqa: BLE001
+        return None
+
+
+_ORDER_DEAD = {"REJECTED", "CANCELLED", "EXPIRED"}
+
+
+def _post_and_verify(payload: dict) -> tuple[dict | None, str]:
+    """POST an order, then confirm the order book didn't reject it.
+
+    Dhan's RMS rejects asynchronously: the POST returns 2xx with an orderId
+    and e.g. "MTF is not permitted for this Scrip" only shows up in the order
+    book afterwards. Returns (response, "") on success, (None, reason) on
+    HTTP-level or order-book rejection.
+    """
+    r = _post_order(payload)
+    if r.status_code >= 400:
+        return None, f"HTTP {r.status_code} {r.text[:200]}"
+    resp = r.json()
+    status = str(resp.get("orderStatus", "") or "")
+    detail: dict = {}
+    for wait in (1, 2, 3):
+        if status not in ("", "TRANSIT", "PENDING"):
+            break
+        time.sleep(wait)
+        detail = _order_status(str(resp.get("orderId", ""))) or detail
+        status = str(detail.get("orderStatus", status) or status)
+    if status in _ORDER_DEAD:
+        return None, detail.get("omsErrorDescription") or status
+    resp["orderStatus"] = status or "PENDING"
+    return resp, ""
+
+
 def place_order(security_id: str, exchange: str, side: str, qty: int,
-                symbol: str) -> dict | None:
+                symbol: str, product: str | None = None) -> dict | None:
+    product = product or PRODUCT_TYPE
     payload = {
         "dhanClientId": CLIENT_ID,
         "transactionType": side,                 # BUY | SELL
         "exchangeSegment": exchange,             # NSE_EQ | BSE_EQ
-        "productType": PRODUCT_TYPE,             # MTF (3x funding) | CNC
+        "productType": product,                  # MTF (3x funding) | CNC
         "orderType": "MARKET",
         "validity": "DAY",
         "securityId": security_id,
@@ -281,19 +358,19 @@ def place_order(security_id: str, exchange: str, side: str, qty: int,
         "afterMarketOrder": False,
     }
     if DRY_RUN:
-        _log(f"DRY-RUN {side} {qty} x {symbol} [{exchange}] ({PRODUCT_TYPE}) -> {ORDER_BASE}")
-        return {"orderId": "dry-run", "orderStatus": "DRY_RUN", "product": PRODUCT_TYPE}
-    r = _post_order(payload)
-    if r.status_code >= 400 and PRODUCT_TYPE == "MTF" and MTF_FALLBACK_CNC:
-        _log(f"MTF rejected for {symbol} ({r.status_code}) -- retrying as CNC (1x)")
+        _log(f"DRY-RUN {side} {qty} x {symbol} [{exchange}] ({product}) -> {ORDER_BASE}")
+        return {"orderId": "dry-run", "orderStatus": "DRY_RUN", "product": product}
+    resp, err = _post_and_verify(payload)
+    if resp is None and product == "MTF" and MTF_FALLBACK_CNC:
+        _log(f"MTF rejected for {symbol} ({err}) -- retrying as CNC (1x)")
         payload["productType"] = "CNC"
-        r = _post_order(payload)
-    if r.status_code >= 400:
-        _log(f"ORDER REJECTED {side} {symbol}: {r.status_code} {r.text[:200]}")
+        resp, err = _post_and_verify(payload)
+    if resp is None:
+        _log(f"ORDER REJECTED {side} {symbol}: {err}")
         return None
-    resp = r.json()
     resp["product"] = payload["productType"]
-    _log(f"ORDER OK {side} {qty} x {symbol} ({payload['productType']}): {resp}")
+    _log(f"ORDER OK {side} {qty} x {symbol} ({payload['productType']}): "
+         f"id={resp.get('orderId')} status={resp.get('orderStatus')}")
     return resp
 
 
@@ -475,8 +552,8 @@ def cmd_manage():
         _log(f"  {sym}: close={close:.2f} ST={st:.2f} held={days_held}d -> "
              f"{reason or 'HOLD'}")
         if reason:
-            if place_order(p["security_id"], p["exchange"], "SELL",
-                           p["qty"], sym) is None:
+            if place_order(p["security_id"], p["exchange"], "SELL", p["qty"],
+                           sym, product=p.get("product", PRODUCT_TYPE)) is None:
                 continue
             _log_trade({"ts": datetime.now(IST).isoformat(), "action": "SELL",
                         "symbol": sym, "exchange": p["exchange"], "qty": p["qty"],
@@ -512,10 +589,14 @@ if __name__ == "__main__":
         sys.exit(1)
     resolve_tokens()        # mint a fresh 24h token if refresh creds are set
     if not DATA_TOKEN:
-        print("No market-data token: set DHAN_ACCESS_TOKEN, or DHAN_PIN + "
-              "DHAN_TOTP_SECRET + DHAN_CLIENT_ID for auto-refresh. See .env.example")
+        _log("No market-data token: set DHAN_ACCESS_TOKEN, or DHAN_PIN + "
+             "DHAN_TOTP_SECRET + DHAN_CLIENT_ID for auto-refresh. See .env.example")
         sys.exit(1)
     if DHAN_ENV != "sandbox" and not ORDER_TOKEN:
-        print("DHAN_ENV=live but no order token (DHAN_ACCESS_TOKEN / refresh creds).")
+        _log("DHAN_ENV=live but no order token (DHAN_ACCESS_TOKEN / refresh creds).")
         sys.exit(1)
-    cmds[args[0]]()
+    try:
+        cmds[args[0]]()
+    except Exception:                             # noqa: BLE001
+        _log(f"FATAL in {args[0]}:\n{traceback.format_exc()}")
+        sys.exit(1)
