@@ -164,15 +164,20 @@ def refresh_access_token(client_id: str, pin: str, totp_secret: str) -> str | No
             )
             r.raise_for_status()
             tok = r.json().get("accessToken")
-            if not tok:
-                _log(f"token refresh: no accessToken in response ({r.text[:200]})")
+            if tok:
+                _log("access token refreshed (valid ~24h)")
+                return tok
+            msg = r.text[:200]
+            if "every 2 minutes" in msg:          # mint rate-limit: retrying in
+                _log(f"token refresh rate-limited ({msg})")   # 5-15s can't help
                 return None
-            _log("access token refreshed (valid ~24h)")
-            return tok
+            # e.g. "Invalid TOTP" (code straddled its 30s window, 2026-07-14):
+            # the next attempt mints a fresh code, so retry these too.
+            _log(f"token refresh attempt {attempt}/3: no accessToken ({msg})")
         except Exception as e:                    # noqa: BLE001
             _log(f"token refresh attempt {attempt}/3 failed ({e})")
-            if attempt < 3:
-                time.sleep(5 * attempt)
+        if attempt < 3:
+            time.sleep(5 * attempt)
     return None
 
 
@@ -310,6 +315,16 @@ def _order_status(order_id: str) -> dict | None:
         return d if isinstance(d, dict) else None
     except Exception:                             # noqa: BLE001
         return None
+
+
+def _cancel_order(order_id: str) -> bool:
+    try:
+        r = requests.delete(f"{ORDER_BASE}/v2/orders/{order_id}",
+                            headers={"access-token": ORDER_TOKEN,
+                                     "client-id": CLIENT_ID}, timeout=30)
+        return r.status_code < 400
+    except Exception:                             # noqa: BLE001
+        return False
 
 
 _ORDER_DEAD = {"REJECTED", "CANCELLED", "EXPIRED"}
@@ -507,6 +522,7 @@ def cmd_scan():
             "entry_date": str(datetime.now(IST).date()),
             "pct_at_entry": round(c["pct"], 2),
             "product": resp.get("product", PRODUCT_TYPE),
+            "order_id": str(resp.get("orderId", "")),
         }
     if not DRY_RUN:
         _save(POSITIONS_F, positions)
@@ -516,10 +532,53 @@ def cmd_scan():
 
 # --- manage: 15:15 exits -------------------------------------------------------------------
 
+def _reconcile_today_entries(positions: dict) -> bool:
+    """Drop/fix slots whose entry order never actually traded. Returns True on change.
+
+    Dhan's order book is day-scoped, so this must run the same day as the
+    entry (manage @ 15:15), keyed by the order_id recorded at entry.
+    Finding 2026-07-14: a CNC market order (SUDARSCHEM) sat PENDING from
+    09:44 through the close — without this, the unfilled slot carries a
+    phantom position into every following scan.
+    """
+    today = str(datetime.now(IST).date())
+    changed = False
+    for sym in list(positions):
+        p = positions[sym]
+        if p.get("entry_date") != today or not p.get("order_id"):
+            continue                    # older entries reconciled on their day
+        cur = _order_status(str(p["order_id"]))
+        if cur is None:
+            continue                    # can't verify -- leave untouched
+        status = str(cur.get("orderStatus", ""))
+        filled = int(cur.get("filledQty") or 0)
+        if status == "TRADED" and filled >= p["qty"]:
+            continue
+        if DRY_RUN:
+            _log(f"reconcile {sym}: entry {status}, filled {filled}/{p['qty']} "
+                 "-- would fix (dry-run: untouched)")
+            continue
+        if filled > 0:                  # partial fill: keep what we actually own
+            _log(f"reconcile {sym}: entry part-filled {filled}/{p['qty']} -- qty adjusted")
+            p["qty"] = filled
+        else:                           # never filled: kill the order, free the slot
+            if status not in _ORDER_DEAD:
+                _cancel_order(str(p["order_id"]))
+            _log(f"reconcile {sym}: entry order {status}, 0 filled -- dropping phantom slot")
+            positions.pop(sym)
+        changed = True
+    return changed
+
+
 def cmd_manage():
     positions = _load(POSITIONS_F, {})
     if not positions:
         _log("manage: no open positions.")
+        return
+    if _reconcile_today_entries(positions):
+        _save(POSITIONS_F, positions)
+    if not positions:
+        _log("manage: no open positions after reconcile.")
         return
     today = datetime.now(IST).date()
     closed = []
