@@ -29,10 +29,14 @@ Design notes
 * Market DATA always uses the LIVE data API (api.dhan.co) with DHAN_ACCESS_TOKEN:
   the sandbox has no market data. ORDERS go to the env-selected base URL
   (sandbox: sandbox.dhan.co with the sandbox token/client id).
-* `prepare` does the heavy pass (~4,000 symbols x 1 daily-history call,
-  ~40-60 min: 0.25s/req delay + network round-trip x ~4.6k symbols) the evening
-  before; `scan` then only needs intraday
-  bars for the (small) shortlist, so 09:45 entries land within seconds.
+* `prepare` keeps a local daily-bar cache (state/history/, one json per scrip)
+  and gets today's OFFICIAL closes for the whole universe from the bulk quote
+  API (~5 requests) -- steady-state sweep is a few minutes, plus a rolling
+  full-history resync (each scrip every 7-11 nights) that heals corporate-
+  action adjustments; a >25% open-vs-cached-close discontinuity (beyond NSE's
+  20% circuit band) forces an immediate resync. First run / cache loss falls
+  back to the full ~45-min history sweep automatically. `scan` then only needs
+  intraday bars for the (small) shortlist, so 09:45 entries land within seconds.
 * MTF orders on non-approved scrips are rejected by Dhan's RMS
   **asynchronously**: the POST returns 2xx with an orderId and the rejection
   only appears in the order book (day-one soak finding, 2026-07-13). Every
@@ -78,6 +82,10 @@ POSITIONS_F = STATE_DIR / "positions.json"
 TRADES_F = STATE_DIR / "trades.csv"
 LOG_F = STATE_DIR / "scanner.log"
 TOKEN_CACHE_F = STATE_DIR / "token_cache.json"
+HISTORY_DIR = STATE_DIR / "history"                      # daily-bar cache, 1 json/scrip
+SKIPLIST_F = STATE_DIR / "skiplist.json"                 # delisted scrips, 7d backoff
+HIST_KEEP_BARS = 200
+RESYNC_BASE_DAYS = 7                                     # full-history refresh cadence
 
 POSITION_SIZE = float(os.environ.get("POSITION_SIZE", 10_000))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", 5))
@@ -424,6 +432,72 @@ def place_order(security_id: str, exchange: str, side: str, qty: int,
     return resp
 
 
+# --- Bulk quotes + daily-bar cache (prepare speedup, 2026-07-14) ----------------
+
+QUOTE_CHUNK = 1000                                        # Dhan max ids/request
+
+
+def fetch_today_bars_bulk(secmap: dict[str, dict]) -> dict[str, dict]:
+    """Today's completed session bar for the whole universe in ~5 requests.
+
+    POST /v2/marketfeed/quote takes up to 1000 security ids per call (rate
+    limit 1 req/s). After the close, ohlc.close == last_price == the OFFICIAL
+    close (better than a bar synthesized from 15m data). Returns
+    security_id -> {o,h,l,c,v}; symbols that didn't trade today come back
+    with zero volume and are omitted. Empty dict = endpoint unavailable
+    (caller falls back to per-symbol intraday splice).
+    """
+    by_seg: dict[str, list[int]] = {}
+    for info in secmap.values():
+        by_seg.setdefault(info["exchange"], []).append(int(info["security_id"]))
+    out: dict[str, dict] = {}
+    for seg, ids in by_seg.items():
+        for i in range(0, len(ids), QUOTE_CHUNK):
+            chunk = ids[i:i + QUOTE_CHUNK]
+            for attempt in (1, 2, 3):
+                try:
+                    r = requests.post(
+                        f"{DATA_BASE}/v2/marketfeed/quote", json={seg: chunk},
+                        headers={"Content-Type": "application/json",
+                                 "access-token": DATA_TOKEN,
+                                 "client-id": LIVE_CLIENT_ID}, timeout=60)
+                    if r.status_code == 429:
+                        raise requests.HTTPError("429 quote rate-limit")
+                    r.raise_for_status()
+                    for sid, q in r.json().get("data", {}).get(seg, {}).items():
+                        ohlc = q.get("ohlc") or {}
+                        vol = float(q.get("volume") or 0)
+                        close = float(q.get("last_price") or 0)
+                        if vol > 0 and close > 0:
+                            out[str(sid)] = {"o": float(ohlc.get("open") or close),
+                                             "h": float(ohlc.get("high") or close),
+                                             "l": float(ohlc.get("low") or close),
+                                             "c": close, "v": vol}
+                    break
+                except Exception as e:                    # noqa: BLE001
+                    _log(f"bulk quote {seg} chunk {i // QUOTE_CHUNK}: "
+                         f"attempt {attempt}/3 failed ({e})")
+                    time.sleep(3 * attempt)
+            time.sleep(1.2)                               # quote API: 1 req/s
+    return out
+
+
+def _hist_path(security_id: str) -> Path:
+    return HISTORY_DIR / f"{security_id}.json"
+
+
+def _df_to_bars(df: pd.DataFrame) -> list[list]:
+    return [[str(_session_date(r.date)), float(r.open), float(r.high),
+             float(r.low), float(r.close), float(r.volume)]
+            for r in df.itertuples(index=False)]
+
+
+def _bars_to_df(bars: list[list]) -> pd.DataFrame:
+    df = pd.DataFrame(bars, columns=["session", "open", "high", "low", "close", "volume"])
+    df["date"] = pd.to_datetime(df["session"])            # midnight IST-session stamp;
+    return df                                             # _session_date maps it back
+
+
 # --- State --------------------------------------------------------------------------
 
 def _load(path: Path, default):
@@ -453,17 +527,57 @@ def _log_trade(row: dict):
 
 def cmd_prepare():
     secmap = resolve_universe_all(force="--refresh-universe" in sys.argv)
-    _log(f"prepare: {len(secmap)} symbols (full NSE+BSE) -- expect ~40-60 min")
-    shortlist, scanned, errors = [], 0, 0
+    today = datetime.now(IST).date()
+    skiplist = _load(SKIPLIST_F, {})
+    quotes = fetch_today_bars_bulk(secmap)
+    bulk_ok = len(quotes) > 0
+    if not bulk_ok:
+        _log("prepare: BULK QUOTE UNAVAILABLE -- falling back to per-symbol "
+             "intraday splice (slow path, ~80-90 min)")
+    _log(f"prepare: {len(secmap)} symbols; {len(quotes)} traded today (bulk quote)")
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    shortlist, scanned, errors, refetched = [], 0, 0, 0
     for sym, info in secmap.items():
+        sid = info["security_id"]
+        entry = skiplist.get(sid)
+        if entry and entry.get("until", "") >= str(today):
+            continue
         try:
-            df = fetch_daily(info["security_id"], info["exchange"])
-            time.sleep(REQ_DELAY)
-            if df is None or len(df) < 40:
+            q = quotes.get(sid)
+            hist = _load(_hist_path(sid), None)
+            # Trailing today-bar (evening re-run) is rebuilt from the quote below.
+            bars = ([b for b in hist["bars"] if b[0] != str(today)] if hist else [])
+            try:
+                stagger = int(sid) % 5                    # spread resyncs over 5 nights
+            except ValueError:
+                stagger = 0
+            need_full = (
+                not bars
+                or (today - date.fromisoformat(hist["full_sync"])).days
+                >= RESYNC_BASE_DAYS + stagger
+                # Discontinuity vs cached close beyond NSE's 20% circuit band =
+                # corporate action (split/bonus): history needs re-adjusting.
+                or (q is not None and bars and bars[-1][4] > 0
+                    and abs(q["o"] / bars[-1][4] - 1) > 0.25)
+            )
+            if need_full:
+                df = fetch_daily(sid, info["exchange"])
+                time.sleep(REQ_DELAY)
+                if df is None or len(df) < 40:
+                    continue
+                bars = [b for b in _df_to_bars(df) if b[0] != str(today)]
+                hist = {"symbol": sym, "full_sync": str(today)}
+                refetched += 1
+            if q:
+                bars.append([str(today), q["o"], q["h"], q["l"], q["c"], q["v"]])
+            df = _bars_to_df(bars[-HIST_KEEP_BARS:])
+            if not bulk_ok:
+                df = ensure_today_bar(df, sid, info["exchange"])
+                bars = _df_to_bars(df)
+            hist["bars"] = bars[-HIST_KEEP_BARS:]
+            _save(_hist_path(sid), hist)
+            if len(df) < 40:
                 continue
-            # Splice in today's session (Dhan's daily candle publishes late);
-            # roughly doubles the API calls -> sweep runs ~80-90 min.
-            df = ensure_today_bar(df, info["security_id"], info["exchange"])
             scanned += 1
             c = float(df["close"].iloc[-1])
             if not (PRICE_LO <= c <= PRICE_HI):      # cheap gate before indicators
@@ -487,13 +601,23 @@ def cmd_prepare():
                 "cci": round(float(cci.iloc[-1]), 1),
                 "supertrend": round(float(st.iloc[-1]), 2),
             })
+        except requests.HTTPError as e:           # 400 = delisted/no-data: back off 7d
+            errors += 1
+            if getattr(e.response, "status_code", 0) == 400:
+                skiplist[sid] = {"until": str(today + timedelta(days=7)),
+                                 "err": str(e)[:80]}
+            elif errors <= 5:
+                _log(f"  {sym}: {e}")
         except Exception as e:                    # noqa: BLE001 -- keep sweeping
             errors += 1
             if errors <= 5:
                 _log(f"  {sym}: {e}")
-    _save(SHORTLIST_F, {"date": str(datetime.now(IST).date()),
+    _save(SHORTLIST_F, {"date": str(today),
                         "universe": "ALL_NSE_BSE", "candidates": shortlist})
-    _log(f"prepare done: scanned {scanned}, shortlist {len(shortlist)}, errors {errors}")
+    _save(SKIPLIST_F, skiplist)
+    _log(f"prepare done: scanned {scanned}, shortlist {len(shortlist)}, "
+         f"errors {errors}, full-history fetches {refetched}, "
+         f"skiplisted {len(skiplist)}")
 
 
 # --- scan: 09:45 entries -----------------------------------------------------------------
