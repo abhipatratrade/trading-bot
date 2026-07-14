@@ -281,6 +281,41 @@ def fetch_daily(security_id: str, exchange: str, days: int = 120) -> pd.DataFram
     return df.sort_values("date").reset_index(drop=True)
 
 
+def _session_date(ts) -> date:
+    """IST trading-session date of a daily bar's UTC timestamp.
+
+    Dhan stamps the daily candle at 18:30 UTC of the *previous* calendar
+    day (= session-date 00:00 IST), so the naive .date() is one day off.
+    """
+    return (ts + timedelta(hours=5, minutes=30)).date()
+
+
+def ensure_today_bar(df: pd.DataFrame, security_id: str, exchange: str) -> pd.DataFrame:
+    """Append today's completed session bar, synthesized from intraday 15m.
+
+    Dhan publishes the official daily candle only well after the close
+    (still absent at 20:50 IST on trade date — 2026-07-14 finding), so an
+    evening `prepare` sees history ending at the PREVIOUS session: prev_close
+    and every indicator come out one bar stale, and the next morning's gap
+    filter fires against a two-session-old close (PPAP entered on a "+12.97%
+    gap" that was really -1.8% vs the true previous close).
+
+    Returns df unchanged when today's bar is already present, or when the
+    symbol didn't trade today (then the last close IS the true prev_close).
+    """
+    if _session_date(df["date"].iloc[-1]) == datetime.now(IST).date():
+        return df
+    g = fetch_today_15m(security_id, exchange)
+    time.sleep(REQ_DELAY)
+    if g is None or not len(g):
+        return df
+    return pd.concat([df, pd.DataFrame([{
+        "date": pd.Timestamp(datetime.now(timezone.utc)),
+        "open": float(g.iloc[0]["open"]), "high": float(g["high"].max()),
+        "low": float(g["low"].min()), "close": float(g.iloc[-1]["close"]),
+        "volume": float(g["volume"].sum())}])], ignore_index=True)
+
+
 def fetch_today_15m(security_id: str, exchange: str) -> pd.DataFrame | None:
     today = datetime.now(IST).date()
     payload = {"securityId": security_id, "exchangeSegment": exchange,
@@ -426,6 +461,9 @@ def cmd_prepare():
             time.sleep(REQ_DELAY)
             if df is None or len(df) < 40:
                 continue
+            # Splice in today's session (Dhan's daily candle publishes late);
+            # roughly doubles the API calls -> sweep runs ~80-90 min.
+            df = ensure_today_bar(df, info["security_id"], info["exchange"])
             scanned += 1
             c = float(df["close"].iloc[-1])
             if not (PRICE_LO <= c <= PRICE_HI):      # cheap gate before indicators
@@ -594,7 +632,9 @@ def cmd_manage():
             continue
         # Append today's forming daily bar from intraday so the Supertrend flip is
         # evaluated on TODAY's close (the backtest exits on the daily close).
-        if g is not None and len(g) and str(df["date"].iloc[-1].date()) != str(today):
+        # _session_date, not .date(): the naive UTC date is one session off,
+        # which would double-append today's bar once Dhan publishes it.
+        if g is not None and len(g) and _session_date(df["date"].iloc[-1]) != today:
             df = pd.concat([df, pd.DataFrame([{
                 "date": pd.Timestamp(datetime.now(timezone.utc)),
                 "open": float(g.iloc[0]["open"]), "high": float(g["high"].max()),
