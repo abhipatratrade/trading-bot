@@ -643,18 +643,27 @@ class BucketRunner:
         price: Decimal | None,
         margin_budget: Decimal,
     ) -> Decimal:
-        """Shrink ``size`` until the venue's real margin fits ``margin_budget``.
+        """Fit ``size`` to the leverage this scrip is ACTUALLY granted.
 
-        ``leverage_max`` is what the bucket WANTS; Dhan grants intraday
-        leverage per scrip, so a name capped at 2x would have its 5x-sized
-        order rejected outright by RMS (Decision 029). Rather than predict the
-        multiple, ask for the rupee margin and scale to it.
+        ``leverage_max`` is the bucket's risk CEILING, not a promise. NSE cash
+        leverage is graded per scrip: measured 2026-07-21, the median is 4.44x
+        across NIFTY-100, 3.79x across Midcap 150 and 3.06x across Smallcap
+        100 — and no name in any of them reaches 5x. Sizing everything at 5x
+        would over-order on effectively every trade and collect an RMS
+        rejection (Decision 030).
 
-        Degradation is deliberately conservative. If the venue offers no
-        preflight (``required_margin`` → None), we fall back to sizing as if
-        leverage were 1x — the only size guaranteed affordable whatever the
-        broker grants. Undersized beats rejected, and badly beats accidentally
-        over-levered.
+        Two sources, in order of authority:
+
+        1. ``Broker.required_margin`` — the venue prices this exact order.
+           Scaling to it deploys the full margin budget at whatever multiple
+           is truly allowed, which IS "trade at max allowed leverage".
+        2. The scrip master's per-scrip figure (``MarketData.max_leverage``),
+           capped at the bucket ceiling. Used when the venue offers no
+           preflight.
+
+        If neither is available, size at 1x — the only quantity guaranteed
+        affordable whatever the broker grants. Undersized beats rejected, and
+        beats accidentally over-levered by a wide margin.
         """
         if price is None or price <= 0 or size <= 0:
             return size
@@ -662,16 +671,26 @@ class BucketRunner:
             symbol, side, size, price, product=self.bucket.config.product
         )
         if needed is None:
-            # Unknown → assume no leverage is granted.
-            affordable = margin_budget / price
+            # Fall back to the scrip's own ceiling, capped by the bucket's.
+            scrip_lev = None
+            if hasattr(self._data, "max_leverage"):
+                scrip_lev = self._data.max_leverage(symbol)
+            lev = (
+                min(scrip_lev, self.bucket.config.leverage_max)
+                if scrip_lev is not None
+                else Decimal("1")
+            )
+            affordable = margin_budget * lev / price
             fitted = min(size, affordable).to_integral_value(rounding="ROUND_DOWN")
             if fitted < size:
                 _log.warning(
-                    "margin_preflight_unavailable_sizing_at_1x",
+                    "margin_preflight_unavailable_sized_on_scrip_leverage",
                     bucket_id=self.bucket.id,
                     symbol=symbol,
                     wanted=str(size),
                     fitted=str(fitted),
+                    leverage_used=str(lev),
+                    scrip_leverage=str(scrip_lev) if scrip_lev else "unknown",
                 )
             return fitted
         if needed <= margin_budget:

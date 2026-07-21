@@ -186,6 +186,7 @@ class DhanData(MarketData):
                 "exchange": "NSE_EQ",
                 "fno": "1" if sym in fno else "0",
                 "band_pct": _band_pct(r),
+                "mtf_leverage": str(r.MTF_LEVERAGE or "").strip(),
             }
             seen_isin.add(str(r.ISIN))
         for r in bse.itertuples(index=False):
@@ -222,6 +223,40 @@ class DhanData(MarketData):
             return Decimal(raw) >= min_band_pct
         except ArithmeticError:
             return False
+
+    def max_leverage(self, symbol: str) -> Decimal | None:
+        """Per-scrip leverage ceiling from the scrip master, or None.
+
+        Leverage on NSE cash equity is graded PER SCRIP by risk, not flat:
+        measured 2026-07-21 across the intraday-indian universes, the median
+        ``MTF_LEVERAGE`` is 4.44x for NIFTY-100, 3.79x for Midcap 150 and
+        3.06x for Smallcap 100 — and NOT ONE name in any of them reaches 5x.
+        Sizing every position at a bucket-wide 5x would therefore over-order
+        on essentially every trade and collect an RMS rejection.
+
+        CAVEAT — this is the **MTF** (funded-delivery) figure; the scrip
+        master carries no MIS/intraday column (``BUY_CO_MIN_MARGIN_PER`` and
+        ``BUY_BO_MIN_MARGIN_PER`` are all zero, ``COVER_FLAG`` all null). Both
+        numbers are graded off the same exchange risk parameters, and
+        intraday risk is lower than overnight, so MTF leverage is expected to
+        UNDER-state what MIS allows. That makes it a safe fallback, not a
+        substitute for the real figure: ``Broker.required_margin`` remains the
+        authority whenever the venue answers.
+
+        0 (not MTF-eligible) and unparseable values return None, which the
+        caller treats as "unknown" and degrades to 1x.
+        """
+        info = self.universe.get(symbol)
+        if info is None:
+            return None
+        raw = (info.get("mtf_leverage") or "").strip()
+        if not raw:
+            return None
+        try:
+            lev = Decimal(raw)
+        except ArithmeticError:
+            return None
+        return lev if lev > 1 else None
 
     def refresh_universe(self) -> int:
         """Force a scrip-master re-download (monthly, or after listing changes)."""

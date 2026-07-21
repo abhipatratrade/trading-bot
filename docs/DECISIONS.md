@@ -888,14 +888,34 @@ fallback for INTRADAY** — falling back would convert a 5x same-day trade
 into a 1x overnight delivery position, so an MIS-ineligible scrip fails
 loudly instead.
 
-Leverage is never predicted. `Broker.required_margin` asks the venue what
-the order actually costs (Dhan `/v2/margincalculator`) and the runner fits
-size to the answer, so a scrip granted 2x is traded smaller rather than
-rejected by RMS. If the preflight is unavailable the runner sizes at **1x**
-— the only size guaranteed affordable whatever the broker grants.
-CAVEAT: the margin endpoint is unexercised against a live account as of
-2026-07-21; the first sandbox soak is its acceptance test, and until then
-the 1x fallback is what actually governs size.
+Leverage is never predicted, and `leverage_max: 5` is a risk CEILING, not a
+target. NSE cash leverage is graded per scrip: measured 2026-07-21 the
+median is **4.44x** across NIFTY-100, **3.79x** across Midcap 150 and
+**3.06x** across Smallcap 100 — and **not one name in any of the three
+reaches 5x**. Sizing every position at a flat 5x would over-order on
+effectively every trade and collect an RMS rejection.
+
+Two sources, in order of authority:
+1. `Broker.required_margin` — the venue prices the exact order (Dhan
+   `/v2/margincalculator`). Scaling to it deploys the full margin budget at
+   whatever multiple is truly allowed, which IS "trade at max leverage".
+2. `MarketData.max_leverage` — the scrip master's per-scrip figure, capped
+   at the bucket ceiling, used when the venue offers no preflight.
+Neither available ⇒ 1x, the only size guaranteed affordable.
+
+CAVEATS. (a) `/v2/margincalculator` is unexercised against a live account as
+of 2026-07-21; the first sandbox soak is its acceptance test. (b) The scrip
+master has NO intraday leverage column (`BUY_CO_MIN_MARGIN_PER` and
+`BUY_BO_MIN_MARGIN_PER` are all zero, `COVER_FLAG` all null), so source 2 is
+the **MTF** (funded-delivery) figure. Both are graded off the same exchange
+risk parameters and intraday risk is lower than overnight, so it should
+under-state what MIS allows — safe as a fallback, not a substitute.
+
+EXPECTATION SET BY THIS. The backtest's "+13.3% on margin" assumed 5x. P&L
+scales with notional, so at a 4.44x median the same margin buys ~89% of the
+backtested exposure, and ~61% at the smallcap median of 3.06x. Return ON
+MARGIN should be expected to land proportionally below the backtest — this
+is a real haircut, not a bug, and it is the price of not over-ordering.
 
 **5. Shared capital budget, and per-bucket P&L.** Two holes surfaced from
 one root cause — components reading a `bucket_state` mirror that only

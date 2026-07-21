@@ -312,7 +312,9 @@ Plan around the HOLDOUT grade: ~PF 1.7, ~+13%/yr on margin, ~9% DD, ~0.8 trades/
 - [x] MIS product per-order (swing=MTF, intraday=INTRADAY, no CNC fallback); size fits granted margin
 - [x] Shared FCFS capital budget across scanner sets; Indian P&L off the trade ledger
 - [ ] **User review, then flip `enabled: true`** ← next action, user-gated
-- [ ] Soak must confirm `/v2/margincalculator` works — until it does, sizing degrades to 1x
+- [x] Per-scrip leverage: size on the scrip master's graded figure (median 4.44x N100 / 3.06x smallcap), capped by bucket ceiling
+- [ ] Soak must confirm `/v2/margincalculator` works — until it does, sizing uses the scrip-master fallback
+- [ ] Expect return-on-margin BELOW the backtest: it assumed 5x, real median is ~4.4x (N100) / ~3.1x (smallcap)
 - [ ] Dhan sandbox soak: verify the 09:30 cut, an entry, and a 15:15 square-off end-to-end
 - [ ] Confirm MIS product routing + wide stop placement on a real order
 - [ ] Re-check NIFTY-100 constituents against the NSE factsheet after each rebalance

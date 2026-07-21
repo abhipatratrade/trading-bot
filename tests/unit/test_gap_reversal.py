@@ -14,6 +14,7 @@ from src.data_sources.base import OHLCVBar
 from src.order_manager.pnl import bucket_cumulative_pnl, bucket_ledger_pnl
 from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import TradingType, load_bucket
+from src.shared.bucket_runner import BucketRunner
 from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
 from src.shared.scanner import gap_reversal as gr
 from src.shared.scanner import indicators as ind
@@ -445,3 +446,113 @@ def test_ledger_pnl_is_independent_of_the_shared_wallet() -> None:
     assert ledger_a == Decimal("900")
     assert ledger_b == Decimal("0")
     assert pct_a == Decimal("1.8")
+
+
+# ---------------------------------------------------------------------------
+# Per-scrip leverage (Decision 030)
+# ---------------------------------------------------------------------------
+class _LevFeed(_Feed):
+    """Feed that also answers the scrip-master leverage lookup."""
+
+    def __init__(self, lev: Decimal | None) -> None:
+        super().__init__([])
+        self._lev = lev
+
+    def max_leverage(self, symbol: str) -> Decimal | None:  # noqa: ARG002
+        return self._lev
+
+
+class _NoPreflightBroker:
+    """Broker whose venue offers no margin preflight."""
+
+    def required_margin(self, *a: object, **k: object) -> Decimal | None:  # noqa: ARG002
+        return None
+
+
+class _PricedBroker:
+    """Broker that prices the order at a fixed per-unit margin."""
+
+    def __init__(self, per_unit: Decimal) -> None:
+        self._per_unit = per_unit
+
+    def required_margin(
+        self, symbol: str, side: str, quantity: Decimal, price: Decimal, product=None
+    ) -> Decimal | None:  # noqa: ARG002
+        return quantity * self._per_unit
+
+
+def _runner_with(data: object) -> BucketRunner:
+    r = object.__new__(BucketRunner)
+    r.bucket = load_bucket("intraday-indian")
+    r._data = data
+    return r
+
+
+def test_sizes_on_scrip_leverage_when_no_preflight() -> None:
+    """A 3x scrip must be sized at 3x, not the bucket's 5x ceiling nor 1x."""
+    r = _runner_with(_LevFeed(Decimal("3")))
+    # ₹10k margin at 3x = ₹30k notional; at ₹100/share that is 300 shares.
+    fitted = r._fit_to_margin(
+        broker=_NoPreflightBroker(),
+        symbol="X",
+        side="buy",
+        size=Decimal("500"),          # what 5x would have asked for
+        price=Decimal("100"),
+        margin_budget=Decimal("10000"),
+    )
+    assert fitted == Decimal("300")
+
+
+def test_scrip_leverage_is_capped_by_the_bucket_ceiling() -> None:
+    """A scrip allowing 10x must still be traded at the bucket's 5x."""
+    r = _runner_with(_LevFeed(Decimal("10")))
+    fitted = r._fit_to_margin(
+        broker=_NoPreflightBroker(),
+        symbol="X",
+        side="buy",
+        size=Decimal("9999"),
+        price=Decimal("100"),
+        margin_budget=Decimal("10000"),
+    )
+    assert fitted == Decimal("500")  # 10k x 5 / 100
+
+
+def test_unknown_scrip_leverage_falls_back_to_1x() -> None:
+    r = _runner_with(_LevFeed(None))
+    fitted = r._fit_to_margin(
+        broker=_NoPreflightBroker(),
+        symbol="X",
+        side="buy",
+        size=Decimal("500"),
+        price=Decimal("100"),
+        margin_budget=Decimal("10000"),
+    )
+    assert fitted == Decimal("100")  # 10k x 1 / 100
+
+
+def test_venue_preflight_overrides_the_scrip_estimate() -> None:
+    """When the venue prices the order, that figure wins."""
+    r = _runner_with(_LevFeed(Decimal("5")))
+    # Venue says 40/unit; budget 10k affords 250 units, not the 500 requested.
+    fitted = r._fit_to_margin(
+        broker=_PricedBroker(Decimal("40")),
+        symbol="X",
+        side="buy",
+        size=Decimal("500"),
+        price=Decimal("100"),
+        margin_budget=Decimal("10000"),
+    )
+    assert fitted == Decimal("250")
+
+
+def test_preflight_within_budget_leaves_size_untouched() -> None:
+    r = _runner_with(_LevFeed(Decimal("5")))
+    fitted = r._fit_to_margin(
+        broker=_PricedBroker(Decimal("10")),   # 500 x 10 = 5k <= 10k budget
+        symbol="X",
+        side="buy",
+        size=Decimal("500"),
+        price=Decimal("100"),
+        margin_budget=Decimal("10000"),
+    )
+    assert fitted == Decimal("500")
