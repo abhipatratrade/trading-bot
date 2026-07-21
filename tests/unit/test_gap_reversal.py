@@ -556,3 +556,26 @@ def test_preflight_within_budget_leaves_size_untouched() -> None:
         margin_budget=Decimal("10000"),
     )
     assert fitted == Decimal("500")
+
+
+def test_margin_fitting_never_touches_crypto_sizes() -> None:
+    """Regression: the fit step must not run on crypto buckets.
+
+    ``margin_budget`` is INR and, on crypto, ``price`` is USD per contract —
+    dividing them yields a fraction that floors to 0 contracts, which would
+    silently stop a LIVE crypto bucket from placing any order at all. Crypto
+    sets leverage explicitly per position (Decision 021) and has already done
+    its fx/contract-size conversion, so the fit step must be a no-op there.
+    """
+    r = object.__new__(BucketRunner)
+    r.bucket = load_bucket("longterm-crypto")
+    r._data = _LevFeed(None)
+    fitted = r._fit_to_margin(
+        broker=_NoPreflightBroker(),
+        symbol="BTCUSD",
+        side="buy",
+        size=Decimal("3"),              # contracts
+        price=Decimal("60000"),         # USD per contract
+        margin_budget=Decimal("10000"), # INR
+    )
+    assert fitted == Decimal("3"), "crypto size must pass through untouched"

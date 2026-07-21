@@ -664,7 +664,19 @@ class BucketRunner:
         If neither is available, size at 1x — the only quantity guaranteed
         affordable whatever the broker grants. Undersized beats rejected, and
         beats accidentally over-levered by a wide margin.
+
+        EQUITY ONLY. This arithmetic assumes ``size`` is a share count and
+        ``price`` is INR per share, matching ``margin_budget``. On crypto the
+        units do not line up — ``size`` is contracts and ``price`` is USD per
+        contract, with the fx and contract-size conversion already done by
+        ``notional_inr_to_contracts`` — so an INR budget divided by a USD
+        price yields a fraction, floors to 0, and would silently stop the
+        bucket from trading at all. Crypto also has no need of this: it sets
+        leverage explicitly per position (Decision 021), so the granted
+        multiple is never in doubt.
         """
+        if self.bucket.market != Market.INDIAN:
+            return size
         if price is None or price <= 0 or size <= 0:
             return size
         needed = broker.required_margin(
