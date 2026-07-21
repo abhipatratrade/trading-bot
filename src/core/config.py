@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal, NamedTuple
 
 from pydantic import Field, SecretStr, model_validator
@@ -26,6 +27,34 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class TradingMode(StrEnum):
     TESTNET = "testnet"
     LIVE = "live"
+
+
+def _enabled_bucket_brokers() -> set[str]:
+    """Broker names used by currently ENABLED buckets, from ``buckets.yaml``.
+
+    Read as raw YAML rather than via ``src.shared.bucket`` on purpose: this
+    module sits at the bottom of the import graph, and ``shared.bucket`` pulls
+    in ``core.models`` → ``core.db`` → back to ``core.config``. A plain file
+    read keeps the layering intact.
+
+    An unreadable or malformed file returns an EMPTY set, which skips the
+    credential checks rather than crashing here. That is the right bias: a
+    genuinely broken buckets.yaml is reported with a far better message by
+    ``load_buckets()`` at startup, and this validator should not be the thing
+    that fails on it.
+    """
+    try:
+        import yaml
+
+        path = Path(__file__).resolve().parents[2] / "buckets.yaml"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return {
+            str(cfg.get("broker"))
+            for cfg in (raw.get("buckets") or {}).values()
+            if isinstance(cfg, dict) and cfg.get("enabled") and cfg.get("broker")
+        }
+    except Exception:
+        return set()
 
 
 class DeltaAccount(NamedTuple):
@@ -178,21 +207,30 @@ class Settings(BaseSettings):
     def _validate_mode_credentials(self) -> Settings:
         """Ensure the broker keys exist for the active mode.
 
-        We deliberately do NOT raise if Telegram/GDrive are missing —
-        those are optional and degrade to no-op.
+        Scoped to brokers an ENABLED bucket actually uses. Demanding Delta
+        credentials when every Delta bucket is switched off blocks startup for
+        an account the bot will never touch — which is exactly what happened on
+        2026-07-22, when taking only intraday-indian (Dhan) live was refused
+        for want of DELTA_LIVE_API_KEY.
+
+        We deliberately do NOT raise if Telegram/GDrive are missing — those are
+        optional and degrade to no-op. Dhan stays lazily validated in
+        ``dhan_account()``, which raises with a precise message on first use.
         """
-        if self.trading_mode == TradingMode.TESTNET:
-            if not (self.delta_testnet_api_key and self.delta_testnet_api_secret):
-                raise ValueError(
-                    "TRADING_MODE=testnet requires DELTA_TESTNET_API_KEY "
-                    "and DELTA_TESTNET_API_SECRET"
-                )
-        elif self.trading_mode == TradingMode.LIVE:
-            if not (self.delta_live_api_key and self.delta_live_api_secret):
-                raise ValueError(
-                    "TRADING_MODE=live requires DELTA_LIVE_API_KEY "
-                    "and DELTA_LIVE_API_SECRET"
-                )
+        brokers = _enabled_bucket_brokers()
+        if "delta_india" in brokers:
+            if self.trading_mode == TradingMode.TESTNET:
+                if not (self.delta_testnet_api_key and self.delta_testnet_api_secret):
+                    raise ValueError(
+                        "TRADING_MODE=testnet requires DELTA_TESTNET_API_KEY "
+                        "and DELTA_TESTNET_API_SECRET (a delta_india bucket is enabled)"
+                    )
+            elif self.trading_mode == TradingMode.LIVE:
+                if not (self.delta_live_api_key and self.delta_live_api_secret):
+                    raise ValueError(
+                        "TRADING_MODE=live requires DELTA_LIVE_API_KEY "
+                        "and DELTA_LIVE_API_SECRET (a delta_india bucket is enabled)"
+                    )
         return self
 
     # -----------------------------------------------------------------------
