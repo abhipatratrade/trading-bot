@@ -65,7 +65,7 @@ from src.shared.allocator.sizer import (
 )
 from src.shared.base_strategy import Strategy
 from src.shared.bucket import Bucket, Market
-from src.shared.market_calendar import NseSession, nse_session
+from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
 from src.shared.scanner.engine import (
@@ -412,7 +412,11 @@ class BucketRunner:
         """
         if self.bucket.market != Market.INDIAN:
             return NseSession.ENTRY_WINDOW
-        return nse_session(self._clock.now())
+        return nse_session(
+            self._clock.now(),
+            entry_start=parse_ist_time(self.bucket.config.entry_start),
+            entry_end=parse_ist_time(self.bucket.config.entry_end),
+        )
 
     def _run_exits(self, om: OrderManager) -> int:
         """Step 0: ask every discovered strategy which held positions to close.

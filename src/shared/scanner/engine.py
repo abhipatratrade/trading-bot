@@ -65,11 +65,17 @@ class ScannerConfig(BaseModel):
     # Which scan engine runs this config. "generic" = the crypto ticker-snapshot
     # path below (default, so every existing crypto config is unchanged);
     # "equity_daily" = the two-phase Dhan equity path (daily-prepare shortlist +
-    # intraday confirm), dispatched to ``run_equity_scan``.
+    # intraday confirm), dispatched to ``run_equity_scan``;
+    # "equity_intraday" = the morning gap-down cut (Decision 029), dispatched to
+    # ``run_gap_reversal_scan``.
     engine: str = "generic"
     # Free-text universe label for equity configs (e.g. nse_bse_all_equities);
     # informational — the equity universe comes from the Dhan data adapter.
     universe: str | None = None
+    # Explicit symbol universe. Used by ``equity_intraday``, whose universe is a
+    # fixed index membership (NIFTY-100) rather than a broker-wide sweep — the
+    # constituents live in git so the scanned set is auditable (House Rule 7).
+    symbols: list[str] = Field(default_factory=list)
 
 
 def load_scanner_config(path: Path) -> ScannerConfig:
@@ -167,6 +173,10 @@ def run_scan(
     """
     if config.engine == "equity_daily":
         return run_equity_scan(
+            bucket_id=bucket_id, data=data, config=config, scan_date=scan_date
+        )
+    if config.engine == "equity_intraday":
+        return run_gap_reversal_scan(
             bucket_id=bucket_id, data=data, config=config, scan_date=scan_date
         )
 
@@ -445,4 +455,162 @@ def run_equity_scan(
         date=scan_date,
         universe=chosen_symbols,
         evaluated_count=len(survivors),
+    )
+
+
+def run_gap_reversal_scan(
+    *,
+    bucket_id: str,
+    data: MarketData,
+    config: ScannerConfig,
+    scan_date: date_type,
+) -> ScanResult:
+    """Morning gap-down cut for the intraday-indian bucket (Decision 029).
+
+    Runs the screen ONCE per session and caches it. The inputs are the 09:15
+    open, the 09:25 close, and the prior session's closes — all fixed the
+    moment 09:30 passes — so re-screening on every 60s tick would burn ~200
+    Dhan calls a minute to recompute a constant. Instead the first pass of the
+    day persists ``ScannerSnapshot`` rows (one per evaluated symbol, the
+    "screen ran today" marker) plus the ``DailyUniverse`` cut, and later ticks
+    read the universe straight back.
+
+    The reversal candle that actually triggers an entry is NOT evaluated here —
+    that is a live per-tick decision in ``gap_down_reversal.select_entries``.
+    """
+    from src.shared.scanner.gap_reversal import (
+        GapCandidate,
+        GapReversalConfig,
+        gap_screen,
+        rank_top,
+    )
+
+    gcfg = GapReversalConfig.from_scanner_config(config)
+
+    # Already screened today? Replay the persisted cut instead of re-fetching.
+    with session_scope() as session:
+        already_ran = session.execute(
+            select(func.count())
+            .select_from(ScannerSnapshot)
+            .where(
+                ScannerSnapshot.date == scan_date,
+                ScannerSnapshot.strategy_id == bucket_id,
+            )
+        ).scalar_one()
+        if already_ran:
+            cached = (
+                session.execute(
+                    select(DailyUniverse)
+                    .where(
+                        DailyUniverse.date == scan_date,
+                        DailyUniverse.strategy_id == bucket_id,
+                    )
+                    .order_by(DailyUniverse.rank)
+                )
+                .scalars()
+                .all()
+            )
+            return ScanResult(
+                bucket_id=bucket_id,
+                date=scan_date,
+                universe=[r.symbol for r in cached],
+                evaluated_count=already_ran,
+            )
+
+    # First pass of the session — run the real screen.
+    candidates: list[GapCandidate] = []
+    evaluated: list[tuple[str, GapCandidate | None]] = []
+    for symbol in gcfg.symbols:
+        try:
+            intraday = data.get_ohlcv(symbol, "5m")
+            daily = data.get_ohlcv(symbol, "1d", limit=gcfg.atr_period + 30)
+        except Exception:
+            # A single unfetchable name must not sink the whole morning cut.
+            _log.warning("gap_scan_fetch_failed", symbol=symbol, exc_info=True)
+            continue
+        cand = gap_screen(symbol, intraday, daily, scan_date, gcfg)
+        evaluated.append((symbol, cand))
+        if cand is not None:
+            candidates.append(cand)
+
+    chosen = rank_top(candidates, gcfg.universe_size)
+    chosen_symbols = [c.symbol for c in chosen]
+    weight = Decimal("1") / Decimal(str(len(chosen))) if chosen else Decimal("0")
+
+    with session_scope() as session:
+        session.execute(
+            delete(ScannerSnapshot).where(
+                ScannerSnapshot.date == scan_date,
+                ScannerSnapshot.strategy_id == bucket_id,
+            )
+        )
+        session.execute(
+            delete(DailyUniverse).where(
+                DailyUniverse.date == scan_date,
+                DailyUniverse.strategy_id == bucket_id,
+            )
+        )
+        for symbol, cand in evaluated:
+            session.add(
+                ScannerSnapshot(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=symbol,
+                    metrics=(
+                        {
+                            "prev_close": str(cand.prev_close),
+                            "open_0915": str(cand.open_0915),
+                            "gap_pct": str(round(cand.gap_pct, 4)),
+                            "body_atr_ratio": str(round(cand.body_atr_ratio, 4)),
+                        }
+                        if cand is not None
+                        else {}
+                    ),
+                    filter_results={},
+                    rank_score=abs(cand.gap_pct) if cand is not None else None,
+                    passed=cand is not None,
+                )
+            )
+        for rank, c in enumerate(chosen, start=1):
+            session.add(
+                DailyUniverse(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=c.symbol,
+                    rank=rank,
+                    target_weight=weight,
+                    notes=f"gap={c.gap_pct:.2f}% body/atr={c.body_atr_ratio:.2f}",
+                )
+            )
+        session.add(
+            AuditLog(
+                strategy_id=bucket_id,
+                event_type=AuditEventType.SCANNER_RUN,
+                message=(
+                    f"gap-reversal scan: {len(chosen)}/{len(evaluated)} gapped down, "
+                    f"top-{gcfg.universe_size}"
+                ),
+                payload={
+                    "bucket_id": bucket_id,
+                    "date": str(scan_date),
+                    "universe": chosen_symbols,
+                    "evaluated": len(evaluated),
+                    "passed": len(candidates),
+                },
+            )
+        )
+
+    _log.info(
+        "gap_reversal_scan_complete",
+        bucket_id=bucket_id,
+        date=str(scan_date),
+        universe=chosen_symbols,
+        evaluated=len(evaluated),
+        passed=len(candidates),
+    )
+    return ScanResult(
+        bucket_id=bucket_id,
+        date=scan_date,
+        universe=chosen_symbols,
+        evaluated_count=len(evaluated),
     )

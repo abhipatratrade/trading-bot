@@ -1,0 +1,154 @@
+# intraday-indian scanner — NIFTY-100 Gap-Down Reversal (Decision 029).
+#
+# backtest_ref: Backtesting Engine/strategies/optimized/nifty100_gap_reversal/
+#   (TRADING_BOT_HANDOFF.md; findings in
+#    results/learnings/gap_reversal_nifty100_2026-07-19.md)
+#   HOLDOUT (frozen, 2024-07→2025-06, incl. Apr-25 crash):
+#     35 trades, +13.3% on margin, wr 51%, PF 1.68, maxDD 9.2%.
+#   Plan around the holdout grade — NOT the full-period +36.6%.
+#
+# This is the MORNING CUT only: which names gapped down hard enough, with a
+# decisive enough first 15 minutes, to be worth fading. The reversal candle
+# that actually fires an entry is evaluated per tick by the strategy
+# (strategies/gap_down_reversal.py), not here.
+#
+# engine: equity_intraday = src/shared/scanner/gap_reversal.py. It runs ONCE per
+# session (its inputs are all fixed by 09:30) and caches the cut in
+# DailyUniverse; later ticks replay it instead of re-fetching 99 symbols.
+#
+# Scan moment: 09:30 IST, the moment the first-15m body is complete. Every daily
+# read is taken STRICTLY BEFORE today, so this path is immune to Dhan's
+# late-published daily candle (the 2026-07-14 STALE-CLOSE bug).
+engine: equity_intraday
+universe: nifty100
+universe_size: 5                     # max 5 concurrent positions (frozen top_n)
+
+filters:
+  # Gap DOWN, measured open_0915 vs prior session close, BOTH from the same
+  # UNADJUSTED 5m series. Below 3% the fade is gross-negative; beyond 12% it's
+  # a circuit or a corporate action, not a panic.
+  - name: gap_down_pct
+    params: { min: 3.0, max: 12.0 }
+  # Corporate-action guard: the same gap recomputed against the ADJUSTED daily
+  # prev-close must agree within 1pt. A split/bonus adjusts daily history but
+  # not the intraday series, so a real action shows up as a big disagreement.
+  - name: corporate_action_guard
+    params: { max_mismatch_pct: 1.0 }
+  # Decisiveness: first-15m body |open_0915 - close_0930| >= 25% of daily
+  # ATR(14) as of the prior close. Both sides carried as fractions of price,
+  # so the test is scale-invariant.
+  - name: first15_body_atr_frac
+    params: { threshold: 0.25, atr_period: 14 }
+
+# Informational for this engine — equity_intraday ranks internally by |gap|
+# descending (the frozen config's same-bar tie-break). Declared to satisfy the
+# shared ScannerConfig schema, same as the equity_daily path.
+ranker:
+  name: gap_down_abs_desc
+  params: {}
+
+# NIFTY-100 constituents, vendored from the Backtesting Engine's verified
+# nse_universe.NIFTY_100 (99 names — the list the 24-month backtest ran on).
+# In git so the scanned set is auditable and identical to the validated run
+# (House Rule 7). Re-check against the NSE index factsheet after each
+# semi-annual rebalance; a changed universe invalidates the backtest_ref.
+symbols:
+  - ADANIENT
+  - ADANIGREEN
+  - ADANIPORTS
+  - ADANIENSOL
+  - ADANIPOWER
+  - ATGL
+  - AMBUJACEM
+  - APOLLOHOSP
+  - ASIANPAINT
+  - DMART
+  - AXISBANK
+  - BAJAJ-AUTO
+  - BAJFINANCE
+  - BAJAJFINSV
+  - BAJAJHLDNG
+  - BANKBARODA
+  - BEL
+  - BPCL
+  - BHARTIARTL
+  - BOSCHLTD
+  - BRITANNIA
+  - CANBK
+  - CHOLAFIN
+  - CIPLA
+  - COALINDIA
+  - COLPAL
+  - DLF
+  - DABUR
+  - DIVISLAB
+  - DRREDDY
+  - EICHERMOT
+  - GAIL
+  - GODREJCP
+  - GRASIM
+  - HCLTECH
+  - HDFCBANK
+  - HDFCLIFE
+  - HAVELLS
+  - HEROMOTOCO
+  - HINDALCO
+  - HAL
+  - HINDUNILVR
+  - ICICIBANK
+  - ICICIGI
+  - ICICIPRULI
+  - ITC
+  - INDUSINDBK
+  - IOC
+  - IRFC
+  - INFY
+  - NAUKRI
+  - JSWSTEEL
+  - JSWENERGY
+  - JINDALSTEL
+  - JIOFIN
+  - KOTAKBANK
+  - LT
+  - LICI
+  - M&M
+  - MARICO
+  - MARUTI
+  - NHPC
+  - NTPC
+  - NESTLEIND
+  - ONGC
+  - PIDILITIND
+  - PFC
+  - POWERGRID
+  - PNB
+  - RECLTD
+  - RELIANCE
+  - MOTHERSON
+  - SBILIFE
+  - SHREECEM
+  - SIEMENS
+  - SBIN
+  - SUNPHARMA
+  - TVSMOTOR
+  - TCS
+  - TATACONSUM
+  - TATAPOWER
+  - TATASTEEL
+  - TECHM
+  - TITAN
+  - TORNTPHARM
+  - TRENT
+  - ULTRACEMCO
+  - UNITDSPR
+  - VBL
+  - VEDL
+  - WIPRO
+  - ETERNAL
+  - ABB
+  - GODREJPROP
+  - INDIGO
+  - MAXHEALTH
+  - ZYDUSLIFE
+  - SHRIRAMFIN
+  - IDBI

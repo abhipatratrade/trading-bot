@@ -59,8 +59,18 @@ def is_trading_day(d: date) -> bool:
     return d.weekday() < 5 and d not in NSE_HOLIDAYS
 
 
-def nse_session(now: datetime) -> NseSession:
-    """Classify ``now`` (any tz; naive treated as UTC) into an NSE session state."""
+def nse_session(
+    now: datetime,
+    entry_start: time = ENTRY_START,
+    entry_end: time = ENTRY_END,
+) -> NseSession:
+    """Classify ``now`` (any tz; naive treated as UTC) into an NSE session state.
+
+    The entry window is per-bucket: swing-indian keeps the 09:45 default above,
+    while intraday-indian opens at 09:30 (its reversal candle can print as
+    early as the 09:30 close — Decision 029). Both are declared in
+    ``buckets.yaml`` and passed in by ``BucketRunner``.
+    """
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     ist_now = now.astimezone(IST)
@@ -69,6 +79,12 @@ def nse_session(now: datetime) -> NseSession:
     t = ist_now.time()
     if not (SESSION_OPEN <= t <= SESSION_CLOSE):
         return NseSession.CLOSED
-    if ENTRY_START <= t <= ENTRY_END:
+    if entry_start <= t <= entry_end:
         return NseSession.ENTRY_WINDOW
     return NseSession.OPEN_NO_ENTRY
+
+
+def parse_ist_time(value: str) -> time:
+    """Parse a ``"HH:MM"`` string from YAML into a ``time``."""
+    hh, _, mm = value.partition(":")
+    return time(int(hh), int(mm))

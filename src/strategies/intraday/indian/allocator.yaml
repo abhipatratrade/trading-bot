@@ -1,0 +1,45 @@
+# Position-size config for intraday-indian (NIFTY-100 Gap-Down Reversal).
+#
+# backtest_ref: Backtesting Engine/strategies/optimized/nifty100_gap_reversal/
+#   results/scanners/nifty100_gap_reversal_opt_opt_full_20260719_030225.json
+#
+# mu/sigma are per-TRADE (== per-day; every trade opens and squares off inside
+# one session, so one "period" is one holding period) over all 76 full-window
+# backtest trades:
+#   mu_per_period    = mean(trade returns)  = 0.006238
+#   sigma_per_period = stdev(trade returns) = 0.018727
+# Raw Kelly* = mu/sigma^2 ~ 17.8 — absurd on its face, which is exactly why the
+# caps below are what actually bind: fractional 0.25 gives 4.45, and the 20%
+# per-symbol cap (5-slot equal weight) clamps it to 0.20. Same shape as
+# swing-indian: the cap is the real sizer, Kelly just confirms "size up to it".
+#
+# The scanner picks a different basket every morning, so per-symbol stats are
+# meaningless — every candidate uses default_for_unknown.
+#
+# SIZE MATTERS HERE MORE THAN USUAL. The edge is thin relative to costs: at
+# Rs 10k/trade the backtest showed costs eating ~99% of gross. The bucket is
+# capitalised at Rs 1,00,000 precisely so 20% x 5x leverage = Rs 1L notional per
+# trade, the size the holdout was validated at. Cutting capital without raising
+# per_symbol_cap silently moves the strategy below its cost hurdle.
+
+fractional_kelly: 0.25
+per_symbol_cap: 0.20      # 5-slot equal-weight basket: 20% of bucket per name
+aggregate_cap: 1.00
+
+# Deliberately FLAT (Decision 029). This strategy fades panic gap-downs, which
+# cluster in exactly the bear/high-volatility tape a regime gate would shut off
+# — the frozen HOLDOUT fold that returned +13.3% CONTAINS the Apr-2025 crash.
+# Scaling size down in bear would suppress the strategy when it works best, so
+# every regime gets 1.0 and regime.yaml is disabled. Do not "fix" this to the
+# 0/0.5/1.0 house default without a fresh backtest showing the gate helps.
+regime_multipliers:
+  bear: 1.00
+  neutral: 1.00
+  bull: 1.00
+
+# All scanner candidates use this (daily-rotating universe -> no per-symbol stats).
+default_for_unknown:
+  mu_per_period: 0.006238    # per trade (one session), from 76 backtest trades
+  sigma_per_period: 0.018727 # per trade (one session)
+
+stats: {}

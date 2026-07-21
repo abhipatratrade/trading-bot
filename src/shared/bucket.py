@@ -41,6 +41,10 @@ class TradingType(StrEnum):
     SWING = "swing"
     SCALP = "scalp"
     GAMBLING = "gambling"
+    # Decision 029 — same-day entry and exit. Distinct from SCALP (which is a
+    # crypto high-leverage type) in that positions are opened and squared off
+    # inside one NSE session.
+    INTRADAY = "intraday"
 
 
 class Market(StrEnum):
@@ -64,6 +68,12 @@ class BucketConfig(BaseModel):
     # stop-market order at this distance, so a max loss holds even when the
     # bot/VM is down. None ⇒ no broker-side stop for this bucket.
     stop_loss_pct: Decimal | None = Field(default=None, gt=0, lt=100)
+    # Decision 029 — per-bucket entry window (IST "HH:MM"), consumed by
+    # ``market_calendar.nse_session`` via BucketRunner. Defaults reproduce the
+    # original module-level constants, so every pre-existing bucket is
+    # unchanged; intraday-indian overrides the start to 09:30.
+    entry_start: str = "09:45"
+    entry_end: str = "10:30"
 
 
 class BucketsConfig(BaseModel):

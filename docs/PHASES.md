@@ -291,6 +291,27 @@ land, then RETIRE it. `swing-indian` stays `enabled: false` in buckets.yaml.
 - [ ] **OPEN — Decision 022**: strategy has NO protective stop by design; swing-indian
       has no stop_loss_pct. Needs a Decision 022 amendment before real money
 
+## Phase 4b — Stocks Intraday (intraday-indian) [inserted 2026-07-21]
+
+NIFTY-100 gap-down reversal — Decision 029. backtest_ref:
+`Backtesting Engine/strategies/optimized/nifty100_gap_reversal/TRADING_BOT_HANDOFF.md`.
+Plan around the HOLDOUT grade: ~PF 1.7, ~+13%/yr on margin, ~9% DD, ~0.8 trades/week.
+
+- [x] Decision 029 written (amends 013; capital, regime-off, wide stop, guard reformulation)
+- [x] `TradingType.INTRADAY`; `intraday-indian` in buckets.yaml (₹1L, dhan, 5x, **disabled**)
+- [x] Migration 0009 seeds `bucket_state` (idempotent, `enabled=false`)
+- [x] Per-bucket entry window (`entry_start`/`entry_end`; 09:30–10:30 here, swing unchanged)
+- [x] `src/shared/scanner/patterns.py` — TV engulfing_bull + hammer, 1:1 port
+- [x] `src/shared/scanner/gap_reversal.py` + `engine: equity_intraday` (once-a-day cached cut)
+- [x] `gap_down_reversal.py` Strategy — first reversal candle, 15:15 square-off
+- [x] Config set: scanner/allocator (μ=0.006238 σ=0.018727 from 76 trades)/regime/master CSV
+- [x] Parity harness vs the 76 frozen backtest trades → 75/76 exact (pattern + entry bar)
+- [x] 19 unit tests; full suite 295 green; ruff clean
+- [ ] **User review, then flip `enabled: true`** ← next action, user-gated
+- [ ] Dhan sandbox soak: verify the 09:30 cut, an entry, and a 15:15 square-off end-to-end
+- [ ] Confirm MIS product routing + wide stop placement on a real order
+- [ ] Re-check NIFTY-100 constituents against the NSE factsheet after each rebalance
+
 ## Phase 5 — Crypto Scalp [priority 5]
 *(Detailed checklist added when Phase 4 completes. Latency-tuned path.)*
 
@@ -308,6 +329,8 @@ land, then RETIRE it. `swing-indian` stays `enabled: false` in buckets.yaml.
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-07-21 — Phase 4b BUILT (disabled): `intraday-indian`, the seventh bucket (Decision 029, amends 013), implementing the holdout-validated NIFTY-100 gap-down reversal from the Backtesting Engine handoff. New `TradingType.INTRADAY`; buckets.yaml entry at **₹1,00,000** (not ₹50k — the frozen 20% cap × 5x MIS must yield the ₹1L notional the backtest was validated at; costs ate ~99% of gross at ₹10k/trade); migration 0009 seeds bucket_state idempotently at `enabled=false`. New `scanner/patterns.py` (TV engulfing_bull + hammer, 1:1 port) and `scanner/gap_reversal.py` (`engine: equity_intraday`) — the morning cut runs ONCE per session and caches to DailyUniverse, since re-screening 99 symbols on every 60s tick would recompute a constant. `nse_session` generalised to a per-bucket entry window (09:30 here vs swing's 09:45; defaults unchanged). Regime gate deliberately OFF (fades panic — the holdout that earned +13.3% IS the Apr-25 crash); wide 15% catastrophe stop per Decision 028's logic. **Parity harness against all 76 frozen backtest trades: 75/76 exact on gap screen, pattern name AND entry bar time.** Two real bugs it caught: (1) `body_avg` is a 14-EMA that must run over the FULL multi-session series — session-scoping it reproduced only 33/76, because a gap morning's opening candles inflate the average and kill `long_body`; (2) the corporate-action guard needed reformulating for live (Dhan publishes no same-day daily bar — the 07-14 STALE-CLOSE bug), accepted cost = VEDL 2025-08-26 whose daily history is rescaled ×0.374 by the later Vedanta demerger; the scale-invariant alternative was worse (5m closes 15:25, misses the closing auction, ~1% disagreement rejected IOC/TORNTPHARM on noise). 19 new tests, 295 green, ruff clean. **Ships DARK — user flips `enabled: true` after review.**
 
 - 2026-04-30 — Phase 0 kicked off: scaffold + continuity files written.
 - 2026-04-30 — Phase 0.2 done: core plumbing (config, logging, db, models, clock) + Alembic + initial migration.

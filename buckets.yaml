@@ -67,3 +67,26 @@ buckets:
     # catastrophe stop — 20% below entry, far outside the Supertrend/30-day
     # exits, catching only a crash while the bot is down.
     stop_loss_pct: 20
+
+  # Decision 029 — seventh bucket, amending 013's fixed six. NIFTY-100
+  # gap-down reversal: long-only intraday fade, entries 09:30–10:30, square-off
+  # 15:15. Holdout-validated PF 1.68 / +13.3% on margin.
+  intraday-indian:
+    # Rs 1,00,000 (not the house Rs 50k) is a COST decision, not a conviction
+    # one: 20% per-symbol cap x 5x MIS = Rs 1L notional per trade, the size the
+    # backtest was validated at. At Rs 50k the notional halves and the edge
+    # thins against a fixed cost floor. See allocator.yaml.
+    capital_inr: 100000
+    broker: dhan
+    leverage_max: 5          # MIS intraday
+    enabled: false           # built dark — user flips this on after review
+    account_ref: dhan
+    # Entry window differs from swing-indian's 09:45: the earliest reversal
+    # candle closes at 09:30 (Decision 029).
+    entry_start: "09:30"
+    entry_end: "10:30"
+    # Same reasoning as Decision 028 — every tight stop tested LOST money
+    # (pattern-low RR 1-3, 5m trailing) because the reversal needs hours to
+    # play out. This is a crash net for a bot/VM outage only, deliberately far
+    # outside the 15:15 square-off's normal range.
+    stop_loss_pct: 15
