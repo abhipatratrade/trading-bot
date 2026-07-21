@@ -22,7 +22,14 @@ buckets:
     capital_inr: 50000
     broker: delta_india
     leverage_max: 5
-    enabled: true
+    # PAUSED 2026-07-22 (user decision). TRADING_MODE is process-wide, so
+    # taking intraday-indian live would have flipped this bucket from its
+    # Delta TESTNET soak onto REAL crypto money — while its own Phase 1b gate
+    # (allocator.yaml mu/sigma from the backtester) is still unmet. Disabled
+    # so "live" means only the bucket that was asked for.
+    # To resume: set enabled: true. Note a disabled bucket runs NO exits, so
+    # square off anything open before pausing for real money.
+    enabled: false
     account_ref: default
     stop_loss_pct: 10     # 5x → 50% of margin
 
@@ -60,7 +67,11 @@ buckets:
     capital_inr: 50000
     broker: dhan
     leverage_max: 4
-    enabled: true    # Phase 4 — full integration (Dhan sandbox)
+    # PAUSED 2026-07-22 (user decision) — same reason as longterm-crypto:
+    # TRADING_MODE is global, and this bucket's sandbox soak must not become
+    # real money as a side effect of taking intraday-indian live.
+    # To resume: set enabled: true (and decide sandbox vs live deliberately).
+    enabled: false   # was: Phase 4 full integration on Dhan sandbox
     account_ref: dhan
     product: MTF             # funded delivery; CNC fallback when not MTF-eligible
     # Decision 022 (amended for swing-indian): this strategy's edge dies with

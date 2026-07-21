@@ -29,7 +29,8 @@ def test_longterm_crypto_resolves() -> None:
     b = buckets["longterm-crypto"]
     assert b.trading_type == TradingType.LONGTERM
     assert b.market == Market.CRYPTO
-    assert b.config.enabled is True
+    # NOT asserting config.enabled: that is an operational switch the user
+    # flips per rollout stage, not a structural property of the bucket.
     assert b.folder.is_dir()
     assert b.scanner_yaml_path.is_file()
     assert b.regime_yaml_path.is_file()
