@@ -1,0 +1,31 @@
+# VM-side DRY RUN for the intraday-indian bucket (Decision 029/030).
+#
+# Runs the real morning gap screen + reversal detection + margin preflight
+# against LIVE Dhan data and logs what it WOULD trade. It places NO orders —
+# scripts/intraday_dryrun.py never imports or calls place_order.
+#
+# Safe to run whatever TRADING_MODE is set to, and whether or not the bucket
+# is enabled. Market data always uses the live api.dhan.co host, so the scan
+# is representative either way; only the /v2/margincalculator probe depends on
+# the mode (in testnet it targets sandbox.dhan.co, which Dhan's edge blocks
+# from datacenter IPs — expect "no answer" there, and read the scrip-master
+# fallback column instead).
+#
+# Read the output with:
+#   journalctl -u intraday-dryrun.service -n 300 --no-pager
+#
+# NOT auto-applied by the deploy timer. After editing, re-copy by hand:
+#   sudo cp ops/intraday-dryrun.service ops/intraday-dryrun.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now intraday-dryrun.timer
+
+[Unit]
+Description=intraday-indian dry run (no orders placed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kohinoor_abhi
+WorkingDirectory=/home/kohinoor_abhi/trading-bot
+ExecStart=/home/kohinoor_abhi/trading-bot/.venv/bin/python scripts/intraday_dryrun.py
+EnvironmentFile=/home/kohinoor_abhi/.env

@@ -1,0 +1,39 @@
+# Fires intraday-dryrun.service twice each weekday morning:
+#   04:10 UTC = 09:40 IST — the 09:25 bar (closing 09:30) has printed, so the
+#                           morning cut is complete and an early reversal
+#                           candle is still actionable.
+#   04:40 UTC = 10:10 IST — catches a later reversal, still inside the
+#                           09:30-10:30 entry window.
+#
+# Two shots because a single sample can easily land on a bar with no signal —
+# this strategy averages ~0.8 trades/week, so ZERO candidates is the normal
+# result and is not a failure. The point of the run is proving the pipeline
+# executes and that the margin preflight answers, not catching a trade.
+#
+# Mon..Fri skips weekends. NSE holidays are not excluded — on those the scan
+# simply finds the previous session's bars and reports no fresh signal, which
+# is harmless (no orders are placed under any circumstances).
+#
+# Install + enable:
+#   sudo cp ops/intraday-dryrun.service ops/intraday-dryrun.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now intraday-dryrun.timer
+#   systemctl list-timers | grep intraday-dryrun   # confirm next-fire
+#
+# Run once on demand:  sudo systemctl start intraday-dryrun.service
+# Read the output:     journalctl -u intraday-dryrun.service -n 300 --no-pager
+#
+# Remove once the bucket is live and proven:
+#   sudo systemctl disable --now intraday-dryrun.timer
+
+[Unit]
+Description=Weekday morning trigger for the intraday-indian dry run
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 04:10:00 UTC
+OnCalendar=Mon..Fri *-*-* 04:40:00 UTC
+Persistent=false
+Unit=intraday-dryrun.service
+
+[Install]
+WantedBy=timers.target
