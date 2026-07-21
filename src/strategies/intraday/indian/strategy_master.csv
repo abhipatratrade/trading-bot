@@ -1,2 +1,3 @@
 strategy_name,tf,min_vol,trading_regime_1,trading_regime_2,trading_type,scanner
 gap_down_reversal,5m,,,,intraday,
+gap_down_reversal_broad,5m,,,,intraday,broad

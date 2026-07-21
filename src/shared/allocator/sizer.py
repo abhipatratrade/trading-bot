@@ -214,6 +214,9 @@ class SizingResult:
     decision: SizingDecision
     contracts: Decimal = Decimal("0")
     suggested_notional_inr: Decimal = Decimal("0")
+    # Margin this position claims from the bucket (notional ÷ leverage). The
+    # runner sums it across strategies to build the per-tick shared budget.
+    required_margin_inr: Decimal = Decimal("0")
     mu: Decimal | None = None
     sigma: Decimal | None = None
     reason: str | None = None
@@ -230,6 +233,7 @@ def size_positions(
     dedup_window_hours: float | None = None,
     contract_sizes_override: dict[str, Decimal] | None = None,
     fx_inr_per_usd_override: Decimal | None = None,
+    committed_margin_inr: Decimal = Decimal("0"),
 ) -> dict[str, SizingResult]:
     """Compute per-symbol sizing for one strategy in one bucket.
 
@@ -255,6 +259,16 @@ def size_positions(
         fx_inr_per_usd_override: optional non-YAML USD/INR rate. Unused
             in production — the rate is fixed in ``allocator.yaml``
             (85 for Delta India, user decision 2026-07-07).
+        committed_margin_inr: margin already claimed EARLIER IN THIS TICK
+            by other strategies in the same bucket. Decision 026 lets one
+            bucket run several scanner sets, and each set has its own
+            allocator config — without this, two sets at
+            ``aggregate_cap: 1.00`` would each independently claim 100% of
+            the bucket, because the ``bucket_state`` mirror they both read
+            only refreshes on the reconciler sweep and so still shows the
+            pre-trade balance. The runner threads the running total through
+            so slots are first-come-first-served across sets, matching the
+            backtest's "max N concurrent, filled chronologically".
 
     Returns:
         {symbol: SizingResult} for every input candidate. Caller iterates
@@ -368,6 +382,14 @@ def size_positions(
         capital_inr=bucket.config.capital_inr,
         adjustments_inr=adjustments_inr,
     )
+    # Margin budget still claimable this tick. Capped at ``capital`` as well as
+    # the wallet: an Indian bucket shares one Dhan account (Decision 027), so
+    # the raw wallet (₹10L in sandbox) is not its money — without the cap the
+    # sufficiency check below would wave through far more than the allocation.
+    # ``committed_margin_inr`` is what earlier strategies in this same tick
+    # already took (Decision 026 multi-scanner; see the arg docstring).
+    budget_inr = min(available_inr, capital) - committed_margin_inr
+    remaining_inr = budget_inr
 
     for sym in candidates:
         if sym in held:
@@ -404,15 +426,21 @@ def size_positions(
             )
             continue
 
-        if required_margin > available_inr:
+        # First-come-first-served against the remaining budget. ``remaining``
+        # is decremented per approved position, so candidates within this call
+        # compete for slots the same way separate scanner sets do.
+        if required_margin > remaining_inr:
             results[sym] = SizingResult(
                 symbol=sym,
                 decision=SizingDecision.SKIPPED_INSUFFICIENT,
                 suggested_notional_inr=suggested_notional,
+                required_margin_inr=required_margin,
                 mu=stats.mu_per_period,
                 sigma=stats.sigma_per_period,
                 reason=(
-                    f"required margin {required_margin} > available {available_inr}"
+                    f"required margin {required_margin} > remaining budget "
+                    f"{remaining_inr} (bucket capital {capital}, "
+                    f"already committed this tick {committed_margin_inr})"
                 ),
             )
             continue
@@ -456,9 +484,13 @@ def size_positions(
             decision=SizingDecision.PLACED,
             contracts=contracts,
             suggested_notional_inr=suggested_notional,
+            required_margin_inr=required_margin,
             mu=stats.mu_per_period,
             sigma=stats.sigma_per_period,
         )
+        # Claim the margin so later candidates (and later scanner sets, via
+        # the runner's running total) see a smaller budget.
+        remaining_inr -= required_margin
 
     # ---- persist audit ----------------------------------------------------
     # SizingSnapshot.regime is now per-symbol (the regime label that was

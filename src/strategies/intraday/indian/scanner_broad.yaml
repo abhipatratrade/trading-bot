@@ -1,0 +1,289 @@
+# intraday-indian BROAD scanner set — Midcap 150 + Smallcap 100 (Decision 029).
+#
+# ⚠️  NOT BACKTEST-VALIDATED. The frozen holdout (PF 1.68) was run on NIFTY-100
+# ONLY. The gap-reversal learnings file explicitly lists a midcap universe as
+# "a separate study; re-freeze a holdout" — that study has not been done. This
+# set exists to GENERATE that evidence live, at the same per-trade size, with
+# its P&L attributable separately from the validated set (Decision 026 named
+# scanner sets). Judge it on its own record; do not assume it inherits PF 1.68.
+#
+# Signal logic is identical to scanner.yaml — same gap band, same corporate
+# action guard, same first-15m body test, same reversal candle. The ONLY
+# differences are the universe and the circuit filter below.
+#
+# CAPITAL: this set shares the bucket's one ₹50k pool with the NIFTY-100 set.
+# Slots are first-come-first-served within a tick, and because strategies are
+# iterated in sorted filename order, ``gap_down_reversal`` (validated) claims
+# ahead of ``gap_down_reversal_broad`` when both fire on the same bar.
+engine: equity_intraday
+universe: nifty_midcap150_smallcap100
+universe_size: 5
+
+filters:
+  - name: gap_down_pct
+    params: { min: 3.0, max: 12.0 }
+  - name: corporate_action_guard
+    params: { max_mismatch_pct: 1.0 }
+  - name: first15_body_atr_frac
+    params: { threshold: 0.25, atr_period: 14 }
+  # Circuit-lock guard — the one filter the NIFTY-100 set does not need.
+  #
+  # A scrip passes if it is an F&O underlying (its NSE price band is DYNAMIC:
+  # it widens after a cool-off rather than freezing) OR its hard band is at
+  # least this wide. Narrow-band non-F&O names are excluded because a
+  # continued slide can lock the scrip, stranding a long until auto
+  # square-off — a tail the NIFTY-100 backtest never faced.
+  #
+  # Do NOT read this as "20% band required": measured 2026-07-21, only 2 of 99
+  # NIFTY-100 names have a 20% band (97 are F&O with a 10% dynamic band), so a
+  # naive band-width filter would reject the validated universe outright. The
+  # F&O test is what carries this filter; the width is the fallback for the
+  # 82 smallcaps that are not F&O. Net effect here: 5 of 235 names excluded.
+  - name: circuit_band_min
+    params: { threshold: 20.0 }
+
+ranker:
+  name: gap_down_abs_desc
+  params: {}
+
+# Midcap 150 + Smallcap 100, minus the 15 names that are also NIFTY-100
+# constituents (they are traded by the default set; leaving them here would
+# double-enter, since dedup is per bucket+strategy+symbol and these run as
+# two different strategy names). Re-derive after each semi-annual rebalance
+# with scripts/refresh_broad_universe.py.
+symbols:
+  - 360ONE
+  - 3MINDIA
+  - ACC
+  - AIAENG
+  - APLAPOLLO
+  - AUBANK
+  - AWL
+  - ABBOTINDIA
+  - ABCAPITAL
+  - AJANTPHARM
+  - ALKEM
+  - ANTHEM
+  - APARINDS
+  - APOLLOTYRE
+  - ASHOKLEY
+  - ASTRAL
+  - AUROPHARMA
+  - AIIL
+  - BSE
+  - BAJAJHFL
+  - BALKRISIND
+  - BANKINDIA
+  - MAHABANK
+  - BERGEPAINT
+  - BDL
+  - BHARATFORG
+  - BHEL
+  - BHARTIHEXA
+  - GROWW
+  - BIOCON
+  - BLUESTARCO
+  - CRISIL
+  - COCHINSHIP
+  - COFORGE
+  - CONCOR
+  - COROMANDEL
+  - DALBHARAT
+  - DIXON
+  - ENDURANCE
+  - ESCORTS
+  - EXIDEIND
+  - NYKAA
+  - FEDERALBNK
+  - FORTIS
+  - GVT&D
+  - GMRAIRPORT
+  - GICRE
+  - GLAXO
+  - GLENMARK
+  - MEDANTA
+  - GODFRYPHLP
+  - GODREJIND
+  - FLUOROCHEM
+  - HDBFS
+  - HEXT
+  - HINDPETRO
+  - POWERINDIA
+  - HONAUT
+  - HUDCO
+  - ICICIAMC
+  - IDFCFIRSTB
+  - ITCHOTELS
+  - INDIANB
+  - IRCTC
+  - IREDA
+  - INDUSTOWER
+  - IPCALAB
+  - JKCEMENT
+  - JSWINFRA
+  - JSL
+  - JUBLFOOD
+  - KPRMILL
+  - KEI
+  - KPITTECH
+  - KALYANKJIL
+  - LTF
+  - LTTS
+  - LGEINDIA
+  - LICHSGFIN
+  - LAURUSLABS
+  - LENSKART
+  - LINDEINDIA
+  - LLOYDSME
+  - LUPIN
+  - MRF
+  - M&MFIN
+  - MANKIND
+  - MFSL
+  - MOTILALOFS
+  - MPHASIS
+  - MCX
+  - NLCINDIA
+  - NMDC
+  - NTPCGREEN
+  - NATIONALUM
+  - NAM-INDIA
+  - OBEROIRLTY
+  - OIL
+  - PAYTM
+  - OFSS
+  - POLICYBZR
+  - PIIND
+  - PAGEIND
+  - PATANJALI
+  - PERSISTENT
+  - PETRONET
+  - PHOENIXLTD
+  - POLYCAB
+  - PREMIERENE
+  - PRESTIGE
+  - RADICO
+  - RVNL
+  - SBICARD
+  - SJVN
+  - SRF
+  - SCHAEFFLER
+  - SAIL
+  - SUNDARMFIN
+  - SUPREMEIND
+  - SUZLON
+  - SWIGGY
+  - TATACOMM
+  - TATAELXSI
+  - TATAINVEST
+  - NIACL
+  - THERMAX
+  - TORNTPOWER
+  - TIINDIA
+  - UNOMINDA
+  - UPL
+  - UBL
+  - VMM
+  - IDEA
+  - VOLTAS
+  - WAAREEENER
+  - YESBANK
+  - AARTIIND
+  - ABREL
+  - AEGISLOG
+  - AFCONS
+  - AFFLE
+  - ARE&M
+  - AMBER
+  - ANANDRATHI
+  - ANANTRAJ
+  - ANGELONE
+  - APTUS
+  - ASTERDM
+  - ATHERENERG
+  - BEML
+  - BLS
+  - BANDHANBNK
+  - FIRSTCRY
+  - BRIGADE
+  - CESC
+  - CGCL
+  - CASTROLIND
+  - CDSL
+  - CHAMBLFERT
+  - CHOLAHLDNG
+  - CUB
+  - COHANCE
+  - CAMS
+  - CREDITACC
+  - CROMPTON
+  - DATAPATTNS
+  - DEEPAKFERT
+  - DELHIVERY
+  - DEVYANI
+  - LALPATHLAB
+  - FSL
+  - FIVESTAR
+  - FORCEMOT
+  - GRSE
+  - GLAND
+  - GPIL
+  - GESHIP
+  - GMDCLTD
+  - HBLENGINE
+  - HSCL
+  - HINDCOPPER
+  - IFCI
+  - IIFL
+  - IRCON
+  - ITI
+  - IGL
+  - INOXWIND
+  - IKS
+  - JBMA
+  - JMFINANCIL
+  - JSWCEMENT
+  - JYOTICNC
+  - KARURVYSYA
+  - KAYNES
+  - KEC
+  - KFINTECH
+  - MANAPPURAM
+  - MRPL
+  - MEESHO
+  - NATCOPHARM
+  - NBCC
+  - NH
+  - NAVINFLUOR
+  - NETWEB
+  - NEULANDLAB
+  - NUVAMA
+  - OLAELEC
+  - PGEL
+  - PNBHOUSING
+  - PWL
+  - PINELABS
+  - PIRAMALFIN
+  - PPLPHARMA
+  - POONAWALLA
+  - RBLBANK
+  - REDINGTON
+  - RPOWER
+  - SAGILITY
+  - SAILIFE
+  - SARDAEN
+  - SIGNATURE
+  - SONACOMS
+  - STARHEALTH
+  - SWANCORP
+  - SYNGENE
+  - TATACHEM
+  - TATATECH
+  - TENNIND
+  - RAMCOCEM
+  - TRITURBINE
+  - URBANCO
+  - WELCORP
+  - WHIRLPOOL
+  - WOCKPHARMA
+  - ZENSARTECH

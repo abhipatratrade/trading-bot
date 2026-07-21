@@ -69,6 +69,9 @@ class GapReversalConfig:
     gap_mismatch_pct: Decimal
     first15_body_atr_frac: Decimal
     atr_period: int
+    # Minimum hard price-band width for a NON-F&O scrip to be eligible. 0
+    # disables the check. F&O underlyings always pass (dynamic band).
+    min_circuit_band_pct: Decimal
 
     @classmethod
     def from_scanner_config(cls, config: ScannerConfig) -> GapReversalConfig:
@@ -89,6 +92,7 @@ class GapReversalConfig:
             gap_mismatch_pct=_p("corporate_action_guard", "max_mismatch_pct", 1.0),
             first15_body_atr_frac=_p("first15_body_atr_frac", "threshold", 0.25),
             atr_period=_i("first15_body_atr_frac", "atr_period", 14),
+            min_circuit_band_pct=_p("circuit_band_min", "threshold", 0),
         )
 
 

@@ -74,6 +74,12 @@ class BucketConfig(BaseModel):
     # unchanged; intraday-indian overrides the start to 09:30.
     entry_start: str = "09:45"
     entry_end: str = "10:30"
+    # Broker margin/product mode for this bucket's orders, when the venue has
+    # one (Decision 029). Dhan cash equity: MTF (funded delivery, swing) vs
+    # INTRADAY (MIS, same-day). It is per-bucket rather than per-broker because
+    # Dhan has a single account, so both Indian buckets share one adapter.
+    # None ⇒ the adapter's own default. Crypto buckets leave it unset.
+    product: str | None = None
 
 
 class BucketsConfig(BaseModel):

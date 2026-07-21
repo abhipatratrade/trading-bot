@@ -518,9 +518,25 @@ def run_gap_reversal_scan(
             )
 
     # First pass of the session — run the real screen.
+    # Circuit-lock screen (Decision 029). Applies only where configured — the
+    # NIFTY-100 set leaves it at 0 because every constituent is an F&O
+    # underlying anyway. Skipped names are logged, never silently dropped.
+    symbols = list(gcfg.symbols)
+    if gcfg.min_circuit_band_pct > 0 and hasattr(data, "circuit_safe"):
+        safe = [s for s in symbols if data.circuit_safe(s, gcfg.min_circuit_band_pct)]
+        if len(safe) != len(symbols):
+            _log.info(
+                "gap_scan_circuit_filtered",
+                bucket_id=bucket_id,
+                excluded=sorted(set(symbols) - set(safe)),
+                kept=len(safe),
+                of=len(symbols),
+            )
+        symbols = safe
+
     candidates: list[GapCandidate] = []
     evaluated: list[tuple[str, GapCandidate | None]] = []
-    for symbol in gcfg.symbols:
+    for symbol in symbols:
         try:
             intraday = data.get_ohlcv(symbol, "5m")
             daily = data.get_ohlcv(symbol, "1d", limit=gcfg.atr_period + 30)

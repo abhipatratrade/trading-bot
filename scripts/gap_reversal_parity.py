@@ -53,6 +53,9 @@ CFG = GapReversalConfig(
     gap_mismatch_pct=Decimal("1.0"),
     first15_body_atr_frac=Decimal("0.25"),
     atr_period=14,
+    # 0 = off, matching the NIFTY-100 set. The circuit screen only applies to
+    # the broad (midcap/smallcap) set and would not change these 76 trades.
+    min_circuit_band_pct=Decimal("0"),
 )
 
 _CACHE: dict[tuple[str, str], list[OHLCVBar] | None] = {}

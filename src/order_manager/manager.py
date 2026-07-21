@@ -103,6 +103,7 @@ class OrderManager:
         time_in_force: TimeInForce = TimeInForce.GTC,
         reduce_only: bool = False,
         stop_price: Decimal | None = None,
+        product: str | None = None,
         intent_id: str = "",
         bucket_id: str | None = None,
         strategy_name: str | None = None,
@@ -208,6 +209,7 @@ class OrderManager:
                     reduce_only=reduce_only,
                     client_order_id=client_oid,
                     stop_price=stop_price,
+                    product=product,
                 )
             )
         except Exception:

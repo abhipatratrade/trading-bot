@@ -42,6 +42,12 @@ class OrderRequest:
     # (stop-market when order_type is MARKET). Used by the protective
     # stop-loss layer (Decision 022).
     stop_price: Decimal | None = None
+    # Broker margin/product mode, when the venue has one. Dhan cash equity
+    # needs it per ORDER, not per client: swing-indian trades MTF (funded
+    # delivery) while intraday-indian trades INTRADAY (MIS), and both share
+    # one Dhan account and therefore one client (Decision 029). None ⇒ the
+    # broker adapter's configured default. Delta India ignores it.
+    product: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +180,30 @@ class Broker(ABC):
         commissions, and realized P&L per trade.
         """
         return []
+
+    def required_margin(  # noqa: B027
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        product: str | None = None,
+    ) -> Decimal | None:
+        """Margin the venue will actually demand for this order, or None.
+
+        Exists because a bucket's ``leverage_max`` is an *intent*, not a
+        promise: Dhan grants intraday leverage per scrip, and a name that
+        only gets 2x would have its 5x-sized order rejected by RMS at
+        placement (Decision 029). Callers size against the returned figure
+        instead of assuming the bucket's leverage was granted.
+
+        None ⇒ the venue offers no preflight, and the caller must fall back
+        to something it can guarantee (see ``BucketRunner._fit_to_margin``).
+        Default implementation is None so venues without the concept — and
+        the crypto path, where leverage IS set explicitly per position —
+        are unaffected.
+        """
+        return None
 
     def contract_size(
         self, symbol: str, default: Decimal | None = Decimal("1")

@@ -1,7 +1,15 @@
-# Position-size config for intraday-indian (NIFTY-100 Gap-Down Reversal).
+# Position-size config for intraday-indian BROAD set (Midcap150 + Smallcap100).
 #
 # backtest_ref: Backtesting Engine/strategies/optimized/nifty100_gap_reversal/
 #   results/scanners/nifty100_gap_reversal_opt_opt_full_20260719_030225.json
+#
+# ⚠️  The mu/sigma below are INHERITED from the NIFTY-100 backtest — there is no
+# midcap/smallcap backtest. They are a placeholder so the sizer has an edge
+# estimate at all; they do NOT describe this universe. In practice it does not
+# change position size, because raw Kelly (17.8) is 22x beyond the 0.20 cap, so
+# the cap sizes every trade regardless (see below). Revisit only if a real
+# broad-universe backtest lands, and note that a WORSE mu here would still not
+# shrink size until it fell ~22x.
 #
 # mu/sigma are per-TRADE (== per-day; every trade opens and squares off inside
 # one session, so one "period" is one holding period) over all 76 full-window

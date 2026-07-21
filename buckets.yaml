@@ -62,6 +62,7 @@ buckets:
     leverage_max: 4
     enabled: true    # Phase 4 — full integration (Dhan sandbox)
     account_ref: dhan
+    product: MTF             # funded delivery; CNC fallback when not MTF-eligible
     # Decision 022 (amended for swing-indian): this strategy's edge dies with
     # tight stops, so instead of the 0.5/leverage rule it rests a WIDE
     # catastrophe stop — 20% below entry, far outside the Supertrend/30-day
@@ -72,15 +73,21 @@ buckets:
   # gap-down reversal: long-only intraday fade, entries 09:30–10:30, square-off
   # 15:15. Holdout-validated PF 1.68 / +13.3% on margin.
   intraday-indian:
-    # Rs 1,00,000 (not the house Rs 50k) is a COST decision, not a conviction
-    # one: 20% per-symbol cap x 5x MIS = Rs 1L notional per trade, the size the
-    # backtest was validated at. At Rs 50k the notional halves and the edge
-    # thins against a fixed cost floor. See allocator.yaml.
-    capital_inr: 100000
+    # Rs 50,000 (house standard, user decision 2026-07-21). At the 20%
+    # per-symbol cap and 5x this gives 5 slots of Rs 50k notional each, vs the
+    # Rs 1L notional the backtest was validated at. The cost penalty is small
+    # -- the Rs 20 brokerage cap is 0.03%/leg at Rs 50k vs 0.02% at Rs 1L, so
+    # round-trip goes 0.10% -> 0.12% against a ~0.62% mean trade. The real
+    # cliff is Rs 10k (0.2%/leg), which this stays well clear of.
+    capital_inr: 50000
     broker: dhan
     leverage_max: 5          # MIS intraday
     enabled: false           # built dark — user flips this on after review
     account_ref: dhan
+    # MIS. Decision 029: NO CNC fallback here (unlike swing-indian's MTF path) —
+    # falling back would turn a 5x same-day trade into a 1x overnight DELIVERY
+    # position. An MIS-ineligible scrip must fail loudly instead.
+    product: INTRADAY
     # Entry window differs from swing-indian's 09:45: the earliest reversal
     # candle closes at 09:30 (Decision 029).
     entry_start: "09:30"

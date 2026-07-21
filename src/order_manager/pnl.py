@@ -114,3 +114,36 @@ def bucket_cumulative_pnl(
     if base <= 0:
         return pnl, None
     return pnl, pnl / base * Decimal("100")
+
+
+def bucket_ledger_pnl(
+    *,
+    capital: Decimal,
+    realized: Decimal,
+    unrealized: Decimal,
+    adjustments: Decimal = Decimal("0"),
+) -> tuple[Decimal, Decimal | None]:
+    """Cumulative bot P&L for a bucket that does NOT own its wallet.
+
+    ``bucket_cumulative_pnl`` derives P&L from mirrored wallet equity, which
+    is only meaningful when the wallet IS the bucket — true for crypto, where
+    Decision 019 gives every bucket its own Delta sub-account. Dhan has no
+    sub-accounts, so every Indian bucket mirrors the SAME account balance
+    (the reconciler already warns: "wallet mirrored into EACH bucket —
+    capital double-counted"). With two Indian buckets live, each card would
+    otherwise report the whole account's equity minus its own capital.
+
+    So for those buckets we build the P&L from the bucket's own trade ledger
+    instead of the shared balance:
+
+        pnl = realized + unrealized
+
+    which is attributable per bucket because every Trade row carries a
+    bucket_id. Returns (pnl_amount, pnl_pct_vs_capital); pct is None when the
+    capital base is not positive.
+    """
+    pnl = realized + unrealized
+    base = capital + adjustments
+    if base <= 0:
+        return pnl, None
+    return pnl, pnl / base * Decimal("100")

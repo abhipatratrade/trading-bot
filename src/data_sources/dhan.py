@@ -140,11 +140,40 @@ class DhanData(MarketData):
         from io import StringIO
 
         m = pd.read_csv(StringIO(resp.text), dtype=str, low_memory=False)
+
+        # Underlyings that have NSE derivatives. Their SM_UPPER/LOWER band is a
+        # *dynamic* (flexible) band, not a hard circuit — it widens on a cool-off
+        # rather than freezing the scrip. Non-F&O names have HARD circuits, which
+        # is what can trap an intraday position (Decision 029). Captured here so
+        # the intraday scanner can tell the two apart; measured 2026-07-21:
+        # 97/99 NIFTY-100 are F&O, vs 18/100 of NIFTY Smallcap 100.
+        fno = set(
+            m[(m["SEGMENT"] == "D") & (m["EXCH_ID"] == "NSE")]["UNDERLYING_SYMBOL"]
+            .dropna()
+            .str.strip()
+        )
+
         eq = m[m["SEGMENT"] == "E"]
         nse = eq[(eq["EXCH_ID"] == "NSE") & (eq["SERIES"] == "EQ")
                  & (eq["INSTRUMENT"] == "EQUITY")]
         bse = eq[(eq["EXCH_ID"] == "BSE") & (eq["INSTRUMENT"] == "EQUITY")
                  & (eq["SERIES"].isin(_BSE_EQUITY_SERIES))]
+
+        def _band_pct(row: object) -> str:
+            """Price-band width as a percent, from the scrip master's limits.
+
+            band = (upper - lower) / (upper + lower), i.e. the half-range about
+            the midpoint. Verified against known values: a 20% band shows
+            1073.85/715.95 → 20.0, a 10% band 1167.70/955.50 → 10.0.
+            """
+            try:
+                hi = float(row.SM_UPPER_LIMIT)
+                lo = float(row.SM_LOWER_LIMIT)
+                if hi <= 0 or lo <= 0 or hi + lo == 0:
+                    return ""
+                return f"{(hi - lo) / (hi + lo) * 100:.1f}"
+            except (TypeError, ValueError):
+                return ""
 
         out: dict[str, dict[str, str]] = {}
         seen_isin: set[str] = set()
@@ -152,7 +181,12 @@ class DhanData(MarketData):
             sym = str(r.UNDERLYING_SYMBOL).strip()
             if not sym or sym in out:
                 continue
-            out[sym] = {"security_id": str(r.SECURITY_ID), "exchange": "NSE_EQ"}
+            out[sym] = {
+                "security_id": str(r.SECURITY_ID),
+                "exchange": "NSE_EQ",
+                "fno": "1" if sym in fno else "0",
+                "band_pct": _band_pct(r),
+            }
             seen_isin.add(str(r.ISIN))
         for r in bse.itertuples(index=False):
             sym = str(r.UNDERLYING_SYMBOL).strip()
@@ -162,6 +196,32 @@ class DhanData(MarketData):
             seen_isin.add(str(r.ISIN))
         _log.info("dhan_universe_resolved", count=len(out))
         return out
+
+    def circuit_safe(self, symbol: str, min_band_pct: Decimal) -> bool:
+        """Is this scrip safe to hold intraday w.r.t. a hard circuit lock?
+
+        True when the scrip is an F&O underlying (its band is dynamic — it
+        widens after a cool-off instead of freezing) OR its hard band is at
+        least ``min_band_pct`` wide. False only for narrow-band, non-F&O
+        names, where a continued slide can lock the scrip and strand a long
+        position until the auto square-off (Decision 029).
+
+        Unknown symbol or missing band data ⇒ False (skip): for a filter whose
+        job is avoiding untradeable names, absent evidence is not evidence of
+        safety.
+        """
+        info = self.universe.get(symbol)
+        if info is None:
+            return False
+        if info.get("fno") == "1":
+            return True
+        raw = info.get("band_pct") or ""
+        if not raw:
+            return False
+        try:
+            return Decimal(raw) >= min_band_pct
+        except ArithmeticError:
+            return False
 
     def refresh_universe(self) -> int:
         """Force a scrip-master re-download (monthly, or after listing changes)."""

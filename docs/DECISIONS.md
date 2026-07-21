@@ -838,3 +838,79 @@ Consequences:
   exception above), including exact pattern name and entry bar time.
 - The bucket ships **disabled** (`enabled: false` in buckets.yaml, seeded
   `false` in migration 0009) and is switched on by hand after review.
+
+## 030 — intraday-indian: broad universe, MIS routing, shared capital, ledger P&L
+Date: 2026-07-21
+Status: Accepted (user decisions, 2026-07-21 session)
+Amends: 029 · Context: 012, 019, 021, 026, 027
+
+Five follow-ups to Decision 029, all user-chosen.
+
+**1. Capital back to the house ₹50,000.** ₹50k × 5x is a ₹2.5L notional
+ceiling, so 5 slots of ₹1L (the backtested size) is arithmetically
+impossible; `per_symbol_cap` stays 0.20, giving 5 slots × ₹50k notional.
+The cost penalty is small — the ₹20 brokerage cap is 0.03%/leg at ₹50k vs
+0.02% at ₹1L, so round-trip goes 0.10% → 0.12% against a ~0.62% mean trade
+(~3% of the edge). The real cliff is ₹10k, where brokerage alone is
+0.2%/leg; ₹50k stays well clear.
+
+**2. Broad scanner set (Midcap 150 + Smallcap 100), NOT validated.**
+Decision 026 named sets, so `scanner.yaml` stays the frozen NIFTY-100
+config and `scanner_broad.yaml` carries 235 names (the two indices minus 15
+NIFTY-100 overlaps, which would otherwise double-enter — dedup is per
+bucket+strategy+symbol and the sets run as different strategy names). The
+holdout grade PF 1.68 does NOT extend to it; the gap-reversal learnings
+call a midcap universe "a separate study; re-freeze a holdout", which has
+not been done. It runs to generate that evidence with separately
+attributable P&L. `gap_down_reversal_broad` subclasses the validated
+strategy so the entry/exit logic can never silently diverge.
+
+**3. Circuit filter — and a corrected premise.** The obvious filter ("hard
+band ≥ 20%") is actively wrong: measured 2026-07-21, only **2 of 99**
+NIFTY-100 names have a 20% band, because 97 are F&O underlyings whose
+SM_UPPER/LOWER band is *dynamic* (it widens after a cool-off rather than
+freezing). A naive width filter would have rejected the validated universe
+outright. The implemented test is **F&O underlying OR hard band ≥ 20%**,
+which excludes only 5 of the 235 broad names. Non-F&O narrow-band scrips
+are the real hazard: a continued slide can lock them, stranding a long
+until auto square-off — a tail the NIFTY-100 backtest never faced. Scrip
+metadata (`fno`, `band_pct`) now rides in the Dhan universe cache.
+
+Residual risk accepted: 82 of the 100 smallcaps are non-F&O, so even at a
+20% hard band they CAN lock intraday. The validation does not cover this.
+
+**4. MIS routing, sized to granted margin.** Dhan had no MIS path at all —
+the client was MTF-only with a CNC fallback, so this bucket would have
+routed MTF (funded delivery, ~14–18% p.a., no auto square-off). `product`
+is now per-ORDER (Dhan has one account, so both Indian buckets share one
+adapter): swing-indian sends MTF, intraday-indian sends INTRADAY. **No CNC
+fallback for INTRADAY** — falling back would convert a 5x same-day trade
+into a 1x overnight delivery position, so an MIS-ineligible scrip fails
+loudly instead.
+
+Leverage is never predicted. `Broker.required_margin` asks the venue what
+the order actually costs (Dhan `/v2/margincalculator`) and the runner fits
+size to the answer, so a scrip granted 2x is traded smaller rather than
+rejected by RMS. If the preflight is unavailable the runner sizes at **1x**
+— the only size guaranteed affordable whatever the broker grants.
+CAVEAT: the margin endpoint is unexercised against a live account as of
+2026-07-21; the first sandbox soak is its acceptance test, and until then
+the 1x fallback is what actually governs size.
+
+**5. Shared capital budget, and per-bucket P&L.** Two holes surfaced from
+one root cause — components reading a `bucket_state` mirror that only
+refreshes on the reconciler sweep:
+
+- *Sizing*: `size_positions` ran once per strategy, each sizing against the
+  full bucket capital, so two sets at `aggregate_cap: 1.00` could each claim
+  100% (200% of the bucket) in one tick. The runner now threads a running
+  `committed_margin_inr` through, and the budget is capped at
+  `min(wallet, capital)` — the raw Dhan wallet is not the bucket's money
+  (Decision 027). Slots are first-come-first-served; strategies iterate in
+  sorted filename order, so the validated set claims ahead of the broad one.
+- *Dashboard*: cumulative P&L came from mirrored wallet equity, which for
+  Indian buckets is the SAME shared Dhan balance (the reconciler already
+  warned "capital double-counted"). Latent while swing-indian was the only
+  Indian bucket. Indian buckets now use `bucket_ledger_pnl` — realized +
+  unrealized from that bucket's own Trade rows. Crypto keeps the wallet
+  mirror, which is correct there (Decision 019 sub-accounts).

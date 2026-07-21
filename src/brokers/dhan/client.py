@@ -189,21 +189,30 @@ class DhanClient(Broker):
     # ── Broker interface ────────────────────────────────────────────────
     def place_order(self, request: OrderRequest) -> OrderResult:
         security_id, exchange = self._resolve(request.symbol)
-        body = self._order_body(request, security_id, exchange, self._product_type)
+        # Product is per-ORDER (Decision 029): swing-indian sends MTF and
+        # intraday-indian sends INTRADAY through this same client, because
+        # Dhan has one account and therefore one adapter instance.
+        product_type = request.product or self._product_type
+        body = self._order_body(request, security_id, exchange, product_type)
 
         self._log.info(
             "placing_order",
             symbol=request.symbol,
             side=request.side,
             size=str(request.size),
-            product=self._product_type,
+            product=product_type,
             stop=str(request.stop_price) if request.stop_price is not None else None,
         )
         try:
             result = self._request("POST", "/v2/orders", body)
         except DhanAPIError:
             # MTF-ineligible scrips reject; retry once as CNC (1× delivery).
-            if self._product_type == "MTF" and self._mtf_fallback_cnc:
+            # NOT applied to INTRADAY: falling an intraday trade back to CNC
+            # would silently turn a 5x same-day position into a 1x DELIVERY
+            # position — a different product, a different risk profile, and
+            # an overnight holding the strategy never asked for. An
+            # MIS-ineligible scrip must fail loudly instead.
+            if product_type == "MTF" and self._mtf_fallback_cnc:
                 self._log.warning("mtf_rejected_retry_cnc", symbol=request.symbol)
                 body = self._order_body(request, security_id, exchange, "CNC")
                 result = self._request("POST", "/v2/orders", body)
@@ -240,7 +249,7 @@ class DhanClient(Broker):
             "dhanClientId": self._client_id,
             "transactionType": request.side.upper(),  # BUY | SELL
             "exchangeSegment": exchange,               # NSE_EQ | BSE_EQ
-            "productType": product_type,               # MTF | CNC
+            "productType": product_type,               # MTF | CNC | INTRADAY
             "orderType": order_type,
             "validity": "DAY",
             "securityId": security_id,
@@ -335,6 +344,58 @@ class DhanClient(Broker):
         if symbol is not None:
             orders = [o for o in orders if o.symbol == symbol]
         return orders
+
+    def required_margin(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        product: str | None = None,
+    ) -> Decimal | None:
+        """Ask Dhan what margin this order needs (``/v2/margincalculator``).
+
+        Intraday leverage is per-scrip, so this is the only honest way to know
+        the size we can actually afford — we never predict a multiple, we ask
+        for the rupee figure and fit to it.
+
+        Returns None on ANY failure (endpoint unavailable, unparseable, scrip
+        unresolvable). None means "unknown", and the caller must degrade to a
+        guaranteed-affordable size rather than assume the bucket's leverage
+        was granted.
+
+        NOTE: unexercised against a live Dhan account as of 2026-07-21 —
+        nothing in this repo or ``scripts/dhan-scanner/`` has called it. Treat
+        the first sandbox soak as its acceptance test; until then the caller's
+        1x fallback is what actually governs size.
+        """
+        try:
+            security_id, exchange = self._resolve(symbol)
+            result = self._request(
+                "POST",
+                "/v2/margincalculator",
+                {
+                    "dhanClientId": self._client_id,
+                    "exchangeSegment": exchange,
+                    "transactionType": side.upper(),
+                    "quantity": int(quantity),
+                    "productType": product or self._product_type,
+                    "securityId": security_id,
+                    "price": float(price),
+                },
+            )
+            if not isinstance(result, dict):
+                return None
+            raw = result.get("totalMargin", result.get("total_margin"))
+            if raw is None:
+                return None
+            margin = Decimal(str(raw))
+            return margin if margin > 0 else None
+        except Exception:
+            self._log.warning(
+                "margin_preflight_failed", symbol=symbol, exc_info=True
+            )
+            return None
 
     def set_leverage(self, symbol: str, leverage: Decimal) -> None:
         # MTF is a fixed broker-funded multiple; there is no per-order leverage

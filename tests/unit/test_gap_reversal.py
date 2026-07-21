@@ -9,15 +9,22 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from src.brokers.base import OrderRequest
 from src.data_sources.base import OHLCVBar
+from src.order_manager.pnl import bucket_cumulative_pnl, bucket_ledger_pnl
+from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import TradingType, load_bucket
 from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
 from src.shared.scanner import gap_reversal as gr
 from src.shared.scanner import indicators as ind
 from src.shared.scanner.engine import load_scanner_config
 from src.shared.scanner.patterns import pattern_flags
+from src.shared.strategy_master.loader import load_strategy_master
 from src.strategies.intraday.indian.strategies.gap_down_reversal import (
     GapDownReversal,
+)
+from src.strategies.intraday.indian.strategies.gap_down_reversal_broad import (
+    GapDownReversalBroad,
 )
 
 _SCANNER_YAML = Path("src/strategies/intraday/indian/scanner.yaml")
@@ -300,8 +307,9 @@ def test_bucket_config_is_wired() -> None:
     b = load_bucket("intraday-indian")
     assert b.trading_type is TradingType.INTRADAY
     assert b.config.broker.value == "dhan"
-    # Rs 1L is load-bearing: 20% cap x 5x = Rs 1L notional, the validated size.
-    assert b.config.capital_inr == Decimal("100000")
+    # 20% cap x 5x on this capital sets the per-trade notional; see
+    # allocator.yaml for why Rs 50k stays clear of the cost cliff.
+    assert b.config.capital_inr == Decimal("50000")
     assert b.config.leverage_max == Decimal("5")
     assert b.config.entry_start == "09:30"
     assert not b.config.enabled, "ships dark; user flips it on"
@@ -336,3 +344,104 @@ def test_entry_window_is_per_bucket() -> None:
         )
         is NseSession.OPEN_NO_ENTRY
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-scanner set (Decision 026 + 029)
+# ---------------------------------------------------------------------------
+def test_two_scanner_sets_are_wired_and_disjoint() -> None:
+    b = load_bucket("intraday-indian")
+    master = load_strategy_master(
+        b.strategy_master_csv_path, b.trading_type.value
+    )
+    assert {(r.strategy_name, r.scanner) for r in master.rows} == {
+        ("gap_down_reversal", ""),
+        ("gap_down_reversal_broad", "broad"),
+    }
+    narrow = set(load_scanner_config(b.scanner_yaml_path_for("")).symbols)
+    broad = set(load_scanner_config(b.scanner_yaml_path_for("broad")).symbols)
+    # Overlap would double-enter the same name: dedup is per
+    # (bucket, strategy, symbol) and these run as two different strategies.
+    assert not (narrow & broad), sorted(narrow & broad)[:5]
+
+
+def test_broad_set_shares_the_strategy_logic() -> None:
+    """The broad set must be the SAME strategy, so fixes can't diverge."""
+    assert issubclass(GapDownReversalBroad, GapDownReversal)
+    assert GapDownReversalBroad.tf == GapDownReversal.tf
+    assert GapDownReversalBroad.name != GapDownReversal.name
+
+
+def test_only_the_broad_set_screens_circuit_bands() -> None:
+    """NIFTY-100 is ~all F&O, so a band filter there would be noise."""
+    b = load_bucket("intraday-indian")
+    narrow = gr.GapReversalConfig.from_scanner_config(
+        load_scanner_config(b.scanner_yaml_path_for(""))
+    )
+    broad = gr.GapReversalConfig.from_scanner_config(
+        load_scanner_config(b.scanner_yaml_path_for("broad"))
+    )
+    assert narrow.min_circuit_band_pct == 0
+    assert broad.min_circuit_band_pct == Decimal("20.0")
+    # Signal thresholds must stay identical — only the universe differs.
+    assert broad.gap_min_pct == narrow.gap_min_pct
+    assert broad.gap_max_pct == narrow.gap_max_pct
+    assert broad.first15_body_atr_frac == narrow.first15_body_atr_frac
+
+
+# ---------------------------------------------------------------------------
+# Shared capital budget across scanner sets
+# ---------------------------------------------------------------------------
+def test_bucket_capital_supports_exactly_five_slots() -> None:
+    """20% cap × 5 = 100% of capital; the two sets share those 5 slots."""
+    b = load_bucket("intraday-indian")
+    alloc = load_allocator_config(b.allocator_yaml_path)
+    per_trade_margin = b.config.capital_inr * alloc.per_symbol_cap
+    assert per_trade_margin == Decimal("10000")
+    assert per_trade_margin * b.config.leverage_max == Decimal("50000")
+    assert alloc.per_symbol_cap * 5 == alloc.aggregate_cap
+
+
+# ---------------------------------------------------------------------------
+# Product routing (MIS)
+# ---------------------------------------------------------------------------
+def test_intraday_routes_mis_and_swing_routes_mtf() -> None:
+    assert load_bucket("intraday-indian").config.product == "INTRADAY"
+    assert load_bucket("swing-indian").config.product == "MTF"
+
+
+def test_order_request_carries_product() -> None:
+    req = OrderRequest(
+        symbol="X", side="buy", size=Decimal("1"), product="INTRADAY"
+    )
+    assert req.product == "INTRADAY"
+    assert OrderRequest(symbol="X", side="buy", size=Decimal("1")).product is None
+
+
+# ---------------------------------------------------------------------------
+# Per-bucket P&L ledger (shared Dhan wallet)
+# ---------------------------------------------------------------------------
+def test_ledger_pnl_is_independent_of_the_shared_wallet() -> None:
+    """Two Indian buckets on one Dhan account must not report each other's P&L.
+
+    The wallet-mirror form double-counts (the reconciler warns about exactly
+    this); the ledger form is built from the bucket's own trades.
+    """
+    shared_wallet = Decimal("1000000")  # Dhan sandbox: same figure for both
+    wallet_a, _ = bucket_cumulative_pnl(
+        capital=Decimal("50000"), available=shared_wallet, locked=Decimal("0")
+    )
+    wallet_b, _ = bucket_cumulative_pnl(
+        capital=Decimal("50000"), available=shared_wallet, locked=Decimal("0")
+    )
+    assert wallet_a == wallet_b == Decimal("950000")  # both wrong, identically
+
+    ledger_a, pct_a = bucket_ledger_pnl(
+        capital=Decimal("50000"), realized=Decimal("1200"), unrealized=Decimal("-300")
+    )
+    ledger_b, _ = bucket_ledger_pnl(
+        capital=Decimal("50000"), realized=Decimal("0"), unrealized=Decimal("0")
+    )
+    assert ledger_a == Decimal("900")
+    assert ledger_b == Decimal("0")
+    assert pct_a == Decimal("1.8")

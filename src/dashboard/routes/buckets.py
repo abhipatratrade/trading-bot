@@ -32,9 +32,13 @@ from src.core.models import (
     RegimeSnapshot,
     Trade,
 )
-from src.order_manager.pnl import bucket_cumulative_pnl, realized_totals
+from src.order_manager.pnl import (
+    bucket_cumulative_pnl,
+    bucket_ledger_pnl,
+    realized_totals,
+)
 from src.shared.allocator.sizer import load_allocator_config
-from src.shared.bucket import Bucket, load_buckets
+from src.shared.bucket import Bucket, Market, load_buckets
 from src.shared.strategy_loader import discover_strategies
 from src.shared.strategy_master.loader import load_strategy_master
 
@@ -84,7 +88,7 @@ def _build_cards() -> list[dict[str, object]]:
     for b in buckets:
         st = states.get(b.id)
         rg = regimes.get(b.id)
-        pnl_amt, pnl_pct = _bucket_pnl(b.config.capital_inr, st)
+        pnl_amt, pnl_pct = _bucket_pnl(b, st)
         cards.append(
             {
                 "id": b.id,
@@ -107,14 +111,47 @@ def _build_cards() -> list[dict[str, object]]:
     return cards
 
 
+def _trade_ledger_pnl(bucket_id: str) -> tuple[Decimal, Decimal]:
+    """``(realized, unrealized)`` from this bucket's own Trade rows.
+
+    Realized stamps land on BOTH legs of a round-trip, so only the reduce-only
+    (exit) leg is counted. Unrealized is stamped on entry legs still open on
+    the exchange (reconciler pass 3).
+    """
+    realized = Decimal("0")
+    unrealized = Decimal("0")
+    with session_scope() as session:
+        for t in session.execute(
+            select(Trade).where(Trade.bucket_id == bucket_id)
+        ).scalars():
+            e = t.extra or {}
+            raw = e.get("pnl_usd")
+            if raw is None:
+                continue
+            try:
+                val = Decimal(str(raw))
+            except ArithmeticError:
+                continue
+            if e.get("pnl_kind") == "realized" and e.get("reduce_only"):
+                realized += val
+            elif e.get("pnl_kind") == "unrealized" and not e.get("reduce_only"):
+                unrealized += val
+    return realized, unrealized
+
+
 def _bucket_pnl(
-    capital: Decimal, state: BucketState | None
+    bucket: Bucket, state: BucketState | None
 ) -> tuple[float | None, float | None]:
     """Cumulative bot P&L for a bucket (floats for template rendering).
 
-    Wallet equity (synced by the reconciler, Decision 021) minus the
+    Crypto: wallet equity (synced by the reconciler, Decision 021) minus the
     capital seed, adjusted by any manual deposits/withdrawals recorded in
-    ``bucket_state.extra["capital_adjustments_inr"]``.
+    ``bucket_state.extra["capital_adjustments_inr"]``. Sound because Decision
+    019 gives each crypto bucket its own sub-account, so wallet == bucket.
+
+    Indian: Dhan has no sub-accounts, so several buckets mirror the SAME
+    wallet and equity cannot be attributed that way (Decision 029). P&L comes
+    from the bucket's own trade ledger instead — see ``bucket_ledger_pnl``.
     """
     if state is None:
         return None, None
@@ -125,12 +162,21 @@ def _bucket_pnl(
             adjustments = Decimal(str(raw_adj))
         except ArithmeticError:
             pass
-    amt, pct = bucket_cumulative_pnl(
-        capital=capital,
-        available=state.available_balance_inr,
-        locked=state.locked_margin_inr,
-        adjustments=adjustments,
-    )
+    if bucket.market == Market.INDIAN:
+        realized, unrealized = _trade_ledger_pnl(bucket.id)
+        amt, pct = bucket_ledger_pnl(
+            capital=bucket.config.capital_inr,
+            realized=realized,
+            unrealized=unrealized,
+            adjustments=adjustments,
+        )
+    else:
+        amt, pct = bucket_cumulative_pnl(
+            capital=bucket.config.capital_inr,
+            available=state.available_balance_inr,
+            locked=state.locked_margin_inr,
+            adjustments=adjustments,
+        )
     return float(amt), (float(pct) if pct is not None else None)
 
 
@@ -282,7 +328,7 @@ def bucket_detail(bucket_id: str, request: Request):
             }
         )
 
-    pnl_amt, pnl_pct = _bucket_pnl(bucket.config.capital_inr, state)
+    pnl_amt, pnl_pct = _bucket_pnl(bucket, state)
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request,

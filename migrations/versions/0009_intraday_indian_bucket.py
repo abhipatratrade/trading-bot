@@ -3,10 +3,10 @@
 Seventh bucket, amending Decision 013's fixed six. NIFTY-100 gap-down
 reversal — long-only intraday fade, holdout-validated PF 1.68.
 
-Capital is Rs 1,00,000 rather than the house Rs 50,000: at the frozen
-config's 20% per-symbol cap and 5x MIS that yields Rs 1L notional per
-trade, the size the backtest was validated at (the edge does not clear
-the cost floor at Rs 10k, and thins at Rs 50k).
+Capital is the house Rs 50,000 (user decision 2026-07-21). At the frozen
+config's 20% per-symbol cap and 5x that is 5 slots of Rs 50k notional,
+vs the Rs 1L the backtest used; the extra cost is ~0.02% round-trip,
+well clear of the Rs 10k cliff where brokerage becomes 0.2%/leg.
 
 Seeded with enabled=false to match buckets.yaml — the bucket is built
 dark and switched on by hand after review.
@@ -37,7 +37,7 @@ def upgrade() -> None:
     op.execute(
         "INSERT INTO bucket_state "
         "(bucket_id, capital_inr, available_balance_inr, locked_margin_inr, enabled) "
-        "VALUES ('intraday-indian', 100000, 100000, 0, false) "
+        "VALUES ('intraday-indian', 50000, 50000, 0, false) "
         "ON CONFLICT (bucket_id) DO NOTHING"
     )
 

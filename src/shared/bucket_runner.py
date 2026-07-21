@@ -292,6 +292,13 @@ class BucketRunner:
         skipped_counts: dict[SizingDecision, int] = {}
         eligible: list[str] = []
         blocked: dict[str, str] = {}
+        # Margin claimed so far THIS TICK across every strategy in this bucket.
+        # Strategies are iterated in sorted filename order, so the claim order
+        # is deterministic — and for intraday-indian it usefully favours the
+        # validated NIFTY-100 set (``gap_down_reversal``) over the broader
+        # experimental one (``gap_down_reversal_broad``) when both signal on
+        # the same bar and there are not enough slots for both.
+        committed_margin = Decimal("0")
 
         for strat_name, strat_cls in self.strategies.items():
             row = self.master.by_name.get(strat_name)
@@ -364,17 +371,41 @@ class BucketRunner:
                 # (1d → 23h, 1h → ~57 min), not a hardcoded 23h.
                 dedup_window_hours=dedup_window_hours_for_tf(row.tf),
                 contract_sizes_override=live_contract_sizes,
+                # Decision 026 + 029: strategies in this bucket share ONE
+                # capital pool, but each has its own allocator config and
+                # they all read the same (sweep-stale) bucket_state. Pass
+                # what earlier strategies already claimed this tick so slots
+                # go first-come-first-served instead of every scanner set
+                # independently claiming the whole bucket.
+                committed_margin_inr=committed_margin,
             )
 
             for sym, res in results.items():
                 if res.decision == SizingDecision.PLACED:
+                    committed_margin += res.required_margin_inr
+                    size = self._fit_to_margin(
+                        broker=broker,
+                        symbol=sym,
+                        side=sides.get(sym, "buy"),
+                        size=res.contracts,
+                        price=mark_prices.get(sym),
+                        margin_budget=res.required_margin_inr,
+                    )
+                    if size < 1:
+                        _log.warning(
+                            "open_skipped_margin_unaffordable",
+                            bucket_id=self.bucket.id,
+                            symbol=sym,
+                            margin_budget=str(res.required_margin_inr),
+                        )
+                        continue
                     self._place_order(
                         broker=broker,
                         om=order_manager,
                         strat_name=strat_name,
                         symbol=sym,
                         side=sides.get(sym, "buy"),
-                        size=res.contracts,
+                        size=size,
                     )
                     placed += 1
                 else:
@@ -602,10 +633,67 @@ class BucketRunner:
                 out[s] = price
         return out
 
+    def _fit_to_margin(
+        self,
+        *,
+        broker: Broker,
+        symbol: str,
+        side: str,
+        size: Decimal,
+        price: Decimal | None,
+        margin_budget: Decimal,
+    ) -> Decimal:
+        """Shrink ``size`` until the venue's real margin fits ``margin_budget``.
+
+        ``leverage_max`` is what the bucket WANTS; Dhan grants intraday
+        leverage per scrip, so a name capped at 2x would have its 5x-sized
+        order rejected outright by RMS (Decision 029). Rather than predict the
+        multiple, ask for the rupee margin and scale to it.
+
+        Degradation is deliberately conservative. If the venue offers no
+        preflight (``required_margin`` → None), we fall back to sizing as if
+        leverage were 1x — the only size guaranteed affordable whatever the
+        broker grants. Undersized beats rejected, and badly beats accidentally
+        over-levered.
+        """
+        if price is None or price <= 0 or size <= 0:
+            return size
+        needed = broker.required_margin(
+            symbol, side, size, price, product=self.bucket.config.product
+        )
+        if needed is None:
+            # Unknown → assume no leverage is granted.
+            affordable = margin_budget / price
+            fitted = min(size, affordable).to_integral_value(rounding="ROUND_DOWN")
+            if fitted < size:
+                _log.warning(
+                    "margin_preflight_unavailable_sizing_at_1x",
+                    bucket_id=self.bucket.id,
+                    symbol=symbol,
+                    wanted=str(size),
+                    fitted=str(fitted),
+                )
+            return fitted
+        if needed <= margin_budget:
+            return size
+        scaled = (size * margin_budget / needed).to_integral_value(
+            rounding="ROUND_DOWN"
+        )
+        _log.warning(
+            "position_resized_to_granted_margin",
+            bucket_id=self.bucket.id,
+            symbol=symbol,
+            wanted=str(size),
+            fitted=str(scaled),
+            margin_needed=str(needed),
+            margin_budget=str(margin_budget),
+        )
+        return scaled
+
     def _place_order(
         self,
         *,
-        broker: Broker,  # noqa: ARG002 — passed for parity / future hooks
+        broker: Broker,
         om: OrderManager,
         strat_name: str,
         symbol: str,
@@ -622,6 +710,7 @@ class BucketRunner:
                 size=size,
                 order_type=OrderType.MARKET,
                 leverage=self.bucket.config.leverage_max,
+                product=self.bucket.config.product,
                 intent_id=f"open-{self._clock.now().strftime('%Y%m%d%H%M')}",
             )
         except KillSwitchEngagedError:
