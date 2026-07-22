@@ -32,7 +32,7 @@ from src.core.models import AuditEventType, AuditLog, BrokerName
 from src.data_sources.base import MarketData
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
-from src.data_sources.dhan import DhanData
+from src.data_sources.dhan import BOT_REQUEST_DELAY_SECONDS, DhanData
 from src.data_sources.symbol_loader import (
     DEFAULT_CSV,
     fetch_mappings,
@@ -199,7 +199,13 @@ def main() -> None:
                 stop_pcts[bucket.id] = bucket.config.stop_loss_pct
     if dhan_accounts:
         try:
-            dhan_data = DhanData.from_settings(settings)
+            # Pace charts calls under Dhan's 5 req/s Data-API cap: the
+            # intraday-indian morning scan fetches ~2 calls/symbol across the
+            # NIFTY-100 (Decision 029). Single-fetch paths (swing exits) only
+            # eat the small per-call delay.
+            dhan_data = DhanData.from_settings(
+                settings, request_delay_seconds=BOT_REQUEST_DELAY_SECONDS
+            )
             for ref, ref_bucket_ids in dhan_accounts.items():
                 client = DhanClient.from_settings(
                     dhan_data.resolve,

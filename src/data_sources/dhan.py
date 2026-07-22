@@ -48,6 +48,31 @@ _INTRADAY_MINUTES: dict[str, str] = {
     "1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60",
 }
 
+# Charts-endpoint 429 backoff (Dhan Data API cap: 5 req/s). Attempts include
+# the first try; base × 2^attempt, capped, unless the response carries a
+# Retry-After header (honoured verbatim).
+_CHARTS_MAX_ATTEMPTS = 5
+_CHARTS_BACKOFF_BASE = 0.5
+_CHARTS_BACKOFF_MAX = 8.0
+
+# Per-request pace for the LIVE bot's Dhan client so the 99-symbol intraday
+# scan stays under 5 req/s (0.22s ≈ 4.5/s, leaving headroom for jitter). NOT
+# applied to the prepare job, which builds its own client and mostly uses the
+# bulk-quote endpoint.
+BOT_REQUEST_DELAY_SECONDS = 0.22
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Parse a ``Retry-After`` header (delta-seconds form) into seconds."""
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        secs = float(raw)
+    except ValueError:
+        return None
+    return secs if secs >= 0 else None
+
 
 class DhanData(MarketData):
     """Synchronous REST client for Dhan equity market data."""
@@ -71,7 +96,19 @@ class DhanData(MarketData):
         self._req_delay = request_delay_seconds
 
     @classmethod
-    def from_settings(cls, settings: Settings | None = None) -> DhanData:
+    def from_settings(
+        cls,
+        settings: Settings | None = None,
+        *,
+        request_delay_seconds: float = 0.0,
+    ) -> DhanData:
+        """Build a DhanData from settings.
+
+        ``request_delay_seconds`` paces every charts call. The live bot passes
+        a small value so the intraday scan stays under Dhan's 5 req/s cap
+        (Decision 029); the prepare job leaves it at 0 because it fetches via
+        the bulk-quote endpoint, not per-symbol charts.
+        """
         s = settings or get_settings()
         acct = s.dhan_account()
         token = DhanTokenManager(
@@ -80,7 +117,11 @@ class DhanData(MarketData):
             totp_secret=acct.totp_secret,
             static_token=acct.data_token,
         )
-        return cls(token_manager=token, data_base_url=acct.data_base_url)
+        return cls(
+            token_manager=token,
+            data_base_url=acct.data_base_url,
+            request_delay_seconds=request_delay_seconds,
+        )
 
     @property
     def token_manager(self) -> DhanTokenManager:
@@ -300,24 +341,56 @@ class DhanData(MarketData):
         return self._parse_candles(self._charts("intraday", payload))
 
     def _charts(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        r = self._http.post(
-            f"{self._base}/v2/charts/{endpoint}",
-            json=payload,
-            headers={"access-token": self._token.token(),
-                     "Content-Type": "application/json"},
-        )
-        if r.status_code == 401:  # token expired mid-flight → refresh once
-            self._token.invalidate()
+        """POST a charts request, resilient to token expiry AND rate limits.
+
+        Dhan's Data API caps the historical/intraday charts endpoint at
+        **5 requests/second** (confirmed from the API docs). The intraday
+        scan fetches ~2 calls/symbol across a 99-name universe, so without
+        both a per-request pace (``request_delay_seconds``, set for the live
+        bot) AND a 429 backoff here, most of the morning cut 429'd and the
+        scan silently saw an almost-empty universe (observed live 2026-07-22:
+        95/99 symbols failed). The pace keeps us under the limit; this retry
+        absorbs the occasional overflow and any burst from other callers
+        sharing the client.
+        """
+        url = f"{self._base}/v2/charts/{endpoint}"
+        headers = {"Content-Type": "application/json"}
+        refreshed = False
+        last: httpx.Response | None = None
+        for attempt in range(_CHARTS_MAX_ATTEMPTS):
+            if self._req_delay:
+                time.sleep(self._req_delay)  # pace BEFORE the call, not after
             r = self._http.post(
-                f"{self._base}/v2/charts/{endpoint}",
+                url,
                 json=payload,
-                headers={"access-token": self._token.token(),
-                         "Content-Type": "application/json"},
+                headers={**headers, "access-token": self._token.token()},
             )
-        r.raise_for_status()
-        if self._req_delay:
-            time.sleep(self._req_delay)
-        return r.json()
+            last = r
+            if r.status_code == 401 and not refreshed:
+                # Token expired mid-flight → refresh once and retry immediately.
+                self._token.invalidate()
+                refreshed = True
+                continue
+            if r.status_code == 429:
+                wait = _retry_after_seconds(r)
+                if wait is None:
+                    wait = min(
+                        _CHARTS_BACKOFF_BASE * (2**attempt), _CHARTS_BACKOFF_MAX
+                    )
+                _log.warning(
+                    "dhan_charts_rate_limited",
+                    endpoint=endpoint,
+                    attempt=attempt + 1,
+                    wait_seconds=round(wait, 2),
+                )
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        # Attempts exhausted — surface the last failure with its real status.
+        assert last is not None
+        last.raise_for_status()
+        return last.json()
 
     @staticmethod
     def _parse_candles(data: dict[str, Any]) -> list[OHLCVBar]:
