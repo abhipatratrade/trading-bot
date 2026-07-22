@@ -136,3 +136,103 @@ def test_refresh_without_exp_does_not_churn() -> None:
     assert mgr.token() == "opaque-token-no-jwt"
     assert mgr.token() == "opaque-token-no-jwt"
     assert len(http.calls) == 1  # no exp → no proactive refresh
+
+
+# ── Refresh hardening (Decision 029): retry + last-good fallback ─────────
+import time as _time_mod  # noqa: E402
+
+import httpx  # noqa: E402
+
+from src.brokers.dhan.auth import _REFRESH_ATTEMPTS  # noqa: E402
+
+
+class _FlakyHttp:
+    """Mint endpoint that fails the first ``fail_first`` calls, then succeeds.
+
+    ``fail_mode``: "no_token" (200 but empty body) or "http" (raise_for_status).
+    """
+
+    def __init__(self, tokens: list[str], fail_first: int, fail_mode: str) -> None:
+        self._tokens = list(tokens)
+        self._fail_first = fail_first
+        self._fail_mode = fail_mode
+        self.calls = 0
+
+    def post(self, url: str, params: dict[str, object] | None = None) -> object:
+        self.calls += 1
+        if self.calls <= self._fail_first:
+            if self._fail_mode == "no_token":
+                return _FakeResp({"message": "Invalid TOTP"})
+            resp = httpx.Response(429, request=httpx.Request("POST", url))
+
+            class _R:
+                text = "rate limited"
+
+                @staticmethod
+                def raise_for_status() -> None:
+                    resp.raise_for_status()
+
+                @staticmethod
+                def json() -> dict[str, object]:
+                    return {}
+
+            return _R()
+        return _FakeResp({"accessToken": self._tokens.pop(0)})
+
+
+def _mgr(http: object, clock_val: float = 1_000_000.0) -> DhanTokenManager:
+    return DhanTokenManager(
+        client_id="C",
+        pin="1234",
+        totp_secret=_TOTP_SECRET,
+        http=http,  # type: ignore[arg-type]
+        clock=lambda: clock_val,
+    )
+
+
+def test_refresh_retries_with_fresh_totp_then_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    good = _fake_jwt(2_000_000)  # far-future expiry
+    http = _FlakyHttp([good], fail_first=2, fail_mode="no_token")
+    mgr = _mgr(http)
+    assert mgr.token() == good
+    assert http.calls == 3  # two Invalid-TOTP, then a mint
+
+
+def test_transient_failure_falls_back_to_cached_token(monkeypatch) -> None:
+    """The 2026-07-22 bug: a good token, a spurious 401, a mint on cooldown."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    good = _fake_jwt(2_000_000)
+    # First call mints the good token; later re-mints all fail (cooldown).
+    http = _FlakyHttp([good], fail_first=0, fail_mode="no_token")
+    mgr = _mgr(http)
+    assert mgr.token() == good  # initial mint
+
+    # Simulate a spurious 401: client invalidates, then the mint is down.
+    http._fail_first = 99  # every subsequent mint now fails
+    mgr.invalidate()
+    # Must NOT raise — the cached token is still valid, so serve it.
+    assert mgr.token() == good
+    assert http.calls == 1 + _REFRESH_ATTEMPTS  # initial + the failed retries
+
+
+def test_no_cached_token_and_refresh_fails_raises(monkeypatch) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    http = _FlakyHttp([], fail_first=99, fail_mode="no_token")
+    mgr = _mgr(http)  # cold start, no last-good token
+    with pytest.raises(RuntimeError, match="no valid cached token"):
+        mgr.token()
+
+
+def test_expired_cached_token_is_not_served(monkeypatch) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    short = _fake_jwt(1_000_030)  # expires 30s after clock → inside the 60s guard
+    http = _FlakyHttp([short], fail_first=0, fail_mode="no_token")
+    mgr = _mgr(http, clock_val=1_000_000.0)
+    assert mgr.token() == short  # mint ok
+
+    http._fail_first = 99
+    mgr.invalidate()
+    # Cached token is within 60s of expiry → must refuse, not serve it stale.
+    with pytest.raises(RuntimeError, match="no valid cached token"):
+        mgr.token()
