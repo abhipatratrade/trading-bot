@@ -89,6 +89,11 @@ class OrderManager:
         self._clock = clock or RealClock()
         self._log = get_logger("order_manager")
 
+    @property
+    def broker_name(self) -> BrokerName:
+        """The broker this manager places orders on."""
+        return self._broker_name
+
     # ── Public API ──────────────────────────────────────────────────
 
     def place_order(

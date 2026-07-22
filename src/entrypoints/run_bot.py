@@ -227,6 +227,9 @@ def main() -> None:
                     clock,
                     bucket_ids=ref_bucket_ids,
                     bucket_fx={b: Decimal("1") for b in ref_bucket_ids},
+                    # The Dhan account is SHARED with the user's manual trading
+                    # (Decision 027) — only manage positions the bot opened.
+                    shared_account=True,
                 )
                 accounts[ref] = ref_bucket_ids  # breakers/stops/reconcile loops
                 data_by_ref[ref] = dhan_data
@@ -326,6 +329,7 @@ def main() -> None:
                     order_manager=order_managers[ref],
                     stop_pct_by_bucket=pcts,
                     clock=clock,
+                    shared_account=ref in dhan_accounts,
                 )
             except Exception:
                 _log.error(
@@ -397,6 +401,7 @@ def main() -> None:
                     min_liq_distance_pct=liq_pct,
                     max_funding_rate=funding_max,
                     clock=clock,
+                    shared_account=ref in dhan_accounts,
                 )
             except Exception:
                 _log.error(

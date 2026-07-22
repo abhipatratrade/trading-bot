@@ -258,3 +258,79 @@ def test_delta_stop_order_body() -> None:
     assert captured["stop_trigger_method"] == "mark_price"
     assert captured["reduce_only"] == "true"
     assert captured["order_type"] == "market_order"
+
+
+# ── Shared-account scoping (Decision 027 followup, 2026-07-22 incident) ──
+_DHAN_PCTS = {"intraday-indian": Decimal("15")}
+_DHAN_ATTR = {"RELIANCE": ("intraday-indian", "gap_down_reversal")}
+
+
+def _eqpos(symbol: str, size: str = "100", entry: str = "1000") -> PositionInfo:
+    return PositionInfo(
+        symbol=symbol, side="long", size=Decimal(size), entry_price=Decimal(entry)
+    )
+
+
+def test_shared_skips_user_position_entirely() -> None:
+    """A position the bot doesn't own gets NO stop (the 2026-07-22 bug)."""
+    plan = plan_stop_protection(
+        positions=[_eqpos("NIFTY-OPT-CE")],   # user's manual position
+        open_orders=[],
+        stop_pct_by_bucket=_DHAN_PCTS,
+        attribution={},                        # not attributed to any bucket
+        owned_quantities={},                   # bot owns nothing
+    )
+    assert plan.place == []
+    assert plan.cancel == []
+    assert plan.unprotectable == []
+
+
+def test_shared_protects_only_bot_position() -> None:
+    plan = plan_stop_protection(
+        positions=[_eqpos("RELIANCE"), _eqpos("NIFTY-OPT-CE")],
+        open_orders=[],
+        stop_pct_by_bucket=_DHAN_PCTS,
+        attribution=_DHAN_ATTR,
+        owned_quantities={"RELIANCE": Decimal("100")},
+    )
+    assert [p.symbol for p in plan.place] == ["RELIANCE"]
+    assert plan.place[0].size == Decimal("100")
+
+
+def test_shared_never_cancels_user_resting_stop() -> None:
+    """The user's own resting stop on an unowned symbol must be left alone."""
+    user_stop = _stop(symbol="NIFTY-OPT-CE", side="sell", size="75", oid="u1")
+    plan = plan_stop_protection(
+        positions=[_eqpos("NIFTY-OPT-CE", size="75")],
+        open_orders=[user_stop],
+        stop_pct_by_bucket=_DHAN_PCTS,
+        attribution={},
+        owned_quantities={},
+    )
+    assert plan.cancel == [], "must not cancel the user's stop"
+    assert plan.place == []
+
+
+def test_shared_caps_stop_size_to_bot_quantity() -> None:
+    """Bot holds 100, exchange shows 150 (user also long 50) → stop only 100."""
+    plan = plan_stop_protection(
+        positions=[_eqpos("RELIANCE", size="150")],
+        open_orders=[],
+        stop_pct_by_bucket=_DHAN_PCTS,
+        attribution=_DHAN_ATTR,
+        owned_quantities={"RELIANCE": Decimal("100")},
+    )
+    assert len(plan.place) == 1
+    assert plan.place[0].size == Decimal("100"), "never cover the user's 50"
+
+
+def test_exclusive_account_unchanged_without_owned() -> None:
+    """owned_quantities=None (crypto) → every position protected, as before."""
+    plan = plan_stop_protection(
+        positions=[_pos()],
+        open_orders=[],
+        stop_pct_by_bucket=PCTS,
+        attribution=ATTR,
+        owned_quantities=None,
+    )
+    assert [p.symbol for p in plan.place] == ["BTCUSD"]

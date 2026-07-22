@@ -39,6 +39,7 @@ from src.core.db import session_scope
 from src.core.logging import get_logger
 from src.core.models import Position, PositionSide
 from src.order_manager.manager import OrderManager
+from src.order_manager.ownership import bot_owned_quantities
 
 _log = get_logger("safety.stop_protection")
 
@@ -99,6 +100,7 @@ def plan_stop_protection(
     stop_pct_by_bucket: dict[str, Decimal],
     attribution: dict[str, tuple[str | None, str | None]],
     tick_sizes: dict[str, Decimal | None] | None = None,
+    owned_quantities: dict[str, Decimal] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -111,9 +113,18 @@ def plan_stop_protection(
             Position rows; unattributed symbols fall back to the account's
             most conservative (smallest) pct.
         tick_sizes: ``symbol → tick`` for trigger snapping (None ⇒ no snap).
+        owned_quantities: SHARED-account guard (Decision 027 followup). When
+            provided (Dhan — the account also holds the user's manual trades),
+            ONLY symbols present here are the bot's; any other position is the
+            user's and is left completely alone — no stop placed, and its own
+            resting stops never cancelled. The stop is also sized to the bot's
+            own quantity, so an overlapping user holding is never covered. When
+            None (crypto — exclusive sub-account, Decision 019), every position
+            is the bot's and behaviour is unchanged.
     """
     plan = StopPlan()
     ticks = tick_sizes or {}
+    shared = owned_quantities is not None
 
     # Resting protective stops, grouped by symbol. Only reduce-only stop
     # orders count — a strategy's own resting stop entry (none exist today)
@@ -130,6 +141,11 @@ def plan_stop_protection(
     for pos in positions:
         if pos.size <= 0 or pos.side not in ("long", "short"):
             continue
+        # Shared account: skip anything the bot didn't open. Crucially do NOT
+        # pop its resting stops — leave the user's own stops untouched.
+        if shared and pos.symbol not in owned_quantities:  # type: ignore[operator]
+            continue
+
         existing = stops_by_symbol.pop(pos.symbol, [])
 
         bucket_id, strategy_name = attribution.get(pos.symbol, (None, None))
@@ -139,6 +155,13 @@ def plan_stop_protection(
         if pct is None:
             plan.unprotectable.append(pos.symbol)
             # Leave any existing stops alone — better a stale stop than none.
+            continue
+
+        # Never protect more than the bot's own quantity (overlap guard).
+        size = pos.size
+        if shared:
+            size = min(pos.size, owned_quantities[pos.symbol])  # type: ignore[index]
+        if size <= 0:
             continue
 
         want_side = "sell" if pos.side == "long" else "buy"
@@ -156,7 +179,7 @@ def plan_stop_protection(
             if (
                 kept is None
                 and o.side == want_side
-                and o.size == pos.size
+                and o.size == size
                 and drift <= _TRIGGER_TOLERANCE
             ):
                 kept = o
@@ -168,15 +191,19 @@ def plan_stop_protection(
                 PlannedStop(
                     symbol=pos.symbol,
                     side=want_side,
-                    size=pos.size,
+                    size=size,
                     trigger=trigger,
                     bucket_id=bucket_id,
                     strategy_name=strategy_name,
                 )
             )
 
-    # Whatever is left has no position behind it → orphan, cancel.
-    for leftovers in stops_by_symbol.values():
+    # Whatever is left has no position behind it → orphan, cancel. On a shared
+    # account only cancel the bot's own orphaned stops; a resting stop on a
+    # symbol the bot doesn't own belongs to the user.
+    for sym, leftovers in stops_by_symbol.items():
+        if shared and sym not in owned_quantities:  # type: ignore[operator]
+            continue
         plan.cancel.extend(leftovers)
 
     return plan
@@ -206,11 +233,16 @@ def ensure_stop_protection(
     order_manager: OrderManager,
     stop_pct_by_bucket: dict[str, Decimal],
     clock: Clock | None = None,
+    shared_account: bool = False,
 ) -> StopPlan:
     """Make the exchange state match the plan for one sub-account.
 
     Returns the executed plan (for logging/tests). Failures on one symbol
     never block the rest; an unprotected position pages via Telegram.
+
+    ``shared_account`` (Decision 027 followup): on the Dhan account, which also
+    holds the user's manual positions, only stops the bot's OWN holdings — the
+    user's positions and their resting stops are never touched.
     """
     clk = clock or RealClock()
     if not stop_pct_by_bucket:
@@ -218,12 +250,22 @@ def ensure_stop_protection(
 
     positions = broker.get_positions()
     open_orders = broker.get_open_orders()
+    owned = None
+    if shared_account:
+        with session_scope() as session:
+            owned = bot_owned_quantities(
+                session,
+                broker_name=order_manager.broker_name,
+                bucket_ids=bucket_ids,
+                now=clk.now(),
+            )
     plan = plan_stop_protection(
         positions=positions,
         open_orders=open_orders,
         stop_pct_by_bucket=stop_pct_by_bucket,
         attribution=_load_attribution(bucket_ids),
         tick_sizes={p.symbol: broker.tick_size(p.symbol) for p in positions},
+        owned_quantities=owned,
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"

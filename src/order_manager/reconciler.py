@@ -31,6 +31,7 @@ from src.core.models import (
     PositionSide,
     Trade,
 )
+from src.order_manager.ownership import bot_owned_quantities
 
 
 @dataclass
@@ -60,11 +61,19 @@ class Reconciler:
         clock: Clock | None = None,
         bucket_ids: list[str] | None = None,
         bucket_fx: dict[str, Decimal] | None = None,
+        shared_account: bool = False,
     ) -> None:
         self._broker = broker
         self._broker_name = broker_name
         self._clock = clock or RealClock()
         self._log = get_logger("order_manager.reconciler")
+        # Decision 027 followup: a SHARED account (Dhan — the Indian buckets
+        # share one login with the user's manual trading) holds positions the
+        # bot never opened. On such an account the reconciler must ONLY adopt
+        # exchange positions the bot itself opened (its own net-long trades),
+        # never the user's. Crypto sub-accounts are exclusive (Decision 019),
+        # so this stays False there and the whole account is treated as ours.
+        self._shared_account = shared_account
         # Decision 019: with one sub-account per bucket, every reconciler is
         # scoped to the bucket(s) on its account so it never sweeps another
         # bucket's rows. ``None`` keeps the legacy broker-wide behaviour
@@ -181,8 +190,32 @@ class Reconciler:
             # tick. Bucket attribution comes from the most-recent filled
             # Trade for the symbol; truly external positions stay
             # unattributed and we just emit a warning.
+            # On a shared account, the bot's own net-long holdings by symbol.
+            # Anything on the exchange NOT here is the user's manual position
+            # and must never be adopted (the 2026-07-22 incident).
+            owned = (
+                bot_owned_quantities(
+                    session,
+                    broker_name=self._broker_name,
+                    bucket_ids=self._bucket_ids or [],
+                    now=self._clock.now(),
+                )
+                if self._shared_account
+                else {}
+            )
+
             for sym, ex_pos in exchange_by_symbol.items():
                 if sym in db_symbols:
+                    continue
+                if self._shared_account and sym not in owned:
+                    # Not opened by the bot → the user's. Leave it entirely
+                    # alone (no import, no stop, no exit downstream).
+                    self._log.info(
+                        "external_position_ignored",
+                        symbol=sym,
+                        exchange_side=ex_pos.side,
+                        exchange_size=str(ex_pos.size),
+                    )
                     continue
                 latest_trade = self._latest_filled_trade(session, sym)
                 strategy_id = latest_trade.strategy_id if latest_trade else "unknown"
@@ -191,6 +224,21 @@ class Reconciler:
                     latest_trade.strategy_name if latest_trade else None
                 )
                 side = _exchange_side_to_position(ex_pos.side)
+                # Never adopt more than the bot's OWN net quantity: if the user
+                # also holds this cash symbol, the exchange size is bot+user, so
+                # cap at what the bot opened (shared account only).
+                import_qty = (
+                    min(ex_pos.size, owned[sym])
+                    if self._shared_account
+                    else ex_pos.size
+                )
+                if import_qty < ex_pos.size:
+                    self._log.warning(
+                        "orphan_qty_capped_to_bot_owned",
+                        symbol=sym,
+                        exchange_size=str(ex_pos.size),
+                        bot_owned=str(owned.get(sym)),
+                    )
                 existing_flat = session.execute(
                     select(Position).where(
                         Position.strategy_id == strategy_id,
@@ -220,7 +268,7 @@ class Reconciler:
                         strategy_name or existing_flat.strategy_name
                     )
                     existing_flat.side = side
-                    existing_flat.quantity = ex_pos.size
+                    existing_flat.quantity = import_qty
                     existing_flat.entry_price = ex_pos.entry_price
                     existing_flat.leverage = ex_pos.leverage
                     existing_flat.liquidation_price = ex_pos.liquidation_price
@@ -235,7 +283,7 @@ class Reconciler:
                             broker=self._broker_name,
                             symbol=sym,
                             side=side,
-                            quantity=ex_pos.size,
+                            quantity=import_qty,
                             entry_price=ex_pos.entry_price,
                             leverage=ex_pos.leverage,
                             liquidation_price=ex_pos.liquidation_price,

@@ -22,13 +22,16 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from sqlalchemy import select
+
 from src.brokers.base import Broker, OrderType, PositionInfo
 from src.core.alerts import note_alert_recovery, send_alert_dedup
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
-from src.core.models import AuditEventType, AuditLog
+from src.core.models import AuditEventType, AuditLog, BucketState
 from src.order_manager.manager import OrderManager
+from src.order_manager.ownership import bot_owned_quantities
 from src.safety import kill_switch
 from src.safety.breakers import run_all_breakers
 from src.safety.equity_anchor import get_or_create_daily_anchor
@@ -47,10 +50,18 @@ def enforce_breakers(
     min_liq_distance_pct: Decimal,
     max_funding_rate: Decimal,
     clock: Clock | None = None,
+    shared_account: bool = False,
 ) -> bool:
     """Run all breakers for one sub-account; halt + flatten on any trip.
 
     Returns True if a trip was handled this call, False otherwise.
+
+    ``shared_account`` (Decision 027 followup): on the Dhan account, which also
+    holds the user's manual positions, the breaker must (a) never flatten a
+    position the bot didn't open, and (b) measure drawdown on the BOT's equity,
+    not the shared wallet — otherwise the user's P&L could trip the bot's
+    breaker and its flatten would close the user's positions (the 2026-07-22
+    hazard).
     """
     clk = clock or RealClock()
 
@@ -60,19 +71,56 @@ def enforce_breakers(
     already_killed = all(kill_switch.is_engaged(b) for b in bucket_ids)
 
     positions = broker.get_positions()
-    held_symbols = [p.symbol for p in positions]
 
-    # Daily-anchored equity (Decision 023): wallet balance + unrealized PnL,
-    # measured against the account's start-of-UTC-day anchor so realized
-    # losses through the day count toward the drawdown, not just open PnL.
-    balances = broker.get_balances()
-    current_equity = sum(
-        (b.available + b.order_margin + b.position_margin for b in balances),
-        Decimal("0"),
-    ) + sum(
-        (p.unrealized_pnl or Decimal("0") for p in positions),
-        Decimal("0"),
-    )
+    if shared_account:
+        # Keep ONLY positions the bot opened; the user's are invisible to
+        # every breaker and to the flatten below.
+        with session_scope() as session:
+            owned = bot_owned_quantities(
+                session,
+                broker_name=order_manager.broker_name,
+                bucket_ids=bucket_ids,
+                now=clk.now(),
+            )
+            states = list(
+                session.execute(
+                    select(BucketState).where(
+                        BucketState.bucket_id.in_(bucket_ids)
+                    )
+                ).scalars()
+            )
+        positions = [p for p in positions if p.symbol in owned]
+        # Bot equity = allocated capital (+ recorded adjustments) + the bot's
+        # OWN unrealized P&L. Decoupled from the shared wallet, so the user's
+        # balance and positions cannot move the bot's drawdown.
+        capital_baseline = sum(
+            (
+                s.capital_inr
+                + Decimal(
+                    str((s.extra or {}).get("capital_adjustments_inr", "0"))
+                )
+                for s in states
+            ),
+            Decimal("0"),
+        )
+        current_equity = capital_baseline + sum(
+            (p.unrealized_pnl or Decimal("0") for p in positions),
+            Decimal("0"),
+        )
+    else:
+        # Daily-anchored equity (Decision 023): wallet balance + unrealized
+        # PnL, measured against the account's start-of-UTC-day anchor so
+        # realized losses through the day count toward the drawdown.
+        balances = broker.get_balances()
+        current_equity = sum(
+            (b.available + b.order_margin + b.position_margin for b in balances),
+            Decimal("0"),
+        ) + sum(
+            (p.unrealized_pnl or Decimal("0") for p in positions),
+            Decimal("0"),
+        )
+
+    held_symbols = [p.symbol for p in positions]
     anchor_equity = get_or_create_daily_anchor(
         account_ref, current_equity, clk
     )

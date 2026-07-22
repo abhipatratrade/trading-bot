@@ -39,3 +39,19 @@ def test_clause_targets_bucket_id_column() -> None:
     clause = rec._scope_positions()[0]
     rendered = str(clause)
     assert "bucket_id" in rendered
+
+
+# ── Shared-account flag (Decision 027 followup) ─────────────────────────
+def test_shared_account_defaults_false() -> None:
+    """Crypto (the default) must keep treating the whole account as the bot's."""
+    assert _reconciler(None)._shared_account is False
+
+
+def test_shared_account_flag_stored() -> None:
+    rec = Reconciler(
+        broker=object(),  # type: ignore[arg-type]
+        broker_name=BrokerName.DHAN,
+        bucket_ids=["intraday-indian", "swing-indian"],
+        shared_account=True,
+    )
+    assert rec._shared_account is True
