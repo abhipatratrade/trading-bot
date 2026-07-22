@@ -313,7 +313,8 @@ def test_bucket_config_is_wired() -> None:
     assert b.config.capital_inr == Decimal("50000")
     assert b.config.leverage_max == Decimal("5")
     assert b.config.entry_start == "09:30"
-    assert not b.config.enabled, "ships dark; user flips it on"
+    # NOTE: config.enabled is operational policy (armed 2026-07-22), not a
+    # structural property — deliberately not asserted here.
 
 
 def test_scanner_config_uses_intraday_engine_and_full_universe() -> None:
@@ -350,19 +351,26 @@ def test_entry_window_is_per_bucket() -> None:
 # ---------------------------------------------------------------------------
 # Multi-scanner set (Decision 026 + 029)
 # ---------------------------------------------------------------------------
-def test_two_scanner_sets_are_wired_and_disjoint() -> None:
+def test_only_validated_set_is_active_broad_is_staged() -> None:
+    """Live scoping (2026-07-22): only the validated NIFTY-100 set trades.
+
+    The broad Midcap/Smallcap set stays OUT of strategy_master.csv until it
+    has its own backtest — re-enabling is a one-line CSV add. Its scanner +
+    allocator files remain in place, and the two universes must stay disjoint
+    so that add can't double-enter a name (dedup is per bucket+strategy+symbol
+    and the sets run as different strategies).
+    """
     b = load_bucket("intraday-indian")
     master = load_strategy_master(
         b.strategy_master_csv_path, b.trading_type.value
     )
     assert {(r.strategy_name, r.scanner) for r in master.rows} == {
         ("gap_down_reversal", ""),
-        ("gap_down_reversal_broad", "broad"),
-    }
+    }, "only the validated set may be active on real money"
+    # Broad config still present for a future re-enable, and still disjoint.
+    assert b.scanner_yaml_path_for("broad").is_file()
     narrow = set(load_scanner_config(b.scanner_yaml_path_for("")).symbols)
     broad = set(load_scanner_config(b.scanner_yaml_path_for("broad")).symbols)
-    # Overlap would double-enter the same name: dedup is per
-    # (bucket, strategy, symbol) and these run as two different strategies.
     assert not (narrow & broad), sorted(narrow & broad)[:5]
 
 
