@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.brokers.dhan.client import DhanClient  # noqa: E402
 from src.core.config import get_settings  # noqa: E402
-from src.data_sources.dhan import DhanData  # noqa: E402
+from src.data_sources.dhan import BOT_REQUEST_DELAY_SECONDS, DhanData  # noqa: E402
 from src.shared.allocator.sizer import load_allocator_config  # noqa: E402
 from src.shared.bucket import load_bucket  # noqa: E402
 from src.shared.scanner.engine import load_scanner_config  # noqa: E402
@@ -80,7 +80,13 @@ def main() -> int:
     print(f"  product / lev cap  {bucket.config.product} / {bucket.config.leverage_max}x")
     print("=" * 72)
 
-    data = DhanData.from_settings(settings)
+    # Same 0.22s pace the live bot uses, so this exercises the REAL fetch
+    # path under Dhan's 5 req/s charts cap (Decision 029). Without it the
+    # 99-symbol scan hammers the API and 429s, exactly the bug this dry run
+    # exists to catch.
+    data = DhanData.from_settings(
+        settings, request_delay_seconds=BOT_REQUEST_DELAY_SECONDS
+    )
 
     # ---- 1. universe + circuit filter ---------------------------------
     symbols = list(gcfg.symbols)
