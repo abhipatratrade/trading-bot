@@ -56,3 +56,6 @@ Thumbs.db
 # Claude Code local settings
 .claude/settings.local.json
 
+
+# Runtime state (Dhan token cache — a live 24h secret; never commit)
+/state/

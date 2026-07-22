@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
@@ -33,6 +35,16 @@ from src.core.logging import get_logger
 
 _AUTH_BASE = "https://auth.dhan.co"
 _log = get_logger("brokers.dhan.auth")
+
+# Cross-process token cache. Dhan mints at most once per 2 minutes per account,
+# and every process (bot, dry run, prepare job) builds its own manager — so
+# without a SHARED cache a restart, or two processes starting close together,
+# collide on the mint cooldown and cannot get a token for up to 2 minutes
+# (observed 2026-07-22). A 0600 file lets them reuse one 24h token. The token
+# is strictly less sensitive than the TOTP secret + PIN already on this disk.
+DEFAULT_TOKEN_CACHE_PATH = (
+    Path(__file__).resolve().parents[3] / "state" / "dhan_token_cache.json"
+)
 
 # Token-refresh hardening (Decision 029 — ported from scripts/dhan-scanner,
 # which learned this the hard way on the 2026-07-13/14 soak).
@@ -83,6 +95,7 @@ class DhanTokenManager:
         refresh_margin_seconds: int = 1800,
         http: httpx.Client | None = None,
         clock: Callable[[], float] = time.time,
+        token_cache_path: Path | None = None,
     ) -> None:
         self._client_id = client_id
         self._pin = pin
@@ -91,6 +104,8 @@ class DhanTokenManager:
         self._http = http or httpx.Client(timeout=30.0)
         self._owns_http = http is None
         self._clock = clock
+        # Persistent cross-process cache. None disables it (tests, static mode).
+        self._cache_path = token_cache_path
         self._token: str | None = static_token
         self._exp: int | None = jwt_exp(static_token) if static_token else None
         # Last token we KNOW was minted successfully, retained across
@@ -98,6 +113,14 @@ class DhanTokenManager:
         self._last_good_token: str | None = static_token
         self._last_good_exp: int | None = self._exp
         self._lock = threading.Lock()
+        # Seed from the shared on-disk token so a cold start reuses a valid
+        # token instead of minting into the 2-minute cooldown.
+        if static_token is None and self.can_refresh:
+            cached = self._load_cache()
+            if cached is not None:
+                self._token = self._last_good_token = cached
+                self._exp = self._last_good_exp = jwt_exp(cached)
+                _log.info("dhan_token_loaded_from_cache", exp=self._exp)
 
     @property
     def can_refresh(self) -> bool:
@@ -138,6 +161,46 @@ class DhanTokenManager:
         if self._exp is None:
             return False  # unknown expiry — rely on invalidate() after a 401
         return self._clock() >= self._exp - self._margin
+
+    def _load_cache(self) -> str | None:
+        """Read a still-valid token from the shared cache file, or None.
+
+        Ignores a missing/corrupt/expired entry silently — the caller just
+        mints instead. Validity is judged by the token's own JWT ``exp`` with
+        the same near-expiry guard as the in-memory fallback.
+        """
+        if not self._cache_path or not self._cache_path.exists():
+            return None
+        try:
+            data = json.loads(self._cache_path.read_text())
+            tok = data.get("token")
+        except (OSError, ValueError):
+            return None
+        if not tok:
+            return None
+        exp = jwt_exp(tok)
+        if exp is None or self._clock() >= exp - _CACHED_TOKEN_MIN_REMAINING:
+            return None
+        return tok
+
+    def _save_cache(self, token: str) -> None:
+        """Persist a freshly-minted token for other processes (0600, atomic)."""
+        if not self._cache_path:
+            return
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"token": token, "minted_at": self._clock()})
+            )
+            os.chmod(tmp, 0o600)  # secret — owner-only
+            tmp.replace(self._cache_path)  # atomic swap
+        except OSError:
+            _log.warning(
+                "dhan_token_cache_write_failed",
+                path=str(self._cache_path),
+                exc_info=True,
+            )
 
     def _cached_token_still_valid(self) -> bool:
         """True when ``_last_good_token`` exists and is not near expiry."""
@@ -189,11 +252,19 @@ class DhanTokenManager:
             self._exp = jwt_exp(tok)
             self._last_good_token = tok
             self._last_good_exp = self._exp
+            self._save_cache(tok)  # share with other processes on this box
             _log.info("dhan_token_refreshed", exp=self._exp, attempt=attempt + 1)
             return
 
-        # Every mint failed. Serve the last-good token if it is still valid —
-        # this is what turns a transient 401 from fatal into harmless.
+        # Every mint failed (typically the 2-minute cooldown). First prefer a
+        # token a PEER process may have minted since we last looked — that is
+        # the whole point of the shared cache — then the in-memory last-good.
+        peer = self._load_cache()
+        if peer is not None and peer != self._last_good_token:
+            self._token = self._last_good_token = peer
+            self._exp = self._last_good_exp = jwt_exp(peer)
+            _log.warning("dhan_token_refresh_used_peer_cache", exp=self._exp)
+            return
         if self._cached_token_still_valid():
             self._token = self._last_good_token
             self._exp = self._last_good_exp

@@ -26,7 +26,7 @@ from typing import Any
 
 import httpx
 
-from src.brokers.dhan.auth import DhanTokenManager
+from src.brokers.dhan.auth import DEFAULT_TOKEN_CACHE_PATH, DhanTokenManager
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
 from src.data_sources.base import FundingRate, MarketData, OHLCVBar, Ticker
@@ -116,6 +116,9 @@ class DhanData(MarketData):
             pin=acct.pin,
             totp_secret=acct.totp_secret,
             static_token=acct.data_token,
+            # Shared on-disk cache so the bot, dry run, and prepare job reuse
+            # one 24h token instead of each minting into Dhan's 2-min cooldown.
+            token_cache_path=DEFAULT_TOKEN_CACHE_PATH,
         )
         return cls(
             token_manager=token,

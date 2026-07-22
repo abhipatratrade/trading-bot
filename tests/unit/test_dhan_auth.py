@@ -236,3 +236,92 @@ def test_expired_cached_token_is_not_served(monkeypatch) -> None:
     # Cached token is within 60s of expiry → must refuse, not serve it stale.
     with pytest.raises(RuntimeError, match="no valid cached token"):
         mgr.token()
+
+
+# ── Persistent cross-process token cache (Decision 029) ─────────────────
+import os  # noqa: E402
+import stat as _stat  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+
+def _mgr_cached(
+    http: object, path: _Path, clock_val: float = 1_000_000.0
+) -> DhanTokenManager:
+    return DhanTokenManager(
+        client_id="C",
+        pin="1234",
+        totp_secret=_TOTP_SECRET,
+        http=http,  # type: ignore[arg-type]
+        clock=lambda: clock_val,
+        token_cache_path=path,
+    )
+
+
+def test_mint_writes_cache_then_peer_reads_it_without_minting(
+    monkeypatch, tmp_path: _Path
+) -> None:
+    """The whole point: process B reuses process A's token, no second mint."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    cache = tmp_path / "tok.json"
+    good = _fake_jwt(2_000_000)
+
+    a = _mgr_cached(_FlakyHttp([good], 0, "no_token"), cache)
+    assert a.token() == good  # process A mints + writes cache
+    assert cache.exists()
+
+    # Process B: mint endpoint would FAIL, but the cache seeds a valid token.
+    b_http = _FlakyHttp([], fail_first=99, fail_mode="no_token")
+    b = _mgr_cached(b_http, cache)
+    assert b.token() == good
+    assert b_http.calls == 0, "B must not mint — it loaded the shared token"
+
+
+def test_cache_file_is_owner_only(monkeypatch, tmp_path: _Path) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    cache = tmp_path / "tok.json"
+    _mgr_cached(_FlakyHttp([_fake_jwt(2_000_000)], 0, "no_token"), cache).token()
+    mode = _stat.S_IMODE(cache.stat().st_mode)
+    # POSIX: 0600. On Windows chmod is a near-no-op, so only assert there.
+    if os.name == "posix":
+        assert mode == 0o600, oct(mode)
+
+
+def test_expired_cache_is_ignored_and_remint(monkeypatch, tmp_path: _Path) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    cache = tmp_path / "tok.json"
+    cache.write_text(json.dumps({"token": _fake_jwt(1_000_010), "minted_at": 0}))
+    fresh = _fake_jwt(2_000_000)
+    http = _FlakyHttp([fresh], fail_first=0, fail_mode="no_token")
+    # Cached token expires 10s after clock → inside the 60s guard → mint anew.
+    mgr = _mgr_cached(http, cache, clock_val=1_000_000.0)
+    assert mgr.token() == fresh
+    assert http.calls == 1
+
+
+def test_corrupt_cache_is_ignored(monkeypatch, tmp_path: _Path) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    cache = tmp_path / "tok.json"
+    cache.write_text("{not valid json")
+    fresh = _fake_jwt(2_000_000)
+    mgr = _mgr_cached(_FlakyHttp([fresh], 0, "no_token"), cache)
+    assert mgr.token() == fresh  # falls through to a mint, no crash
+
+
+def test_failed_mint_picks_up_peer_token_from_disk(
+    monkeypatch, tmp_path: _Path
+) -> None:
+    """A's token goes bad; B minted a newer one; A must adopt B's from disk."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    cache = tmp_path / "tok.json"
+    old, new = _fake_jwt(2_000_000), _fake_jwt(2_000_500)
+
+    a = _mgr_cached(_FlakyHttp([old], 0, "no_token"), cache)
+    assert a.token() == old
+
+    # A peer writes a fresher token to the shared cache.
+    cache.write_text(json.dumps({"token": new, "minted_at": 1.0}))
+
+    # A's token 401s → invalidate → re-mint fails → adopt the peer's token.
+    a._http._fail_first = 99  # type: ignore[attr-defined]
+    a.invalidate()
+    assert a.token() == new
