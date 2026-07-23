@@ -170,10 +170,43 @@ def test_get_fills_parses_trades() -> None:
 
 
 def test_error_envelope_raises() -> None:
+    # A NON-token error raises immediately, no retry.
     http = _FakeHttp({"GET /v2/fundlimit": [_Resp(
-        {"errorType": "Auth", "errorCode": "DH-906", "errorMessage": "Invalid Token"})]})
+        {"errorType": "Data", "errorCode": "DH-905", "errorMessage": "Bad request"})]})
+    with pytest.raises(DhanAPIError, match="DH-905"):
+        _client(http).get_balances()
+    assert len(http.calls) == 1, "non-token error must not retry"
+
+
+def test_invalid_token_retries_then_recovers() -> None:
+    # DH-906 on the first call → invalidate + retry → success on the second.
+    http = _FakeHttp({"GET /v2/fundlimit": [
+        _Resp({"errorType": "Auth", "errorCode": "DH-906",
+               "errorMessage": "Invalid Token"}, status=400),
+        _Resp({"availabelBalance": 50000.0, "utilizedAmount": 0.0}),
+    ]})
+    _client(http).get_balances()
+    assert len(http.calls) == 2, "must retry once after an invalid-token error"
+
+
+def test_invalid_token_persists_raises() -> None:
+    # Both attempts return DH-906 → the error surfaces (no infinite loop).
+    env = {"errorType": "Auth", "errorCode": "DH-906",
+           "errorMessage": "Invalid Token"}
+    http = _FakeHttp({"GET /v2/fundlimit": [
+        _Resp(env, status=400), _Resp(env, status=400)]})
     with pytest.raises(DhanAPIError, match="DH-906"):
         _client(http).get_balances()
+    assert len(http.calls) == 2, "retry once, then surface"
+
+
+def test_invalid_token_message_without_code_also_retries() -> None:
+    http = _FakeHttp({"GET /v2/fundlimit": [
+        _Resp({"errorMessage": "Invalid Token"}, status=400),
+        _Resp({"availabelBalance": 1.0, "utilizedAmount": 0.0}),
+    ]})
+    _client(http).get_balances()
+    assert len(http.calls) == 2
 
 
 def test_non_json_403_raises_clean_error() -> None:

@@ -84,6 +84,26 @@ class DhanAPIError(Exception):
         super().__init__(f"Dhan API error [{code}]: {message}")
 
 
+def _is_invalid_token(resp: httpx.Response) -> bool:
+    """True when a response means the access token was rejected.
+
+    Two shapes: a plain HTTP 401, or a 400/200 with Dhan's error envelope
+    ``{"errorCode": "DH-906", "errorMessage": "Invalid Token"}`` — the form the
+    live trading endpoints return on a single-session invalidation.
+    """
+    if resp.status_code == 401:
+        return True
+    try:
+        data = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    code = str(data.get("errorCode", "")).upper()
+    msg = str(data.get("errorMessage", "")).lower()
+    return code == "DH-906" or "invalid token" in msg
+
+
 class DhanClient(Broker):
     """Synchronous REST order client for Dhan (cash equity + MTF)."""
 
@@ -147,7 +167,15 @@ class DhanClient(Broker):
 
     # ── HTTP ────────────────────────────────────────────────────────────
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        """Send one request, refreshing the token once on a 401."""
+        """Send one request, refreshing the token once on an invalid-token error.
+
+        A token can be rejected two ways: HTTP 401, OR — on the live trading
+        endpoints — an HTTP 400 with envelope ``errorCode DH-906 / "Invalid
+        Token"``. The latter is what a single-session invalidation looks like
+        (a peer process minted, killing ours server-side while it is still
+        valid by its own timestamp). Both trigger invalidate() + one retry;
+        the token manager then adopts the peer's fresh cached token.
+        """
         def _send() -> httpx.Response:
             return self._http.request(
                 method,
@@ -161,7 +189,7 @@ class DhanClient(Broker):
             )
 
         resp = _send()
-        if resp.status_code == 401:
+        if _is_invalid_token(resp):
             self._token.invalidate()
             resp = _send()
         return self._handle(resp)

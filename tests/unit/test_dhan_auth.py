@@ -325,3 +325,48 @@ def test_failed_mint_picks_up_peer_token_from_disk(
     a._http._fail_first = 99  # type: ignore[attr-defined]
     a.invalidate()
     assert a.token() == new
+
+
+# ── Peer-adopt on single-session invalidation (2026-07-23 live incident) ──
+import json as _json_mod  # noqa: E402
+
+
+def _refreshable(cache_path, http, clock_val=1_000_000.0):
+    return DhanTokenManager(
+        client_id="C", pin="1234", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: clock_val, token_cache_path=cache_path,
+    )
+
+
+def test_rejected_token_adopts_peer_cache_without_minting(tmp_path, monkeypatch) -> None:
+    """A peer minted (killing ours server-side) → adopt theirs, don't mint."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    bad = _fake_jwt(2_000_000)
+    peer = _fake_jwt(2_100_000)                    # different, valid, peer-minted
+    cache = tmp_path / "tok.json"
+    cache.write_text(_json_mod.dumps({"token": peer, "minted_at": 0}))
+    http = _FlakyHttp([], fail_first=99, fail_mode="no_token")  # any mint fails
+    mgr = _refreshable(cache, http)
+    mgr._token = mgr._last_good_token = bad         # our (about-to-be-rejected) token
+    mgr._exp = mgr._last_good_exp = jwt_exp(bad)
+
+    mgr.invalidate()                                # broker rejected `bad`
+    assert mgr.token() == peer                      # adopted the peer token
+    assert http.calls == 0, "must NOT mint when a fresh peer token exists"
+
+
+def test_cache_holding_rejected_token_forces_mint(tmp_path, monkeypatch) -> None:
+    """If the cache still holds the REJECTED token, don't re-adopt it — mint."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    bad = _fake_jwt(2_000_000)
+    fresh = _fake_jwt(2_200_000)
+    cache = tmp_path / "tok.json"
+    cache.write_text(_json_mod.dumps({"token": bad, "minted_at": 0}))  # stale peer
+    http = _FlakyHttp([fresh], fail_first=0, fail_mode="no_token")
+    mgr = _refreshable(cache, http)
+    mgr._token = mgr._last_good_token = bad
+    mgr._exp = mgr._last_good_exp = jwt_exp(bad)
+
+    mgr.invalidate()
+    assert mgr.token() == fresh                     # minted a new one
+    assert http.calls == 1, "cache==rejected must not be re-adopted"

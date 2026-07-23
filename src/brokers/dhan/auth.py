@@ -112,6 +112,12 @@ class DhanTokenManager:
         # invalidate() so a failed re-mint can fall back to it.
         self._last_good_token: str | None = static_token
         self._last_good_exp: int | None = self._exp
+        # The exact token a broker call just had REJECTED (DH-906 / 401). Dhan
+        # tokens are single-session, so when a peer process mints, ours is
+        # invalidated server-side while still valid by its own timestamp. We
+        # remember the rejected value so refresh never re-adopts it from the
+        # (still timestamp-valid) shared cache — it would just be rejected again.
+        self._rejected_token: str | None = None
         self._lock = threading.Lock()
         # Seed from the shared on-disk token so a cold start reuses a valid
         # token instead of minting into the 2-minute cooldown.
@@ -149,6 +155,10 @@ class DhanTokenManager:
         """
         with self._lock:
             if self.can_refresh:
+                # Remember the bad token so refresh won't re-adopt it from the
+                # shared cache (it's timestamp-valid but server-rejected).
+                if self._token is not None:
+                    self._rejected_token = self._token
                 self._token = None
                 self._exp = None
 
@@ -219,6 +229,19 @@ class DhanTokenManager:
         """
         import pyotp  # local import: only the refreshable path needs it
 
+        # Peer-first: a concurrent process may already have minted a fresh
+        # token (that mint is WHY ours was rejected — single-session). Adopt
+        # theirs instead of minting a competing one, or N processes thrash,
+        # each mint invalidating the others every tick. Skip a cached token
+        # equal to the one just rejected — it would only be rejected again.
+        peer = self._load_cache()
+        if peer is not None and peer != self._rejected_token:
+            self._token = self._last_good_token = peer
+            self._exp = self._last_good_exp = jwt_exp(peer)
+            self._rejected_token = None
+            _log.info("dhan_token_adopted_peer_before_mint", exp=self._exp)
+            return
+
         totp = pyotp.TOTP(self._totp_secret)
         last_err: Exception | None = None
         for attempt in range(_REFRESH_ATTEMPTS):
@@ -252,6 +275,7 @@ class DhanTokenManager:
             self._exp = jwt_exp(tok)
             self._last_good_token = tok
             self._last_good_exp = self._exp
+            self._rejected_token = None  # a fresh mint supersedes the bad one
             self._save_cache(tok)  # share with other processes on this box
             _log.info("dhan_token_refreshed", exp=self._exp, attempt=attempt + 1)
             return
@@ -260,9 +284,14 @@ class DhanTokenManager:
         # token a PEER process may have minted since we last looked — that is
         # the whole point of the shared cache — then the in-memory last-good.
         peer = self._load_cache()
-        if peer is not None and peer != self._last_good_token:
+        if (
+            peer is not None
+            and peer != self._last_good_token
+            and peer != self._rejected_token
+        ):
             self._token = self._last_good_token = peer
             self._exp = self._last_good_exp = jwt_exp(peer)
+            self._rejected_token = None
             _log.warning("dhan_token_refresh_used_peer_cache", exp=self._exp)
             return
         if self._cached_token_still_valid():
