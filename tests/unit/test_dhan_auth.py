@@ -370,3 +370,77 @@ def test_cache_holding_rejected_token_forces_mint(tmp_path, monkeypatch) -> None
     mgr.invalidate()
     assert mgr.token() == fresh                     # minted a new one
     assert http.calls == 1, "cache==rejected must not be re-adopted"
+
+
+# ── Cross-machine remote store (2026-07-23 shared-token fix) ─────────────
+class _FakeStore:
+    """In-memory TokenStore double. ``raises`` makes both methods throw, to
+    prove the manager stays fail-soft when the DB is down."""
+
+    def __init__(self, token: str | None = None, *, raises: bool = False) -> None:
+        self.token = token
+        self.saved: list[str] = []
+        self._raises = raises
+
+    def load(self) -> str | None:
+        if self._raises:
+            raise RuntimeError("db down")
+        return self.token
+
+    def save(self, token: str) -> None:
+        if self._raises:
+            raise RuntimeError("db down")
+        self.token = token
+        self.saved.append(token)
+
+
+def _mgr_remote(http, store, *, cache_path=None, clock_val=1_000_000.0):
+    return DhanTokenManager(
+        client_id="C", pin="1234", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: clock_val,
+        token_cache_path=cache_path, remote_store=store,
+    )
+
+
+def test_mint_publishes_to_remote_store(monkeypatch) -> None:
+    """Every fresh mint is written to the shared row for other-VM peers."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    good = _fake_jwt(2_000_000)
+    store = _FakeStore()
+    mgr = _mgr_remote(_FlakyHttp([good], 0, "no_token"), store)
+    assert mgr.token() == good
+    assert store.saved == [good]  # published for the recorder's VM to read
+
+
+def test_cold_start_adopts_remote_token_without_minting(monkeypatch) -> None:
+    """The recorder's case: a peer minted, the row holds it → read, don't mint."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    peer = _fake_jwt(2_000_000)
+    store = _FakeStore(token=peer)
+    http = _FlakyHttp([], fail_first=99, fail_mode="no_token")  # any mint fails
+    mgr = _mgr_remote(http, store)
+    assert mgr.token() == peer
+    assert http.calls == 0, "must read the shared row, not mint"
+
+
+def test_load_peer_prefers_fresher_of_file_and_remote(monkeypatch, tmp_path) -> None:
+    """When both peer sources hold a token, the later-expiry one wins."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    older, newer = _fake_jwt(2_000_000), _fake_jwt(2_500_000)
+    cache = tmp_path / "tok.json"
+    cache.write_text(_json_mod.dumps({"token": older, "minted_at": 0}))
+    store = _FakeStore(token=newer)  # remote is fresher than the file
+    http = _FlakyHttp([], fail_first=99, fail_mode="no_token")
+    mgr = _mgr_remote(http, store, cache_path=cache)
+    assert mgr.token() == newer
+    assert http.calls == 0
+
+
+def test_remote_store_down_falls_back_to_mint(monkeypatch) -> None:
+    """A DB outage must not raise into the token path — mint as usual."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    good = _fake_jwt(2_000_000)
+    store = _FakeStore(raises=True)  # both load() and save() throw
+    mgr = _mgr_remote(_FlakyHttp([good], 0, "no_token"), store)
+    assert mgr.token() == good  # save() raised internally but mint still returns
+    assert store.saved == []  # nothing persisted, and no exception surfaced
