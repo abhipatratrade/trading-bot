@@ -93,15 +93,16 @@ buckets:
     capital_inr: 50000
     broker: dhan
     leverage_max: 5          # MIS intraday
-    # DISARMED 2026-07-22 within minutes of going live. On the shared live Dhan
-    # account the bot's stop-protection sweep tried to place protective stops on
-    # the USER'S OWN manual NIFTY options positions — it manages positions at
-    # the ACCOUNT level, not just the ones it opened. No order reached Dhan
-    # (option symbols don't resolve in the cash-equity universe, so it errored
-    # first) but a manual CASH position WOULD have been touched. BLOCKED until
-    # the safety sweeps + reconciler are scoped to bot-opened positions only
-    # on shared accounts (Decision 027 accounts). See the 2026-07-22 session log.
-    enabled: false
+    # RE-ARMED 2026-07-23 after the shared-account scoping fix (commit 1fe42e1):
+    # the stop sweep, reconciler orphan-import, and drawdown breaker now act
+    # ONLY on positions the bot opened (src/order_manager/ownership.py), so the
+    # user's manual NIFTY positions on this shared Dhan account are never
+    # touched — validated live read-only against the real positions (0 stops
+    # placed/cancelled, 0 adopted). Only the validated NIFTY-100 set trades
+    # (broad row kept out of strategy_master.csv). The ORDER path (INTRADAY
+    # placement + 15:15 square-off) goes live on the first qualifying gap-down —
+    # it is the one thing still unexercised by any test.
+    enabled: true
     account_ref: dhan
     # MIS. Decision 029: NO CNC fallback here (unlike swing-indian's MTF path) —
     # falling back would turn a 5x same-day trade into a 1x overnight DELIVERY
