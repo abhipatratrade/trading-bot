@@ -22,6 +22,7 @@ Tables:
     bucket_state          — per-bucket capital & available balance
     daily_equity_anchor   — start-of-day equity per sub-account (DD breaker)
     heartbeat             — liveness row per service (dead-man's switch)
+    dhan_token            — shared single-session Dhan access token per client id
 """
 
 from __future__ import annotations
@@ -607,6 +608,40 @@ class Heartbeat(Base, TimestampMixin):
         DateTime(timezone=True), nullable=False
     )
     extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class DhanToken(Base, TimestampMixin):
+    """The one live Dhan access token for a client id, shared across machines.
+
+    Dhan keeps a single active token per client id: minting a new one evicts
+    the previous token server-side (established websockets survive, but fresh
+    REST calls and new connections on the old token get 401 / DH-906). The
+    trading bot (Mumbai VM) and the depth-data recorder (a separate VM) both
+    need a live token; if each minted its own they would evict each other
+    roughly once a day — the ping-pong documented on 2026-07-23.
+
+    Fix: the routine minter (the bot, on its morning TOTP refresh and any
+    self-heal) writes the freshly-minted token to this row, and every other
+    process READS it instead of minting a competing one. One row per client
+    id. This is the cross-VM analogue of the on-disk token cache the bot's own
+    processes already share; see ``src/brokers/dhan/auth.py`` and
+    ``token_store.py``. The token is strictly less sensitive than the TOTP
+    secret + PIN that mint it.
+    """
+
+    __tablename__ = "dhan_token"
+    __table_args__ = (
+        UniqueConstraint("client_id", name="uq_dhan_token_client"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    token: Mapped[str] = mapped_column(Text, nullable=False)
+    minted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Which process last minted — "bot" | "recorder" | other. Forensics only.
+    minted_by: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
 # Re-export for convenience: ``from src.core.models import *`` grabs everything.

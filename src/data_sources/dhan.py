@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 
 from src.brokers.dhan.auth import DEFAULT_TOKEN_CACHE_PATH, DhanTokenManager
+from src.brokers.dhan.token_store import PostgresTokenStore
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
 from src.data_sources.base import FundingRate, MarketData, OHLCVBar, Ticker
@@ -111,6 +112,17 @@ class DhanData(MarketData):
         """
         s = settings or get_settings()
         acct = s.dhan_account()
+        # Cross-MACHINE peer: publish every minted token to a Postgres row so a
+        # process on ANOTHER VM (the depth-data recorder) reads it instead of
+        # minting a competitor — Dhan is single-session, so a competing mint
+        # would evict us (2026-07-23 ping-pong). The bot is the routine minter,
+        # hence minted_by="bot". Fail-soft: a DB outage degrades to the on-disk
+        # cache below. Only attach when we actually have a client id to key on.
+        remote_store = (
+            PostgresTokenStore(acct.data_client_id, minted_by="bot")
+            if acct.data_client_id
+            else None
+        )
         token = DhanTokenManager(
             client_id=acct.data_client_id,
             pin=acct.pin,
@@ -119,6 +131,7 @@ class DhanData(MarketData):
             # Shared on-disk cache so the bot, dry run, and prepare job reuse
             # one 24h token instead of each minting into Dhan's 2-min cooldown.
             token_cache_path=DEFAULT_TOKEN_CACHE_PATH,
+            remote_store=remote_store,
         )
         return cls(
             token_manager=token,

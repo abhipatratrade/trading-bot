@@ -28,6 +28,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import httpx
 
@@ -66,6 +67,25 @@ _REFRESH_RETRY_SLEEP = 2.0
 _CACHED_TOKEN_MIN_REMAINING = 60
 
 
+@runtime_checkable
+class TokenStore(Protocol):
+    """A cross-machine shared-token backend (e.g. a Postgres row).
+
+    The manager's on-disk cache only reaches processes on the SAME box; a
+    ``TokenStore`` extends the same single-token-shared invariant to processes
+    on other machines (the depth recorder's VM). It is consulted as a peer
+    source next to the file cache.
+
+    Both methods MUST be fail-soft — ``load`` returns None and ``save``
+    swallows on any error — so a backend outage degrades to the file cache +
+    in-memory last-good token and never raises into the trading loop. The
+    manager only touches it on a refresh or after a 401, never per-tick.
+    """
+
+    def load(self) -> str | None: ...
+    def save(self, token: str) -> None: ...
+
+
 def jwt_exp(token: str) -> int | None:
     """Best-effort parse of a JWT's ``exp`` (unix seconds); None if unparseable.
 
@@ -96,6 +116,7 @@ class DhanTokenManager:
         http: httpx.Client | None = None,
         clock: Callable[[], float] = time.time,
         token_cache_path: Path | None = None,
+        remote_store: TokenStore | None = None,
     ) -> None:
         self._client_id = client_id
         self._pin = pin
@@ -106,6 +127,9 @@ class DhanTokenManager:
         self._clock = clock
         # Persistent cross-process cache. None disables it (tests, static mode).
         self._cache_path = token_cache_path
+        # Cross-MACHINE shared store (Postgres row). None disables it. Peered
+        # with the file cache so the bot and the recorder's VM share one token.
+        self._remote_store = remote_store
         self._token: str | None = static_token
         self._exp: int | None = jwt_exp(static_token) if static_token else None
         # Last token we KNOW was minted successfully, retained across
@@ -119,10 +143,10 @@ class DhanTokenManager:
         # (still timestamp-valid) shared cache — it would just be rejected again.
         self._rejected_token: str | None = None
         self._lock = threading.Lock()
-        # Seed from the shared on-disk token so a cold start reuses a valid
-        # token instead of minting into the 2-minute cooldown.
+        # Seed from the shared token (file cache and/or remote row) so a cold
+        # start reuses a valid token instead of minting into the 2-min cooldown.
         if static_token is None and self.can_refresh:
-            cached = self._load_cache()
+            cached = self._load_peer()
             if cached is not None:
                 self._token = self._last_good_token = cached
                 self._exp = self._last_good_exp = jwt_exp(cached)
@@ -193,8 +217,50 @@ class DhanTokenManager:
             return None
         return tok
 
+    def _load_remote(self) -> str | None:
+        """Read a still-valid token from the remote store, or None.
+
+        Same near-expiry guard as ``_load_cache``. The store is itself
+        fail-soft; the extra guard here just filters a stale/near-expiry row.
+        """
+        if self._remote_store is None:
+            return None
+        try:
+            tok = self._remote_store.load()
+        except Exception:  # noqa: BLE001 — a peer source must never raise here
+            return None
+        if not tok:
+            return None
+        exp = jwt_exp(tok)
+        if exp is None or self._clock() >= exp - _CACHED_TOKEN_MIN_REMAINING:
+            return None
+        return tok
+
+    def _load_peer(self) -> str | None:
+        """Freshest still-valid shared token across the file cache + remote row.
+
+        Both are peer sources written by whichever process last minted; pick
+        the one with the later ``exp`` (a proxy for "minted more recently",
+        since every mint gets a fresh ~24h expiry). Either source being
+        unavailable degrades silently to the other, then to a mint.
+        """
+        best_tok: str | None = None
+        best_exp = -1
+        for tok in (self._load_cache(), self._load_remote()):
+            if tok is None:
+                continue
+            exp = jwt_exp(tok)
+            if exp is not None and exp > best_exp:
+                best_exp, best_tok = exp, tok
+        return best_tok
+
     def _save_cache(self, token: str) -> None:
-        """Persist a freshly-minted token for other processes (0600, atomic)."""
+        """Persist a freshly-minted token for other processes.
+
+        Writes BOTH peer sources: the on-disk cache (0600, atomic — same-box
+        processes) and the remote store (other machines). Each is fail-soft.
+        """
+        self._save_remote(token)
         if not self._cache_path:
             return
         try:
@@ -211,6 +277,19 @@ class DhanTokenManager:
                 path=str(self._cache_path),
                 exc_info=True,
             )
+
+    def _save_remote(self, token: str) -> None:
+        """Publish a freshly-minted token to the remote store. Fail-soft.
+
+        A remote outage must not fail the mint — the file cache and in-memory
+        token still serve this process; only cross-machine sharing degrades.
+        """
+        if self._remote_store is None:
+            return
+        try:
+            self._remote_store.save(token)
+        except Exception:  # noqa: BLE001 — store save is best-effort
+            _log.warning("dhan_token_remote_write_failed", exc_info=True)
 
     def _cached_token_still_valid(self) -> bool:
         """True when ``_last_good_token`` exists and is not near expiry."""
@@ -234,7 +313,7 @@ class DhanTokenManager:
         # theirs instead of minting a competing one, or N processes thrash,
         # each mint invalidating the others every tick. Skip a cached token
         # equal to the one just rejected — it would only be rejected again.
-        peer = self._load_cache()
+        peer = self._load_peer()
         if peer is not None and peer != self._rejected_token:
             self._token = self._last_good_token = peer
             self._exp = self._last_good_exp = jwt_exp(peer)
@@ -283,7 +362,7 @@ class DhanTokenManager:
         # Every mint failed (typically the 2-minute cooldown). First prefer a
         # token a PEER process may have minted since we last looked — that is
         # the whole point of the shared cache — then the in-memory last-good.
-        peer = self._load_cache()
+        peer = self._load_peer()
         if (
             peer is not None
             and peer != self._last_good_token
