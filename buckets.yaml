@@ -93,17 +93,14 @@ buckets:
     capital_inr: 50000
     broker: dhan
     leverage_max: 5          # MIS intraday
-    # PAUSED 2026-07-23 (was live 08:56–09:11 IST). The shared-account scoping
-    # fix (1fe42e1) worked live — the reconciler logged external_position_ignored
-    # for the user's options and touched nothing. But get_positions then began
-    # failing every tick with DH-906 Invalid Token: Dhan single-session tokens
-    # were thrashing (a peer process minting invalidated the running bot's token;
-    # the client didn't self-heal on DH-906). Fixed in commit 9fd5f87. Paused so
-    # the token self-heal can be validated live (bot healthy, no thrash, user's
-    # positions still ignored) BEFORE real money rides on it again. Re-arm is a
-    # deliberate user action, not under an entry-window clock. Only the validated
-    # NIFTY-100 set trades; the ORDER path remains unexercised by any test.
-    enabled: false
+    # RE-ARMED 2026-07-23 (2nd arming). Both live bugs from the 1st arming are
+    # fixed AND validated live: shared-account scoping (1fe42e1 — reconciler
+    # ignores the user's positions) and DH-906 token self-heal (9fd5f87 — no
+    # more thrash). Only the validated NIFTY-100 set trades. The ORDER path
+    # (INTRADAY placement + 15:15 square-off) is still the one thing unexercised
+    # by any test — it goes live on the first qualifying gap-down.
+    # OPERATIONAL: do not log into Dhan while the bot runs (single-session token).
+    enabled: true
     account_ref: dhan
     # MIS. Decision 029: NO CNC fallback here (unlike swing-indian's MTF path) —
     # falling back would turn a 5x same-day trade into a 1x overnight DELIVERY
