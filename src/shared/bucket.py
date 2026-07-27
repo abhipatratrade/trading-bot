@@ -87,6 +87,18 @@ class BucketConfig(BaseModel):
     # affordable quantity — so the bucket never spends more margin than budgeted.
     # None ⇒ no fallback; an ineligible scrip fails loudly.
     fallback_product: str | None = None
+    # Decision 032 — how often the runner takes a full pipeline pass, in
+    # seconds. None ⇒ derived from the fastest timeframe in the bucket (see
+    # ``BucketRunner``). Set it when a bucket's cadence must be pinned
+    # independently of its regime/strategy TFs: swing-indian runs a 1h
+    # strategy under a 1d regime model and needs to act on a 1h close
+    # promptly, not up to 15 minutes later.
+    tick_interval_seconds: int | None = Field(default=None, ge=10, le=3600)
+    # Decision 032 — annual financing rate the broker charges on the FUNDED
+    # portion of a carried position (Dhan MTF ≈ 14.6%/yr). The reconciler
+    # subtracts it from realized P&L per calendar day held. None ⇒ the
+    # product is unfunded (CNC, MIS, crypto) and nothing is charged.
+    carry_interest_apr: Decimal | None = Field(default=None, ge=0, lt=1)
 
 
 class BucketsConfig(BaseModel):

@@ -326,26 +326,26 @@ def test_scanner_config_uses_intraday_engine_and_full_universe() -> None:
 
 
 def test_entry_window_is_per_bucket() -> None:
-    """intraday-indian opens at 09:30; swing-indian still opens at 09:45."""
+    """Each bucket carries its own window; intraday-indian's still closes 10:30.
+
+    swing-indian's spans the whole session since Decision 032 (1h signal bins
+    close at 10:15…15:15, and the stub bin is actioned at the next 09:15 open),
+    so the interesting contrast is the END: at 11:00 the intraday bucket is past
+    its window while the swing bucket is still inside its own.
+    """
     intraday = load_bucket("intraday-indian").config
     swing = load_bucket("swing-indian").config
+
+    def _session(cfg, at):  # noqa: ANN001, ANN202
+        return nse_session(
+            at, parse_ist_time(cfg.entry_start), parse_ist_time(cfg.entry_end)
+        )
+
     at_0935 = datetime(2026, 7, 20, 9, 35, tzinfo=_IST)
-    assert (
-        nse_session(
-            at_0935,
-            parse_ist_time(intraday.entry_start),
-            parse_ist_time(intraday.entry_end),
-        )
-        is NseSession.ENTRY_WINDOW
-    )
-    assert (
-        nse_session(
-            at_0935,
-            parse_ist_time(swing.entry_start),
-            parse_ist_time(swing.entry_end),
-        )
-        is NseSession.OPEN_NO_ENTRY
-    )
+    at_1100 = datetime(2026, 7, 20, 11, 0, tzinfo=_IST)
+    assert _session(intraday, at_0935) is NseSession.ENTRY_WINDOW
+    assert _session(intraday, at_1100) is NseSession.OPEN_NO_ENTRY
+    assert _session(swing, at_1100) is NseSession.ENTRY_WINDOW
 
 
 # ---------------------------------------------------------------------------
@@ -624,12 +624,29 @@ def test_one_x_size_none_without_price() -> None:
 def test_one_x_size_none_when_bucket_declares_no_fallback() -> None:
     """A bucket without ``fallback_product`` never opts into the retry."""
     r = object.__new__(BucketRunner)
-    r.bucket = load_bucket("swing-indian")   # MTF path, no CNC-1x fallback
+    r.bucket = load_bucket("longterm-indian")  # no fallback_product configured
     r._data = _LevFeed(None)
     assert r.bucket.config.fallback_product is None
     assert r._one_x_size(
         price=Decimal("100"), margin_budget=Decimal("10000")
     ) is None
+
+
+def test_swing_bucket_declares_cnc_fallback_so_mtf_retry_is_capped() -> None:
+    """MTF→CNC must be size-capped, not a full-notional cash order.
+
+    Without ``fallback_product`` the runner passes no ``fallback_max_size``, and
+    the Dhan client's MTF retry would re-send the LEVERAGED quantity as cash —
+    ~3.8× the margin the sizer budgeted, out of an account shared with the
+    user's own money (Decision 032).
+    """
+    r = object.__new__(BucketRunner)
+    r.bucket = load_bucket("swing-indian")
+    r._data = _LevFeed(None)
+    assert r.bucket.config.fallback_product == "CNC"
+    assert r._one_x_size(
+        price=Decimal("100"), margin_budget=Decimal("10000")
+    ) == Decimal("100")
 
 
 def test_intraday_bucket_declares_cnc_fallback() -> None:

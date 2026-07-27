@@ -37,7 +37,7 @@ from src.core.alerts import send_alert_dedup
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
-from src.core.models import Position, PositionSide
+from src.core.models import OrderStatus, Position, PositionSide, Trade
 from src.order_manager.manager import OrderManager
 from src.order_manager.ownership import bot_owned_quantities
 
@@ -93,6 +93,28 @@ def expected_trigger(
     return _round_to_tick(raw, tick)
 
 
+def expected_trigger_at_distance(
+    entry_price: Decimal,
+    position_side: str,
+    distance: Decimal,
+    tick: Decimal | None = None,
+) -> Decimal:
+    """Trigger an absolute ``distance`` (quote currency) away from entry.
+
+    The percent form above is a bucket-wide crash net. Some strategies size the
+    stop off the instrument's own volatility instead — swing-indian's 1h mean
+    reversion rests it at ``entry − 3.5 × daily ATR14`` (Decision 032), which is
+    the stop its backtest was validated with. The strategy supplies the rupee
+    distance at entry; it is fixed for the life of the position, exactly as the
+    backtest fixes it at the entry bar.
+    """
+    if position_side == "long":
+        raw = entry_price - distance
+    else:
+        raw = entry_price + distance
+    return _round_to_tick(raw, tick)
+
+
 def plan_stop_protection(
     *,
     positions: list[PositionInfo],
@@ -101,6 +123,7 @@ def plan_stop_protection(
     attribution: dict[str, tuple[str | None, str | None]],
     tick_sizes: dict[str, Decimal | None] | None = None,
     owned_quantities: dict[str, Decimal] | None = None,
+    stop_distances: dict[str, Decimal] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -113,6 +136,12 @@ def plan_stop_protection(
             Position rows; unattributed symbols fall back to the account's
             most conservative (smallest) pct.
         tick_sizes: ``symbol → tick`` for trigger snapping (None ⇒ no snap).
+        stop_distances: ``symbol → absolute distance from entry`` supplied by
+            the strategy that opened the position (Decision 032). Takes
+            precedence over the bucket percent for those symbols; a distance
+            that is missing, non-positive, or wider than the bucket's own
+            crash net is ignored, so a bad number can only ever make the stop
+            tighter than the configured worst case, never looser.
         owned_quantities: SHARED-account guard (Decision 027 followup). When
             provided (Dhan — the account also holds the user's manual trades),
             ONLY symbols present here are the bot's; any other position is the
@@ -165,9 +194,28 @@ def plan_stop_protection(
             continue
 
         want_side = "sell" if pos.side == "long" else "buy"
-        trigger = expected_trigger(
-            pos.entry_price, pos.side, pct, ticks.get(pos.symbol)
-        )
+        tick = ticks.get(pos.symbol)
+        trigger = expected_trigger(pos.entry_price, pos.side, pct, tick)
+        distance = (stop_distances or {}).get(pos.symbol)
+        if distance is not None and distance > 0:
+            strategy_trigger = expected_trigger_at_distance(
+                pos.entry_price, pos.side, distance, tick
+            )
+            # Only ever tighten: the bucket pct is the guaranteed worst case.
+            inside = (
+                strategy_trigger > trigger
+                if pos.side == "long"
+                else strategy_trigger < trigger
+            )
+            if inside and strategy_trigger > 0:
+                trigger = strategy_trigger
+            else:
+                _log.warning(
+                    "stop_distance_ignored_wider_than_bucket_net",
+                    symbol=pos.symbol,
+                    strategy_trigger=str(strategy_trigger),
+                    bucket_trigger=str(trigger),
+                )
 
         kept = None
         for o in existing:
@@ -225,6 +273,49 @@ def _load_attribution(
         return {p.symbol: (p.bucket_id, p.strategy_name) for p in rows}
 
 
+def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
+    """symbol → protective-stop distance stamped on its open entry Trade.
+
+    Strategies that own their stop distance (Decision 032) put it on the entry
+    order via ``OrderManager.place_order(extra_payload=...)``. The newest
+    unpaired entry per symbol wins; anything unparseable is dropped so the
+    sweep silently falls back to the bucket percent.
+    """
+    out: dict[str, Decimal] = {}
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(Trade)
+                .where(
+                    Trade.bucket_id.in_(bucket_ids),
+                    Trade.status.in_(
+                        [OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.OPEN]
+                    ),
+                )
+                .order_by(Trade.created_at.desc())
+                .limit(500)
+            )
+            .scalars()
+            .all()
+        )
+        for t in rows:
+            extra = t.extra or {}
+            if t.symbol in out or extra.get("reduce_only"):
+                continue
+            if extra.get("closed_by_trade_id"):
+                continue
+            raw = extra.get("stop_distance")
+            if raw is None:
+                continue
+            try:
+                value = Decimal(str(raw))
+            except (ArithmeticError, ValueError):
+                continue
+            if value > 0:
+                out[t.symbol] = value
+    return out
+
+
 def ensure_stop_protection(
     *,
     account_ref: str,
@@ -266,6 +357,7 @@ def ensure_stop_protection(
         attribution=_load_attribution(bucket_ids),
         tick_sizes={p.symbol: broker.tick_size(p.symbol) for p in positions},
         owned_quantities=owned,
+        stop_distances=_load_stop_distances(bucket_ids),
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"

@@ -114,6 +114,7 @@ class OrderManager:
         bucket_id: str | None = None,
         strategy_name: str | None = None,
         allow_when_killed: bool = False,
+        extra_payload: dict[str, Any] | None = None,
     ) -> PlacementResult:
         now = self._clock.now()
         client_oid = make_client_order_id(
@@ -153,7 +154,12 @@ class OrderManager:
                 )
 
         # 3. Persist PENDING trade
-        extra: dict[str, Any] = {}
+        # ``extra_payload`` carries per-order facts the placement itself cannot
+        # derive and later stages need off the ledger: the strategy's protective
+        # stop distance (read by the stop sweep — Decision 032) and the margin
+        # the sizer allotted (read by the MTF carry-interest charge). Never
+        # secrets; this row is dashboard-visible.
+        extra: dict[str, Any] = dict(extra_payload or {})
         if reduce_only:
             extra["reduce_only"] = True
         if stop_price is not None:

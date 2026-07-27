@@ -63,21 +63,54 @@ buckets:
     leverage_max: 1
     enabled: false   # Phase 3 — needs Dhan adapter
 
+  # Decision 032 — the bucket's strategy changed. Blasting Momentum (09:45 gap
+  # momentum, daily) is inert; swing-indian now runs Midcap-150 1h Mean
+  # Reversion, holdout-validated PF 2.31 / +24.7% on margin (train fold).
   swing-indian:
+    # Rs 50,000 (house standard). The backtest's unit of risk is a FIXED
+    # Rs 10,000 margin/trade, and allocator.yaml's 0.20 per-symbol cap turns
+    # this capital into exactly that — so per-trade economics match the
+    # validated run and the book is 5 concurrent names instead of the
+    # backtest's 20 (user decision 2026-07-27, quarter scale). Raise THIS to
+    # scale up; never raise per_symbol_cap, which would change the per-trade
+    # size the strategy was validated at.
     capital_inr: 50000
     broker: dhan
     leverage_max: 4
-    # PAUSED 2026-07-22 (user decision) — same reason as longterm-crypto:
-    # TRADING_MODE is global, and this bucket's sandbox soak must not become
-    # real money as a side effect of taking intraday-indian live.
-    # To resume: set enabled: true (and decide sandbox vs live deliberately).
-    enabled: false   # was: Phase 4 full integration on Dhan sandbox
+    # LIVE 2026-07-27 (user decision). TRADING_MODE on the VM is already live
+    # for intraday-indian, so this bucket trades REAL money from the first
+    # qualifying 1h close after deploy. What is exercised: the read path, the
+    # Dhan MTF order path (shared with intraday-indian's INTRADAY path), the
+    # shared-account scoping (1fe42e1) and the token self-heal (9fd5f87).
+    # What is NOT yet exercised live: an MTF entry, a mean-touch exit, and an
+    # ATR-distance resting stop. Watch the first fill.
+    # OPERATIONAL: do not log into Dhan while the bot runs (single-session token).
+    enabled: true
     account_ref: dhan
     product: MTF             # funded delivery; CNC fallback when not MTF-eligible
-    # Decision 022 (amended for swing-indian): this strategy's edge dies with
-    # tight stops, so instead of the 0.5/leverage rule it rests a WIDE
-    # catastrophe stop — 20% below entry, far outside the Supertrend/30-day
-    # exits, catching only a crash while the bot is down.
+    fallback_product: CNC    # MTF-ineligible scrip trades 1x rather than skipping
+    # Entry window. The 1h signal bins close at 10:15…15:15, and the stub bin
+    # (15:15→15:30) is actioned at the NEXT session's 09:15 open — three of the
+    # 214 backtest trades entered that way — so the window spans the session.
+    # The real gate is bar-driven inside the strategy (a signal is only
+    # actionable while its bin is the most recently completed one); this is the
+    # coarse guard around it.
+    entry_start: "09:15"
+    entry_end: "15:30"
+    # A 1h strategy under a 1d regime model: without this the runner would pace
+    # the bucket at the 1d interval (900s) and act on a 1h close up to fifteen
+    # minutes late. The scan itself caches per 1h bin, so a 60s cadence costs
+    # nothing extra in Dhan calls.
+    tick_interval_seconds: 60
+    # Dhan MTF funding cost on the borrowed portion (notional − margin), per
+    # calendar day held. The backtest does NOT model it (~4% of net over 24
+    # months), so the reconciler subtracts it from realized P&L — Decision 032.
+    carry_interest_apr: 0.146
+    # Decision 022 (amended for swing-indian): the STRATEGY's own protective
+    # stop is 3.5 × daily ATR14 from entry, supplied per position and rested on
+    # the exchange by the stop sweep. This percent is the fallback crash net for
+    # any position that arrives without a distance (manual import, reconciler
+    # adoption) — deliberately wide, and the sweep only ever tightens from it.
     stop_loss_pct: 20
 
   # Decision 029 — seventh bucket, amending 013's fixed six. NIFTY-100

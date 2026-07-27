@@ -10,7 +10,10 @@ from src.data_sources.base import OHLCVBar
 from src.shared.scanner import equity
 from src.shared.scanner.engine import load_scanner_config
 
-_SCANNER_YAML = Path("src/strategies/swing/indian/scanner.yaml")
+# Decision 032 moved Blasting Momentum off the bucket's DEFAULT scanner set
+# (scanner.yaml is now the 1h mean-reversion config); its own config lives on
+# under this name so the equity_daily engine stays covered.
+_SCANNER_YAML = Path("src/strategies/swing/indian/scanner_blasting.yaml")
 
 
 def _cfg() -> equity.EquityScanConfig:
@@ -41,7 +44,7 @@ def _daily(increments: list[float]) -> list[OHLCVBar]:
 _PASSING = [(0.15 if i % 3 else -0.1) for i in range(25)] + [1.2, 1.6, 2.0, 2.4, 2.8]
 
 
-def test_swing_indian_scanner_uses_equity_engine() -> None:
+def test_blasting_scanner_uses_equity_engine() -> None:
     cfg = load_scanner_config(_SCANNER_YAML)
     assert cfg.engine == "equity_daily"
 

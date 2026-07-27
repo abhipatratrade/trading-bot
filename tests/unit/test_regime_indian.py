@@ -11,12 +11,18 @@ from src.shared.regime.store import MARKET_SENTINEL
 _REGIME_YAML = Path("src/strategies/swing/indian/regime.yaml")
 
 
-def test_swing_indian_regime_yaml_is_nifty_proxy() -> None:
+def test_swing_indian_regime_gate_is_off() -> None:
+    """Decision 032: the 1h mean-reversion strategy must NOT be regime-gated.
+
+    It buys panic dislocations, so a bull/neutral gate mutes it exactly when it
+    works — in-sample the gate cut net +30.7% → +2–9%. The proxy config is kept
+    for a future re-enable but must stay disabled.
+    """
     cfg = load_regime_config(_REGIME_YAML)
-    assert cfg.enabled is True
+    assert cfg.enabled is False
     assert cfg.proxy_symbol == "NIFTYBEES"
     assert cfg.tf == "1d"
-    assert cfg.symbols == []  # broad-market only (market gate is bull/neutral)
+    assert cfg.symbols == []
 
 
 def test_indian_symbols_direct_ticker_no_translation() -> None:

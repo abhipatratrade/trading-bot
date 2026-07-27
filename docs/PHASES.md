@@ -291,6 +291,48 @@ land, then RETIRE it. `swing-indian` stays `enabled: false` in buckets.yaml.
 - [ ] **OPEN — Decision 022**: strategy has NO protective stop by design; swing-indian
       has no stop_loss_pct. Needs a Decision 022 amendment before real money
 
+### Phase 4 — Midcap-150 1h Mean Reversion (LIVE 2026-07-27)
+
+The real Phase-4 strategy. Decision 032. backtest_ref:
+`Backtesting Engine/strategies/optimized/midcap150_meanrev_1h_swing/TRADING_BOT_HANDOFF.md`.
+Plan around the TRAIN grade: ~PF 2.3, ~+25%/yr on deployed margin, ~4-5% DD,
+~2 trades/day across 94 names, avg 2.7-day hold — less ~4% MTF interest. The
+holdout's +57% is crash-boosted: treat corrections as upside, not the base case.
+At the bucket's quarter scale (5 slots x Rs 10k) expect ~a quarter of the backtest's
+rupee P&L.
+
+- [x] Decision 032 written (quarter scale, old strategy inert, resting ATR stop, MTF interest)
+- [x] `src/shared/scanner/meanrev.py` — 09:15-anchored 15m→1h resample, EMA20 distance,
+      FRESH-cross rule, scale guard, prior-close daily ATR14
+- [x] `engine: equity_meanrev_1h` + `run_meanrev_scan` — caches per 1h bin (~190 Dhan
+      calls per bin, not per 60s tick); enforces the ≤5-new-entries-per-day budget
+- [x] `mean_reversion_1h.py` Strategy — entry on the freshly-closed bin, mean-touch +
+      20-trading-day exits, emits the 3.5xATR stop distance
+- [x] Config set: scanner.yaml (94 pinned Midcap-150 ∩ F&O) / allocator.yaml
+      (μ=0.007465 σ=0.031572 from 214 trades) / master CSV / regime OFF
+- [x] Blasting Momentum made inert: `_blasting_momentum.py`, no master row, configs
+      moved to `scanner_blasting.yaml` / `allocator_blasting.yaml`
+- [x] Strategy-supplied resting stops: `place_order(extra_payload=)` → `Trade.extra`
+      → `plan_stop_protection(stop_distances=)`. Only ever TIGHTENS vs the bucket net
+- [x] MTF carry interest charged on `(notional − margin)` per calendar day at 14.6%/yr
+- [x] Cadence: bucket paces to its fastest tf; `tick_interval_seconds: 60` pinned
+- [x] **MTF→CNC fallback size bug fixed** — it re-sent the LEVERAGED quantity as cash
+      (~Rs 38k for a Rs 10k slot, on the account shared with the user's own money).
+      Now capped at 1x like the MIS path (Decision 031's guard, generalised)
+- [x] Parity harness vs the 214 frozen backtest trades → **208/214** on cross, dist and
+      ATR stop. The 6 misses are the EMA20 warm-up guard at the data boundary
+      (5 on 2024-06-04 with 96 of 100 bins; WAAREEENER = an 11-day-old IPO)
+- [x] 36 new unit tests; full suite 401 green (4 pre-existing env failures); ruff clean
+- [x] **LIVE**: `enabled: true`, real money, from the first qualifying 1h close
+- [ ] **UNEXERCISED — watch the first trade**: an MTF entry, a mean-touch exit, and the
+      ATR-distance resting stop have never run against the real venue. Run
+      `scripts/meanrev_dryrun.py` just after a bin close to check the read path first
+- [ ] Confirm the 90-day 15m pull succeeds for all 94 names inside the rate limit
+      (~190 calls/bin at 4.5 req/s ≈ 45s) and that the EMA20 series comes back warm
+- [ ] Confirm `carry_interest` lands on the first closed round-trip (`Trade.extra`)
+- [ ] Re-derive the 94-name universe after each Midcap-150 rebalance
+- [ ] Expect return BELOW the backtest: 5 concurrent slots, not 20
+
 ## Phase 4b — Stocks Intraday (intraday-indian) [inserted 2026-07-21]
 
 NIFTY-100 gap-down reversal — Decision 029. backtest_ref:
@@ -350,6 +392,7 @@ Append a one-liner per session for traceability.
 
 - 2026-07-21 (cont.) — Decision 030, five user-chosen follow-ups to 029. (1) Capital back to ₹50k: ₹50k×5x caps notional at ₹2.5L so 5×₹1L is impossible; kept per_symbol_cap 0.20 → 5 slots × ₹50k, costing ~0.02% more round-trip (~3% of edge) vs the ₹10k cliff at 0.2%/leg. (2) BROAD scanner set via Decision 026: Midcap150+Smallcap100 = 235 names after dropping 15 NIFTY-100 overlaps (they'd double-enter — dedup is per bucket+strategy+symbol and the sets run as different strategy names); `gap_down_reversal_broad` subclasses the validated strategy so logic can't diverge; explicitly NOT holdout-validated. (3) CIRCUIT FILTER — the obvious "band ≥20%" test was actively wrong: only 2 of 99 NIFTY-100 names have a 20% band because 97 are F&O with a *dynamic* band, so a width filter would have rejected the validated universe. Correct test is "F&O underlying OR hard band ≥20%", excluding 5 of 235; `fno`/`band_pct` now ride in the Dhan universe cache. (4) MIS: Dhan had NO intraday product — client was MTF-only w/ CNC fallback, so this bucket would have routed funded *delivery*. `product` is now per-ORDER (one Dhan account = one adapter); INTRADAY gets no CNC fallback (would turn 5x same-day into 1x overnight). Leverage is never predicted — new `Broker.required_margin` asks Dhan `/v2/margincalculator` and the runner fits size to the answer, degrading to 1x when unavailable. ENDPOINT UNEXERCISED — soak is its acceptance test. (5) Two holes from one root cause (components trusting a sweep-stale bucket_state mirror): size_positions ran per-strategy against full capital so two sets could each claim 100% (fixed: runner threads committed_margin, budget capped at min(wallet, capital) per Decision 027); and dashboard P&L read the SHARED Dhan wallet for every Indian bucket (the reconciler already warned "capital double-counted") — Indian buckets now use `bucket_ledger_pnl` off their own Trade rows, crypto keeps the wallet mirror. Parity still 75/76. 302 tests green, ruff clean. Still DARK.
 
+- 2026-07-27 — **Phase 4 LIVE**: `swing-indian` re-armed on real money with Midcap-150 1h Mean Reversion (Decision 032), replacing Blasting Momentum (now inert). Holdout-validated PF 2.31 / +24.7% on margin (train fold); running at quarter scale — `capital_inr` Rs 50k x `per_symbol_cap` 0.20 = the backtest's fixed Rs 10k margin/trade, 5 concurrent slots instead of 20. New `scanner/meanrev.py` + `engine: equity_meanrev_1h`: 15m→1h resample anchored 09:15 IST (7 bins/session, the last a 15-min stub that is a real signal bar — 3 of 214 backtest trades entered at the FOLLOWING 09:15 open), EMA20 distance, FRESH -6.5% cross only, adjusted/unadjusted scale guard, prior-close daily ATR14. Scan caches per 1h bin so a 60s tick costs ~190 Dhan calls per BIN, not per minute. Three pieces of new shared plumbing: strategy-supplied RESTING stops (`extra_payload` → `Trade.extra` → `plan_stop_protection(stop_distances=)`, which can only ever tighten vs the bucket's 20% net), MTF carry interest booked on `(notional − margin)` at 14.6%/yr per calendar day (the backtest omits it, ~4% of net), and a per-bucket `tick_interval_seconds` because a 1d regime model would otherwise have paced a 1h strategy at 900s. **Found and fixed a live-money hazard on the way in**: the Dhan MTF→CNC fallback re-sent the LEVERAGED quantity as a cash order — ~Rs 38k for a Rs 10k slot, on the account shared with the user's manual trading — now capped at 1x like the MIS path. Regime gate turned OFF for this bucket (in-sample the gate cut net +30.7% → +2-9% by removing the crash-rebound trades that ARE the edge). Parity harness vs the 214 frozen trades: **208/214** on cross, dist and ATR stop; the 6 misses are all the EMA20 warm-up guard at the data boundary (Rs 13,660 of net, all winners — the port is conservative, not broken). 36 new tests, 401 green, ruff clean. UNEXERCISED: an MTF entry, a mean-touch exit and the resting ATR stop against the real venue.
 - 2026-07-21 — Phase 4b BUILT (disabled): `intraday-indian`, the seventh bucket (Decision 029, amends 013), implementing the holdout-validated NIFTY-100 gap-down reversal from the Backtesting Engine handoff. New `TradingType.INTRADAY`; buckets.yaml entry at **₹1,00,000** (not ₹50k — the frozen 20% cap × 5x MIS must yield the ₹1L notional the backtest was validated at; costs ate ~99% of gross at ₹10k/trade); migration 0009 seeds bucket_state idempotently at `enabled=false`. New `scanner/patterns.py` (TV engulfing_bull + hammer, 1:1 port) and `scanner/gap_reversal.py` (`engine: equity_intraday`) — the morning cut runs ONCE per session and caches to DailyUniverse, since re-screening 99 symbols on every 60s tick would recompute a constant. `nse_session` generalised to a per-bucket entry window (09:30 here vs swing's 09:45; defaults unchanged). Regime gate deliberately OFF (fades panic — the holdout that earned +13.3% IS the Apr-25 crash); wide 15% catastrophe stop per Decision 028's logic. **Parity harness against all 76 frozen backtest trades: 75/76 exact on gap screen, pattern name AND entry bar time.** Two real bugs it caught: (1) `body_avg` is a 14-EMA that must run over the FULL multi-session series — session-scoping it reproduced only 33/76, because a gap morning's opening candles inflate the average and kill `long_body`; (2) the corporate-action guard needed reformulating for live (Dhan publishes no same-day daily bar — the 07-14 STALE-CLOSE bug), accepted cost = VEDL 2025-08-26 whose daily history is rescaled ×0.374 by the later Vedanta demerger; the scale-invariant alternative was worse (5m closes 15:25, misses the closing auction, ~1% disagreement rejected IOC/TORNTPHARM on noise). 19 new tests, 295 green, ruff clean. **Ships DARK — user flips `enabled: true` after review.**
 
 - 2026-04-30 — Phase 0 kicked off: scaffold + continuity files written.

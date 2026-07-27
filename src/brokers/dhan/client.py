@@ -249,25 +249,27 @@ class DhanClient(Broker):
         try:
             result = self._request("POST", "/v2/orders", body)
         except DhanAPIError:
-            # MTF-ineligible scrips reject; retry once as CNC (1× delivery).
-            if product_type == "MTF" and self._mtf_fallback_cnc:
-                self._log.warning("mtf_rejected_retry_cnc", symbol=request.symbol)
-                body = self._order_body(request, security_id, exchange, "CNC")
-                result = self._request("POST", "/v2/orders", body)
-            # MIS-ineligible scrips reject too. Decision 029 originally failed
-            # loudly here; amended 2026-07-27 (user decision) to fall back to
-            # 1× CNC so the trade still happens. The size MUST be clamped to
-            # ``fallback_max_size``: ``size`` was sized for leveraged MIS, so
-            # re-sending it on a cash product would consume `leverage`× the
-            # budgeted margin. No cap supplied ⇒ no fallback, rejection stands.
-            elif product_type == "INTRADAY" and request.fallback_max_size is not None:
+            # A scrip the venue grants no MTF (or no MIS) on rejects the order.
+            # Decision 029, amended 2026-07-27 (user decision): trade it 1× CNC
+            # rather than skip it — but the size MUST be clamped to
+            # ``fallback_max_size``. ``size`` was computed at the leveraged
+            # product's multiple, so re-sending it on a cash product would
+            # consume `leverage`× the margin the sizer budgeted for the slot
+            # (at swing-indian's ~3.8× MTF, a ₹10k slot would spend ~₹38k of
+            # cash — on an account shared with the user's own money). No cap
+            # supplied ⇒ no fallback, and the rejection stands.
+            leveraged = product_type == "MTF" and self._mtf_fallback_cnc
+            if (
+                leveraged or product_type == "INTRADAY"
+            ) and request.fallback_max_size is not None:
                 capped = min(request.size, request.fallback_max_size)
                 if capped < 1:
                     raise
                 effective = replace(request, size=capped)
                 self._log.warning(
-                    "mis_rejected_retry_cnc_1x",
+                    "leveraged_product_rejected_retry_cnc_1x",
                     symbol=request.symbol,
+                    product=product_type,
                     requested_size=str(request.size),
                     cnc_size=str(capped),
                 )

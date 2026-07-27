@@ -49,6 +49,10 @@ _INTRADAY_MINUTES: dict[str, str] = {
     "1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60",
 }
 
+# Dhan's intraday charts endpoint serves at most ~90 calendar days per request
+# (the chunk size the Backtesting Engine's downloader paginates with).
+_INTRADAY_MAX_DAYS = 90
+
 # Charts-endpoint 429 backoff (Dhan Data API cap: 5 req/s). Attempts include
 # the first try; base × 2^attempt, capped, unless the response carries a
 # Retry-After header (honoured verbatim).
@@ -335,6 +339,32 @@ class DhanData(MarketData):
             )
         return self._intraday(security_id, exchange, minutes)
 
+    def get_ohlcv_history(
+        self, symbol: str, interval: str, *, days: int
+    ) -> list[OHLCVBar]:
+        """Intraday bars over a WIDE window (``days`` calendar days back).
+
+        ``get_ohlcv`` deliberately pulls only the last 5 days for intraday: the
+        tick paths (gap reversal, exits) look at today's session, and a 5-day
+        request is one small response per symbol. The 1h mean-reversion signal
+        is the exception — its EMA(20) runs on a continuous 1h series and needs
+        months of warmup before it agrees with the backtest's value, so it asks
+        for its own window here rather than widening the default for everyone.
+
+        Capped at Dhan's 90-day intraday request limit (the same chunk size the
+        Backtesting Engine's downloader uses).
+        """
+        security_id, exchange = self._resolve(symbol)
+        minutes = _INTRADAY_MINUTES.get(interval)
+        if minutes is None:
+            raise ValueError(
+                f"Unsupported Dhan interval {interval!r}; "
+                f"valid: {list(_INTRADAY_MINUTES)}"
+            )
+        return self._intraday(
+            security_id, exchange, minutes, days=min(days, _INTRADAY_MAX_DAYS)
+        )
+
     def _daily(self, security_id: str, exchange: str, limit: int) -> list[OHLCVBar]:
         to_d = datetime.now(UTC).date()
         # ~1.5 calendar days per trading day covers weekends/holidays.
@@ -347,12 +377,14 @@ class DhanData(MarketData):
         data = self._charts("historical", payload)
         return self._parse_candles(data)[-limit:]
 
-    def _intraday(self, security_id: str, exchange: str, minutes: str) -> list[OHLCVBar]:
+    def _intraday(
+        self, security_id: str, exchange: str, minutes: str, days: int = 5
+    ) -> list[OHLCVBar]:
         today = datetime.now(UTC).date()
         payload = {
             "securityId": security_id, "exchangeSegment": exchange,
             "instrument": "EQUITY", "interval": minutes,
-            "fromDate": str(today - timedelta(days=5)), "toDate": str(today),
+            "fromDate": str(today - timedelta(days=days)), "toDate": str(today),
         }
         return self._parse_candles(self._charts("intraday", payload))
 

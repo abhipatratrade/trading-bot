@@ -168,8 +168,17 @@ class BucketRunner:
         )
         # Full pipeline passes are paced to the bucket's timeframe; the
         # 60s main loop skips this runner until the interval elapses.
-        self.tick_interval_seconds: int = tick_interval_for_tf(
-            self.regime_config.tf
+        #
+        # The pace is the FASTEST thing in the bucket, not the regime's own TF:
+        # swing-indian keeps a 1d regime model while running a 1h strategy, and
+        # pacing that bucket at the 1d interval (900s) would act on a 1h close
+        # up to fifteen minutes late. ``tick_interval_seconds`` in buckets.yaml
+        # overrides both when a bucket needs a specific cadence.
+        tfs = [self.regime_config.tf] + [row.tf for row in self.master.rows]
+        self.tick_interval_seconds: int = (
+            bucket.config.tick_interval_seconds
+            if bucket.config.tick_interval_seconds is not None
+            else min(tick_interval_for_tf(tf) for tf in tfs)
         )
 
     # ── Main entry ─────────────────────────────────────────────────────
@@ -265,6 +274,7 @@ class BucketRunner:
                     require_binance_listed=(
                         self.bucket.market.value == "crypto"
                     ),
+                    now=self._clock.now(),
                 )
             return scans[name]
 
@@ -331,6 +341,7 @@ class BucketRunner:
             # Honor the strategy's declared direction (Decision 021: some
             # strategies are long-only, others long/short).
             sides = {ec.symbol: ec.side for ec in entry_candidates}
+            hints = {ec.symbol: ec.hint for ec in entry_candidates}
             mark_prices = self._collect_mark_prices(symbols)
 
             # Per-symbol regimes for the sizer (one HMM call per
@@ -409,6 +420,10 @@ class BucketRunner:
                         fallback_max_size=self._one_x_size(
                             price=mark_prices.get(sym),
                             margin_budget=res.required_margin_inr,
+                        ),
+                        extra_payload=_entry_extra(
+                            hint=hints.get(sym, {}),
+                            margin_inr=res.required_margin_inr,
                         ),
                     )
                     placed += 1
@@ -756,6 +771,7 @@ class BucketRunner:
         side: str,
         size: Decimal,
         fallback_max_size: Decimal | None = None,
+        extra_payload: dict[str, object] | None = None,
     ) -> None:
         try:
             om.place_order(
@@ -769,6 +785,7 @@ class BucketRunner:
                 leverage=self.bucket.config.leverage_max,
                 product=self.bucket.config.product,
                 fallback_max_size=fallback_max_size,
+                extra_payload=extra_payload,
                 intent_id=f"open-{self._clock.now().strftime('%Y%m%d%H%M')}",
             )
         except KillSwitchEngagedError:
@@ -794,6 +811,28 @@ class BucketRunner:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _entry_extra(
+    *, hint: dict[str, object], margin_inr: Decimal
+) -> dict[str, object]:
+    """Facts stamped on the entry Trade for downstream stages to read back.
+
+    ``stop_distance`` (from the strategy's ``EntryCandidate.hint``) is what the
+    stop sweep rests the broker-side protective order at — Decision 032's
+    per-instrument ATR stop, instead of the bucket-wide percent net.
+    ``margin_inr`` is the own-capital the sizer allotted this slot, which is
+    what the MTF carry-interest charge measures the funded portion against.
+    Both are plain strings so the JSONB round-trips losslessly.
+    """
+    out: dict[str, object] = {"margin_inr": str(margin_inr)}
+    distance = hint.get("stop_distance")
+    if distance is not None:
+        out["stop_distance"] = str(distance)
+    signal = hint.get("signal")
+    if signal is not None:
+        out["signal"] = str(signal)
+    return out
+
+
 def _empty_summary(bucket_id: str) -> RunSummary:
     return RunSummary(
         bucket_id=bucket_id,

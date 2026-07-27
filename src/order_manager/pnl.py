@@ -72,6 +72,36 @@ def realized_pnl(
     return gross - total_fees
 
 
+def carry_interest(
+    *,
+    notional: Decimal,
+    margin: Decimal | None,
+    annual_rate: Decimal | None,
+    days: int,
+) -> Decimal:
+    """Financing cost of a broker-FUNDED position, for ``days`` calendar days.
+
+    Dhan MTF lends the difference between the position's notional and the
+    own-capital margin, and charges interest on that funded portion per day
+    held (Decision 032). The backtest omits this — measured at ~₹6.5k on ₹164k
+    of net over 24 months, ~4% — so the bot books it when a round-trip closes
+    rather than quietly reporting a P&L the strategy never earned.
+
+        interest = max(0, notional − margin) × annual_rate × days / 365
+
+    Returns 0 when the bucket has no rate configured (unfunded products: CNC,
+    MIS intraday, crypto), when the margin was never stamped on the entry, or
+    when the position closed the same day it opened (MTF funding begins at the
+    overnight carry).
+    """
+    if annual_rate is None or margin is None or days <= 0:
+        return Decimal("0")
+    funded = notional - margin
+    if funded <= 0:
+        return Decimal("0")
+    return funded * annual_rate * Decimal(days) / Decimal("365")
+
+
 def pnl_pct(pnl: Decimal, notional: Decimal) -> Decimal | None:
     """P&L as % of traded notional. None when notional is not positive."""
     if notional <= 0:

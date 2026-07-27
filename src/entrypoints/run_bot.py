@@ -200,6 +200,9 @@ def main() -> None:
     # buckets.yaml must never be able to take down the live crypto path.
     dhan_data: DhanData | None = None
     dhan_accounts: dict[str, list[str]] = {}
+    # Broker financing rate on the funded portion of a carried position
+    # (Decision 032) — subtracted from realized P&L by the reconciler.
+    carry_aprs: dict[str, Decimal] = {}
     for bucket in all_buckets:
         if (
             bucket.config.enabled
@@ -210,6 +213,8 @@ def main() -> None:
             bucket_fx[bucket.id] = Decimal("1")  # Dhan wallet is INR-native
             if bucket.config.stop_loss_pct is not None:
                 stop_pcts[bucket.id] = bucket.config.stop_loss_pct
+            if bucket.config.carry_interest_apr is not None:
+                carry_aprs[bucket.id] = bucket.config.carry_interest_apr
     if dhan_accounts:
         try:
             # Pace charts calls under Dhan's 5 req/s Data-API cap: the
@@ -243,6 +248,9 @@ def main() -> None:
                     # The Dhan account is SHARED with the user's manual trading
                     # (Decision 027) — only manage positions the bot opened.
                     shared_account=True,
+                    carry_interest_apr={
+                        b: r for b, r in carry_aprs.items() if b in ref_bucket_ids
+                    },
                 )
                 accounts[ref] = ref_bucket_ids  # breakers/stops/reconcile loops
                 data_by_ref[ref] = dhan_data

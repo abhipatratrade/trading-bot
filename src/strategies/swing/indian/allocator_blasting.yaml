@@ -1,0 +1,33 @@
+# Position-size config for swing-indian (Blasting Momentum v1).
+#
+# backtest_ref: Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md
+#
+# mu/sigma are POOLED per-1D-period stats derived from the 41 backtest trades
+# (933 position-days, Nifty 500, 2025-07-07..2026-07-09):
+#   mu_per_period    = sum(trade returns) / sum(days held)  = 0.00146 / day
+#   sigma_per_period = std(trade returns) / sqrt(avg hold)  = 0.1413 / sqrt(22.8)
+#                    = 0.0296 / day
+# The scanner picks change daily, so per-symbol stats are meaningless here —
+# every candidate uses default_for_unknown (strategy-level stats, not
+# symbol-level). Kelly* = mu/sigma^2 ~ 1.67 raw; fractional 0.25 and the 20%
+# per-symbol cap (5-slot equal weight) are the binding constraints in practice.
+#
+# Leverage: bucket leverage_max=4 in buckets.yaml covers the chosen 3x MTF
+# (Dhan productType=MTF, funded ~2/3 at ~14-18% p.a. — funding drag is NOT in
+# mu; at 3x the backtest-implied net is ~+54%/yr on margin with ~22% margin-DD).
+
+fractional_kelly: 0.25
+per_symbol_cap: 0.20      # 5-slot equal-weight basket: 20% of bucket per name
+aggregate_cap: 1.00
+
+regime_multipliers:
+  bear: 0.00
+  neutral: 0.40
+  bull: 1.00
+
+# All scanner candidates use this (daily-rotating universe -> no per-symbol stats).
+default_for_unknown:
+  mu_per_period: 0.00146    # per 1D bar, pooled from backtest trades
+  sigma_per_period: 0.0296  # per 1D bar
+
+stats: {}

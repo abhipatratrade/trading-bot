@@ -1,45 +1,81 @@
-# swing-indian scanner — Blasting Momentum v1.
+# swing-indian scanner — Midcap-150 1h Mean Reversion (Decision 032).
 #
-# backtest_ref: Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md
-#   (Nifty 500 ~1yr: +23.5% unlevered, PF 1.71, DD 7.3%, 41 trades,
-#    OOS halves +9.7%/+10.5%. At 3x MTF ~ +54% on margin, margin-DD ~22%.)
+# backtest_ref: Backtesting Engine/strategies/optimized/midcap150_meanrev_1h_swing/
+#   (TRADING_BOT_HANDOFF.md + mean_reversion_1h_swing_rules.json; engine
+#    mean_reversion_1h_scanner.py, whose MeanRevConfig defaults ARE this config;
+#    findings in results/learnings/2026-07-23_meanrev_1h_nifty100.md)
 #
-# Universe: the ENTIRE tradeable NSE + BSE cash-equity universe (user decision
-# 2026-07-10), resolved from the Dhan scrip master (NSE SEGMENT=E SERIES=EQ +
-# BSE equities, deduped preferring the NSE listing). NOTE: the backtest was run
-# on Nifty 500 only — whole-market adds untested micro-caps; the price/turnover
-# floors below are the guardrails. Watch live fill quality before trusting.
+#   24-month holdout validation, Rs 10k margin/trade at per-stock MTF (avg 3.79x):
+#     TRAIN   2025-07 -> 2026-07    82 trades  +24.7%  wr ~72%  PF 2.31  DD 4.4%
+#     HOLDOUT 2024-06 -> 2025-06   132 trades  +57.1%  wr ~75%  PF 3.04  DD 5.3%
+#   Plan around the TRAIN grade. The holdout is crash-boosted (mean reversion
+#   feasts on the Apr-2025 crash) -- treat corrections as upside, not the base
+#   case, and subtract ~4% for the MTF interest the bot books itself.
 #
-# Filter/ranker names below are the Phase-4 contract: implementations register
-# in src/shared/scanner/filters/ when the Dhan data adapter lands (Decision 012,
-# Phase 3/4). Until then the bucket stays disabled in buckets.yaml and the
-# interim runner (scripts/dhan-scanner/) executes the same spec on the sandbox.
+# This is the bucket's DEFAULT scanner set. The previous occupant (Blasting
+# Momentum, engine equity_daily over the whole NSE+BSE universe) moved to
+# scanner_blasting.yaml / allocator_blasting.yaml and is currently inert: its
+# strategy file is _blasting_momentum.py (leading underscore => the loader skips
+# it) and it has no strategy_master.csv row. Re-enabling it means renaming the
+# file back, restoring its row with scanner=blasting, and re-arming the nightly
+# dhan-prepare timer for this bucket.
 #
-# Scan moment: 09:45 IST. Daily-side indicators are as of the PRIOR close
-# (no look-ahead); gap/volume confirm on the morning's 15m bars.
+# Scan moment: every COMPLETED 1h bin, i.e. 10:15, 11:15, 12:15, 13:15, 14:15,
+# 15:15 and the 15:15->15:30 stub (whose entry lands at the next 09:15 open).
+# Bins are resampled from Dhan 15m anchored to the 09:15 IST session open, which
+# is what a TradingView 1h chart shows.
 
-# engine: which scan path in src/shared/scanner/engine.py runs this config.
-# equity_daily = two-phase Dhan path (daily-prepare shortlist + intraday confirm).
-engine: equity_daily
-universe: nse_bse_all_equities
-universe_size: 5                    # top-5 basket (max_positions)
+# engine: the 1h EMA20-dislocation path in src/shared/scanner/engine.py
+# (run_meanrev_scan -> src/shared/scanner/meanrev.py). Caches per 1h bin, so a
+# 60s tick loop does not re-fetch 94 symbols every minute.
+engine: equity_meanrev_1h
+universe: nifty_midcap_150_fno
+universe_size: 5                    # max NEW entries surfaced per bin
 
 filters:
-  - name: gap_up_pct_min            # (09:45 price / prev daily close - 1)*100
-    params: { threshold: 2.0 }
-  - name: daily_rsi_min_rising      # RSI(14) as of prior close, and rising d/d
-    params: { period: 14, threshold: 65.0 }
-  - name: daily_ema_stack           # EMA(fast) > EMA(slow), prior close
-    params: { fast: 10, slow: 20 }
-  - name: daily_cci_min             # CCI(14) as of prior close
-    params: { period: 14, threshold: 200.0 }
-  - name: cum_volume_min            # shares traded 09:15 -> 09:45
-    params: { threshold: 20000 }
-  - name: price_band_inr
-    params: { low: 100.0, high: 2000.0 }
-  - name: turnover_min_inr          # price x cum_vol (size proxy)
-    params: { threshold: 500000 }
+  - name: ema_distance_cross        # FRESH downward cross of the band:
+    params:                         #   dist[t] <= -6.5 AND dist[t-1] > -6.5
+      ema_len: 20                   # EMA(20) on the continuous 1h close
+      threshold_pct: 6.5            # DO NOT LOWER -- 4.5% is net-negative
+  - name: protective_stop           # resting broker-side stop (Decision 022/032)
+    params:
+      atr_period: 14                # DAILY ATR, value as of the prior close
+      atr_mult: 3.5
+  - name: max_hold
+    params: { trading_days: 20 }    # rare backstop; mean_touch does the work
+  - name: daily_entry_cap
+    params: { max_new_per_day: 5 }  # portfolio rule, filled chronologically
+  - name: scale_guard               # unadjusted 1h vs adjusted 1D divergence
+    params: { tolerance: 0.03 }     # split/bonus names are dropped, not traded
+  - name: fno_only
+    params: { required: true }      # non-F&O midcaps were net losers
+  - name: history
+    params: { intraday_lookback_days: 90 }   # EMA20 warmup on the 1h series
 
 ranker:
-  name: gap_up_pct_desc             # strongest gappers first
+  name: deepest_dislocation_first   # tie-break on the same bin = more negative dist
   params: {}
+
+# NIFTY-Midcap-150 INTERSECT NSE F&O as of 2026-07-24 (universe_snapshot.json in
+# the backtest_ref folder). Pinned in git so the scanned set is auditable
+# (House Rule 7); the scan additionally re-checks the F&O flag against the live
+# scrip master each bin and logs anything that has dropped out. Re-derive after
+# each index rebalance -- see docs/runbook.md.
+symbols: [
+  360ONE, ABCAPITAL, ALKEM, APLAPOLLO, ASHOKLEY, ASTRAL,
+  AUBANK, AUROPHARMA, BANKINDIA, BDL, BHARATFORG, BHEL,
+  BIOCON, BLUESTARCO, BSE, COCHINSHIP, COFORGE, COLPAL,
+  CONCOR, DABUR, DALBHARAT, DIXON, EXIDEIND, FEDERALBNK,
+  FORTIS, GLENMARK, GMRAIRPORT, GODFRYPHLP, GODREJPROP, "GVT&D",
+  HAVELLS, HEROMOTOCO, HINDPETRO, ICICIGI, ICICIPRULI, IDEA,
+  IDFCFIRSTB, INDIANB, INDUSINDBK, INDUSTOWER, IREDA, JSWENERGY,
+  JUBLFOOD, KALYANKJIL, KEI, KPITTECH, LAURUSLABS, LICHSGFIN,
+  LICI, LTF, LUPIN, MANKIND, MARICO, MCX,
+  MFSL, MOTILALOFS, MPHASIS, NAM-INDIA, NATIONALUM, NAUKRI,
+  NHPC, NMDC, NYKAA, OBEROIRLTY, OFSS, OIL,
+  PAGEIND, PATANJALI, PAYTM, PERSISTENT, PETRONET, PHOENIXLTD,
+  PIIND, POLICYBZR, POLYCAB, POWERINDIA, PREMIERENE, PRESTIGE,
+  RADICO, RVNL, SAIL, SBICARD, SRF, SUPREMEIND,
+  SUZLON, SWIGGY, TATAELXSI, TIINDIA, UNOMINDA, UPL,
+  VMM, VOLTAS, WAAREEENER, YESBANK,
+]

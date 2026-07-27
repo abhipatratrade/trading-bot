@@ -979,3 +979,131 @@ delivery — the exact exposure 030(4) avoided. (b) At 1x the notional is
 ~0.62% mean trade — Decision 030(1)'s "real cliff". The fallback therefore
 trades a thin-to-negative edge in exchange for participating at all; it is
 expected to be rare, since MIS-ineligibility is uncommon among liquid names.
+
+---
+
+## 032 — swing-indian goes live on Midcap-150 1h mean reversion
+Date: 2026-07-27
+Status: Accepted (user decision, 2026-07-27)
+Amends: 028 (the bucket's stop), 031 (the MTF leg of the CNC fallback)
+backtest_ref: `Backtesting Engine/strategies/optimized/midcap150_meanrev_1h_swing/`
+(TRADING_BOT_HANDOFF.md + mean_reversion_1h_swing_rules.json; engine
+`mean_reversion_1h_scanner.py`; findings in
+`results/learnings/2026-07-23_meanrev_1h_nifty100.md`)
+
+The backtester handed over a holdout-validated 1h mean-reversion swing
+strategy. The user chose to take it **live** (real money, quarter scale) rather
+than stage it on sandbox. It replaces Blasting Momentum as the bucket's
+strategy; that one never traded live and is now inert.
+
+**The strategy.** Evaluated on every completed 1h bar (resampled from Dhan 15m,
+anchored per IST day to 09:15 — a TradingView 1h chart) across NIFTY-Midcap-150
+∩ NSE F&O (94 names). `dist = (close/ema20 − 1) × 100`; a **fresh** downward
+cross of −6.5% (`dist[t] ≤ −6.5 AND dist[t−1] > −6.5`, so a stuck-stretched name
+does not re-fire) goes LONG at the next bar's open. Exits: 1h close ≥ EMA20
+(mean touch, the primary), a 3.5 × daily-ATR14 protective stop, or 20 trading
+days. Long-only, ≤5 new entries/day, one position per symbol.
+
+Validated 24 months at ₹10k margin/trade on per-stock MTF (avg 3.79×):
+train (2025-07→2026-07) 82 trades +24.7% PF 2.31 DD 4.4%; frozen holdout
+(2024-06→2025-06) 132 trades +57.1% PF 3.04 DD 5.3%. **Plan around the TRAIN
+grade** — the holdout is crash-boosted, because this is a convex buy-the-panic
+book. Monte Carlo: day-cluster bootstrap P(net≤0) = 0.00%.
+
+### The four decisions this needed
+
+**(1) Quarter scale, not full.** The backtest's unit of risk is a FIXED ₹10,000
+of own capital per trade, with `capital_base = 20 slots × ₹10k = ₹200k`. The
+bucket keeps `capital_inr: 50000`, and `per_symbol_cap: 0.20` turns that into
+exactly ₹10k/slot — so per-trade economics (≈₹38k notional at MTF) match the
+validated run and only the book size differs: 5 concurrent names, not 20. A 6th
+simultaneous signal is skipped as `SKIPPED_INSUFFICIENT`, never sized down. To
+scale up, raise `capital_inr`; never `per_symbol_cap`.
+
+**(2) The old strategy goes inert, not live alongside.** Enabling the bucket
+would have armed Blasting Momentum's order path, which has never run outside
+the Dhan sandbox. It is now `_blasting_momentum.py` (leading underscore ⇒ the
+loader skips it) with no `strategy_master.csv` row, and its configs live at
+`scanner_blasting.yaml` / `allocator_blasting.yaml`. Consequences worth
+knowing: the bucket's DEFAULT scanner set is now `equity_meanrev_1h`, so the
+nightly `dhan-prepare` timer (which only visits `equity_daily` buckets) no
+longer sweeps 4,600 names for it; and `regime.yaml` is now **disabled**,
+because the bull/neutral gate existed for Blasting Momentum and is actively
+harmful here — in-sample it cut net +30.7% → +2–9% by removing the
+crash-rebound trades that ARE the edge.
+
+**(3) The ATR stop RESTS on the exchange.** Decision 028 gave this bucket a
+wide 20% catastrophe net because Blasting Momentum's edge died with tight
+stops. This strategy's backtest is validated WITH a stop, at
+`entry − 3.5 × daily_ATR14` (≈9–12% on a midcap), modelled as gap-through — so
+a tick-checked exit would be both less faithful and useless while the bot is
+down. `plan_stop_protection` therefore takes an optional per-symbol
+`stop_distances` map: the strategy emits the rupee distance in its
+`EntryCandidate.hint`, `BucketRunner` stamps it on the entry `Trade.extra` (via
+a new `OrderManager.place_order(extra_payload=...)`), and the sweep reads it
+back. **The override can only ever tighten** — a distance wider than the
+bucket's own percent net is refused and logged, so the configured worst case
+holds no matter what the ATR read does. Buckets that supply no distance behave
+exactly as before.
+
+**(4) The bot books MTF interest itself.** The backtest omits Dhan's funding
+cost (measured ~₹6,456 on ₹163,636 of net, ~4%). `carry_interest_apr: 0.146` on
+the bucket makes the reconciler subtract
+`(notional − margin) × rate × days/365` from realized P&L when a round-trip
+closes — funded portion only, so the 1× CNC fallback pays nothing. Reporting a
+P&L the strategy never earned would corrupt every downstream read.
+
+### Cadence — the one structural change
+
+Entries fire intraday on ANY 1h close, and mean-touch exits need 1h checking,
+neither of which the bucket's 09:45 daily-prepare shape supported. Rather than
+a new bucket or a new runner mode, three small changes covered it:
+
+- the entry window is now the whole session (`09:15`–`15:30`), with the REAL
+  gate bar-driven inside the strategy — a signal is actionable only while its
+  bin is the most recently completed one, which is the live equivalent of the
+  backtest's "fill at the next bar's open" (House Rule 9: the same rule replays
+  in the backtester);
+- `BucketRunner` now paces a bucket at its FASTEST timeframe rather than the
+  regime model's, with an explicit `tick_interval_seconds: 60` override — a 1d
+  regime model would otherwise have delayed every 1h signal by up to 15 min;
+- `run_meanrev_scan` caches per 1h bin, so a 60s tick loop re-fetches 94
+  symbols × 2 series only when a new bar closes (~190 calls per bin, not per
+  minute).
+
+Note the 15:15→15:30 stub bin: a 1h session has 7 bins, and the last is 15
+minutes long. It is a real signal bar in the backtest (3 of 214 trades entered
+at the FOLLOWING session's 09:15 open), so `last_complete_bar_key` keeps naming
+it until the next session's first bin closes.
+
+### Hazard found while wiring this up
+
+Taking MTF live exposed a pre-existing gap in the Dhan adapter: the MTF→CNC
+fallback re-sent the **leveraged** quantity as a cash order. At ~3.8× that is
+~₹38k of cash for a slot budgeted ₹10k — on an account shared with the user's
+own money (Decision 027). Decision 031 had already solved exactly this for
+INTRADAY; the two branches are now one, so **any** leveraged-product rejection
+retries at `min(size, fallback_max_size)` or not at all. `swing-indian` opts in
+with `fallback_product: CNC`.
+
+### Parity
+
+`scripts/meanrev_1h_parity.py` replays the port over the same cached 15m/1D
+CSVs the backtest used: **208/214** trades reproduce on all three axes (fresh
+cross on the same bin, dist within 0.15pp, ATR stop within 0.1%). The six
+misses are all the EMA20 warm-up guard at a data boundary — five on 2024-06-04
+(the cached series starts 2024-05-15, giving 96 of the 100 required 1h bins)
+and WAAREEENER, an IPO with 11 daily bars and therefore no ATR at all. They are
+₹13,660 of net, all winners, so the port is conservative rather than broken;
+live, the guard only bites a recent listing, which is where a seeded EMA and a
+missing stop argue for sitting out anyway.
+
+### Known deviations from the backtest, accepted
+
+- **5 concurrent instead of 20** (see (1)) — expect ~a quarter of the rupee
+  P&L, and occasional missed signals when the book is full.
+- **Fills are market orders moments after the bar close**, not the exact next
+  open. Same convention as `gap_down_reversal`; a signal found late is skipped
+  rather than chased.
+- **Mean-touch exits fill at the next bar's open**, not at the touching close.
+- **Cold-EMA / no-ATR names are skipped** (the 208/214 above).

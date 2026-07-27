@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -32,8 +32,10 @@ from src.core.models import (
     AuditEventType,
     AuditLog,
     DailyUniverse,
+    OrderStatus,
     ScannerSnapshot,
     SymbolMapping,
+    Trade,
 )
 from src.data_sources.base import MarketData, Ticker
 
@@ -68,6 +70,8 @@ class ScannerConfig(BaseModel):
     # intraday confirm), dispatched to ``run_equity_scan``;
     # "equity_intraday" = the morning gap-down cut (Decision 029), dispatched to
     # ``run_gap_reversal_scan``.
+    # "equity_meanrev_1h" = the 1h EMA20-dislocation cut (Decision 032),
+    # dispatched to ``run_meanrev_scan``.
     engine: str = "generic"
     # Free-text universe label for equity configs (e.g. nse_bse_all_equities);
     # informational — the equity universe comes from the Dhan data adapter.
@@ -160,6 +164,7 @@ def run_scan(
     config: ScannerConfig,
     scan_date: date_type,
     require_binance_listed: bool = True,
+    now: datetime | None = None,
 ) -> ScanResult:
     """Run the scanner for one bucket on one date.
 
@@ -170,6 +175,9 @@ def run_scan(
     Equity configs (``engine: equity_daily``) take the two-phase Dhan path
     instead — a daily-prepare shortlist (written by ``prepare_job``) plus an
     intraday gap/volume confirm — via ``run_equity_scan``.
+
+    ``now`` is the tick's clock reading; only the 1h mean-reversion path needs
+    it (to know which bar it is scanning for). None ⇒ wall clock.
     """
     if config.engine == "equity_daily":
         return run_equity_scan(
@@ -178,6 +186,14 @@ def run_scan(
     if config.engine == "equity_intraday":
         return run_gap_reversal_scan(
             bucket_id=bucket_id, data=data, config=config, scan_date=scan_date
+        )
+    if config.engine == "equity_meanrev_1h":
+        return run_meanrev_scan(
+            bucket_id=bucket_id,
+            data=data,
+            config=config,
+            scan_date=scan_date,
+            now=now or datetime.now(UTC),
         )
 
     # 1. eligible symbols (joined to symbol mapping)
@@ -456,6 +472,230 @@ def run_equity_scan(
         universe=chosen_symbols,
         evaluated_count=len(survivors),
     )
+
+
+def entries_taken_today(bucket_id: str, day: date_type) -> int:
+    """How many NEW positions this bucket has opened during ``day`` (IST).
+
+    Counts non-reduce-only, non-rejected ``Trade`` rows — the portfolio rule
+    "max N new entries per day" is a property of the book, not of one strategy,
+    so it is scoped to the bucket. Exits and protective stops are reduce-only
+    and never count.
+    """
+    from src.shared.scanner.meanrev import IST
+
+    start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
+    rows = 0
+    with session_scope() as session:
+        trades = (
+            session.execute(
+                select(Trade).where(
+                    Trade.bucket_id == bucket_id,
+                    Trade.created_at >= start,
+                    Trade.created_at < start + timedelta(days=1),
+                    Trade.status.in_(
+                        [
+                            OrderStatus.PENDING,
+                            OrderStatus.OPEN,
+                            OrderStatus.PARTIAL,
+                            OrderStatus.FILLED,
+                        ]
+                    ),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for t in trades:
+            if not (t.extra or {}).get("reduce_only"):
+                rows += 1
+    return rows
+
+
+# In-process cache: bucket_id → (bar_key, ScanResult). The 1h signal cannot
+# change inside a bin, so a 60s tick loop must not re-fetch 94 symbols × 2
+# series every minute. A restart simply re-scans the current bin.
+_MEANREV_SCAN_CACHE: dict[str, tuple[str, ScanResult]] = {}
+
+
+def run_meanrev_scan(
+    *,
+    bucket_id: str,
+    data: MarketData,
+    config: ScannerConfig,
+    scan_date: date_type,
+    now: datetime,
+) -> ScanResult:
+    """1h EMA20-dislocation cut for the swing-indian bucket (Decision 032).
+
+    Runs ONCE per completed 1h bin and caches the result: the inputs are fixed
+    the moment the bin closes, so re-screening every 60s would burn ~190 Dhan
+    calls a minute recomputing a constant.
+
+    Unlike the gap-reversal cut this is not a once-a-day screen — the universe
+    is re-derived on every bin (10:15, 11:15 … 15:30), and the day's remaining
+    entry budget shrinks it as positions are opened.
+    """
+    from src.shared.scanner.meanrev import (
+        MeanRevConfig,
+        MeanRevSignal,
+        evaluate,
+        last_complete_bar_key,
+        rank_top,
+    )
+
+    cfg = MeanRevConfig.from_scanner_config(config)
+    key = last_complete_bar_key(now)
+    cached = _MEANREV_SCAN_CACHE.get(bucket_id)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    # Named scanner sets namespace their snapshots as "<bucket>:<name>"; the
+    # trade ledger is keyed by the bare bucket id.
+    ledger_bucket = bucket_id.split(":", 1)[0]
+
+    symbols = list(cfg.symbols)
+    if cfg.fno_only and hasattr(data, "universe"):
+        universe = data.universe
+        eligible = [s for s in symbols if universe.get(s, {}).get("fno") == "1"]
+        if len(eligible) != len(symbols):
+            _log.info(
+                "meanrev_scan_non_fno_excluded",
+                bucket_id=bucket_id,
+                excluded=sorted(set(symbols) - set(eligible)),
+                kept=len(eligible),
+                of=len(symbols),
+            )
+        symbols = eligible
+
+    signals: list[MeanRevSignal] = []
+    evaluated = 0
+    for symbol in symbols:
+        try:
+            intraday = _intraday_history(data, symbol, cfg.intraday_lookback_days)
+            daily = data.get_ohlcv(symbol, "1d", limit=cfg.atr_period + 40)
+        except Exception:
+            # One unfetchable name must never sink the whole bin's scan.
+            _log.warning("meanrev_scan_fetch_failed", symbol=symbol, exc_info=True)
+            continue
+        evaluated += 1
+        sig = evaluate(symbol, intraday, daily, cfg, want_bar_key=key)
+        if sig is not None:
+            signals.append(sig)
+
+    # Portfolio rule: at most ``daily_entry_cap`` NEW entries per session, filled
+    # chronologically — earlier bins already consumed part of today's budget.
+    taken = entries_taken_today(ledger_bucket, now.astimezone(_ist()).date())
+    budget = max(0, cfg.daily_entry_cap - taken)
+    chosen = rank_top(signals, min(cfg.universe_size, budget))
+    if budget < cfg.universe_size:
+        _log.info(
+            "meanrev_daily_entry_budget",
+            bucket_id=bucket_id,
+            taken_today=taken,
+            cap=cfg.daily_entry_cap,
+            remaining=budget,
+        )
+    chosen_symbols = [c.symbol for c in chosen]
+    weight = Decimal("1") / Decimal(str(len(chosen))) if chosen else Decimal("0")
+
+    with session_scope() as session:
+        session.execute(
+            delete(ScannerSnapshot).where(
+                ScannerSnapshot.date == scan_date,
+                ScannerSnapshot.strategy_id == bucket_id,
+            )
+        )
+        session.execute(
+            delete(DailyUniverse).where(
+                DailyUniverse.date == scan_date,
+                DailyUniverse.strategy_id == bucket_id,
+            )
+        )
+        for sig in signals:
+            session.add(
+                ScannerSnapshot(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=sig.symbol,
+                    metrics={
+                        "bar_key": sig.bar_key,
+                        "close": str(sig.close),
+                        "ema20": str(sig.ema20),
+                        "dist_pct": str(sig.dist_pct),
+                        "atr14": str(sig.atr14),
+                        "stop_distance": str(sig.stop_distance),
+                    },
+                    filter_results={},
+                    rank_score=-sig.dist_pct,  # deeper dislocation ranks higher
+                    passed=True,
+                )
+            )
+        for rank, sig in enumerate(chosen, start=1):
+            session.add(
+                DailyUniverse(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=sig.symbol,
+                    rank=rank,
+                    target_weight=weight,
+                    notes=f"bar={sig.bar_key} dist={sig.dist_pct}% ema20={sig.ema20}",
+                )
+            )
+        session.add(
+            AuditLog(
+                strategy_id=bucket_id,
+                event_type=AuditEventType.SCANNER_RUN,
+                message=(
+                    f"meanrev 1h scan [{key}]: {len(chosen)}/{len(signals)} crossed "
+                    f"of {evaluated} evaluated (day budget {budget})"
+                ),
+                payload={
+                    "bucket_id": bucket_id,
+                    "date": str(scan_date),
+                    "bar_key": key,
+                    "universe": chosen_symbols,
+                    "evaluated": evaluated,
+                    "passed": len(signals),
+                    "entries_taken_today": taken,
+                },
+            )
+        )
+
+    _log.info(
+        "meanrev_scan_complete",
+        bucket_id=bucket_id,
+        bar_key=key,
+        universe=chosen_symbols,
+        evaluated=evaluated,
+        passed=len(signals),
+    )
+    result = ScanResult(
+        bucket_id=bucket_id,
+        date=scan_date,
+        universe=chosen_symbols,
+        evaluated_count=evaluated,
+    )
+    _MEANREV_SCAN_CACHE[bucket_id] = (key, result)
+    return result
+
+
+def _ist():  # noqa: ANN202 — tiny local helper, typed at the call site
+    from src.shared.scanner.meanrev import IST
+
+    return IST
+
+
+def _intraday_history(data: MarketData, symbol: str, days: int) -> list:
+    """15m bars over ``days`` calendar days, or the adapter's default window.
+
+    ``DhanData.get_ohlcv_history`` widens the intraday request beyond the
+    5-day default the tick paths use — the 1h EMA20 needs a warm series.
+    Adapters without it (tests, crypto) fall back to ``get_ohlcv``.
+    """
+    if hasattr(data, "get_ohlcv_history"):
+        return data.get_ohlcv_history(symbol, "15m", days=days)
+    return data.get_ohlcv(symbol, "15m")
 
 
 def run_gap_reversal_scan(

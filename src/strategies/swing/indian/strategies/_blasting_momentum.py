@@ -1,5 +1,25 @@
 """
-Blasting Momentum — swing-indian strategy (Phase 4, Dhan).
+Blasting Momentum — swing-indian strategy (Phase 4, Dhan). **INERT.**
+
+RETIRED FROM THE LIVE PATH 2026-07-27 (user decision, Decision 032). The bucket
+now runs Midcap-150 1h Mean Reversion. This strategy never traded live — only a
+Dhan sandbox soak — and taking the bucket live was not a reason to arm an
+unexercised second order path at the same time.
+
+Three things keep it inert, any one of which is sufficient:
+  * this filename starts with ``_``, so ``discover_strategies`` skips it;
+  * it has no ``strategy_master.csv`` row, so the runner would gate it anyway;
+  * its scanner/allocator pair moved to ``scanner_blasting.yaml`` /
+    ``allocator_blasting.yaml``, which nothing references.
+
+To bring it back: rename to ``blasting_momentum.py``, add the row
+``blasting_momentum,1d,,bull,neutral,swing,blasting``, flip ``regime.yaml`` back
+to ``enabled: true`` (it gates on bull/neutral), widen the bucket entry window
+back to 09:45–10:30, and re-arm the nightly ``dhan-prepare`` timer — its
+``equity_daily`` engine needs that shortlist and the prepare job only visits
+buckets whose DEFAULT scanner set uses that engine.
+
+The code below is unchanged from its last reviewed state.
 
 backtest_ref:
     Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md

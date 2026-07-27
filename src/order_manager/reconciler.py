@@ -62,6 +62,7 @@ class Reconciler:
         bucket_ids: list[str] | None = None,
         bucket_fx: dict[str, Decimal] | None = None,
         shared_account: bool = False,
+        carry_interest_apr: dict[str, Decimal] | None = None,
     ) -> None:
         self._broker = broker
         self._broker_name = broker_name
@@ -83,6 +84,11 @@ class Reconciler:
         # the bucket's allocator fx_inr_per_usd (wallet quote → INR) —
         # a FIXED rate per user decision 2026-07-07 (85 for Delta India).
         self._bucket_fx = bucket_fx or {}
+        # Decision 032: buckets that carry a broker-FUNDED position overnight
+        # (Dhan MTF) pay interest on the funded portion. The backtest does not
+        # model it (~4% of net over 24 months), so the bot books it itself when
+        # a round-trip closes: bucket_id → annual rate, e.g. 0.146 = 14.6%/yr.
+        self._carry_apr = carry_interest_apr or {}
 
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
@@ -471,6 +477,7 @@ class Reconciler:
         """
         from src.order_manager.pnl import (
             aggregate_fills,
+            carry_interest,
             pnl_pct,
             realized_pnl,
             trade_notional,
@@ -617,6 +624,18 @@ class Reconciler:
                 notional = Decimal(
                     e_extra.get("traded_notional_usd", "0")
                 )
+                # Broker-funded carry (Dhan MTF, Decision 032). Charged on the
+                # FUNDED portion only — notional minus the own-capital margin
+                # the sizer allotted — for every calendar day the position was
+                # held. A trade whose bucket has no rate, or whose entry
+                # predates the margin stamp, is charged nothing.
+                interest = carry_interest(
+                    notional=notional,
+                    margin=_decimal_or_none(e_extra.get("margin_inr")),
+                    annual_rate=self._carry_apr.get(exit_trade.bucket_id or ""),
+                    days=_calendar_days(entry.created_at, exit_trade.created_at),
+                )
+                pnl -= interest
                 pct = pnl_pct(pnl, notional)
                 stamp = {
                     "pnl_usd": str(pnl),
@@ -625,6 +644,8 @@ class Reconciler:
                     "pnl_final": True,
                     "pnl_updated_at": now.isoformat(),
                 }
+                if interest > 0:
+                    stamp["carry_interest"] = str(interest)
                 exit_trade.extra = {**x_extra, **stamp}
                 entry.extra = {
                     **e_extra,
@@ -745,6 +766,27 @@ class Reconciler:
                     )
                 )
                 self._log.info("order_status_updated", **diff)
+
+
+def _decimal_or_none(raw: object) -> Decimal | None:
+    """Parse a JSONB-stored number, or None if absent/unparseable."""
+    if raw is None:
+        return None
+    try:
+        return Decimal(str(raw))
+    except (ArithmeticError, ValueError):
+        return None
+
+
+def _calendar_days(start: Any, end: Any) -> int:
+    """Calendar days a position was carried (0 when same-day or unknown).
+
+    MTF funding is charged per calendar day held, weekends included — the
+    broker's money is out over the weekend too.
+    """
+    if start is None or end is None:
+        return 0
+    return max(0, (end.date() - start.date()).days)
 
 
 def _map_status(status_str: str) -> OrderStatus:

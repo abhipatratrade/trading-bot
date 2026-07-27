@@ -57,7 +57,8 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Strategy Master | CSV per bucket, OR-semantics regime gate — Decision 016 |
 | Scanner sets | Multiple named scanner+allocator yaml pairs per bucket; `scanner` column in strategy_master.csv links them — Decision 026 |
 | Exits & enforcement | Strategy-driven exits (step 0); breaker trip = kill switch + flatten; bucket_state mirrors sub-account wallet; dashboard basic auth — Decision 021 |
-| Protective stops | Exchange-resident reduce-only stop-market per position; `stop_loss_pct` per bucket in buckets.yaml (0.5/leverage rule) — Decision 022; swing-indian uses a WIDE 20% crash net only — Decision 028 |
+| Protective stops | Exchange-resident reduce-only stop-market per position; `stop_loss_pct` per bucket in buckets.yaml (0.5/leverage rule) — Decision 022. A strategy may supply its own per-position distance, which only ever TIGHTENS vs the bucket percent — Decision 032 (swing-indian rests 3.5×daily-ATR14; its 20% figure is now the fallback net) |
+| swing-indian strategy | Midcap-150 1h Mean Reversion, LIVE 2026-07-27 — Decision 032. Blasting Momentum is inert (`_blasting_momentum.py`, no master row) |
 | Kill-switch semantics | Blocks risk-increasing actions only: strategy exits + breaker watch continue while killed — Decision 024 |
 | USD/INR rate | FIXED 85 in each bucket's allocator.yaml (no live FX feed) — user decision 2026-07-07, see Decision 024 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |

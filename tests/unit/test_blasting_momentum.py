@@ -1,4 +1,10 @@
-"""Blasting Momentum strategy — entries + Supertrend/max-hold exits (Phase 4)."""
+"""Blasting Momentum strategy — entries + Supertrend/max-hold exits (Phase 4).
+
+The strategy is INERT since Decision 032 (renamed ``_blasting_momentum.py`` so
+the loader skips it, no strategy_master row). These tests still run against the
+module: if it is ever brought back, its logic should be known-good rather than
+re-derived, and the file must keep importing cleanly in the meantime.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from src.data_sources.base import OHLCVBar
-from src.strategies.swing.indian.strategies.blasting_momentum import (
+from src.strategies.swing.indian.strategies._blasting_momentum import (
     BlastingMomentum,
 )
 

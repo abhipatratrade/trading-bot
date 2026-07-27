@@ -81,18 +81,37 @@ def test_place_market_order_builds_body() -> None:
     assert res.status == "pending"
 
 
-def test_mtf_rejection_falls_back_to_cnc() -> None:
+def test_mtf_rejection_falls_back_to_cnc_at_1x_size() -> None:
+    # Decision 032: the MTF retry is size-capped exactly like the MIS one. The
+    # order was sized at the scrip's MTF multiple, so re-sending that quantity
+    # as cash would spend `leverage`x the margin the sizer budgeted — on an
+    # account shared with the user's own money.
     http = _FakeHttp({"POST /v2/orders": [
         _Resp({"errorType": "Order_Error", "errorCode": "DH-XXX",
                "errorMessage": "MTF not allowed"}),
         _Resp({"orderId": "777", "orderStatus": "PENDING"})]})
-    req = OrderRequest(symbol="TBZ", side="buy", size=Decimal("10"))
+    req = OrderRequest(symbol="TBZ", side="buy", size=Decimal("38"),
+                       fallback_max_size=Decimal("10"))
     res = _client(http).place_order(req)
     assert len(http.calls) == 2
     assert http.calls[0]["json"]["productType"] == "MTF"
+    assert http.calls[0]["json"]["quantity"] == 38
     assert http.calls[1]["json"]["productType"] == "CNC"
+    assert http.calls[1]["json"]["quantity"] == 10
     assert res.raw["productType"] == "CNC"
+    assert res.size == Decimal("10")
     assert res.exchange_order_id == "777"
+
+
+def test_mtf_rejection_without_size_cap_raises() -> None:
+    """No ``fallback_max_size`` ⇒ the rejection stands, never an uncapped retry."""
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"errorCode": "DH-XXX", "errorMessage": "MTF not allowed"}),
+        _Resp({"orderId": "777", "orderStatus": "PENDING"})]})
+    req = OrderRequest(symbol="TBZ", side="buy", size=Decimal("38"))
+    with pytest.raises(DhanAPIError):
+        _client(http).place_order(req)
+    assert len(http.calls) == 1
 
 
 def test_mtf_rejection_no_fallback_raises() -> None:

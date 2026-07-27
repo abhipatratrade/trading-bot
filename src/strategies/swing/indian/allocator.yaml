@@ -1,33 +1,60 @@
-# Position-size config for swing-indian (Blasting Momentum v1).
+# Position-size config for swing-indian (Midcap-150 1h Mean Reversion).
 #
-# backtest_ref: Backtesting Engine/results/learnings/2026-07-09_blasting_momentum_swing.md
+# backtest_ref: Backtesting Engine/strategies/optimized/midcap150_meanrev_1h_swing/
+#   results/scanners/nifty_midcap_150_meanrev_1h_midcap_FINAL_fno_5perday_MTFlev_20260724_025002.json
 #
-# mu/sigma are POOLED per-1D-period stats derived from the 41 backtest trades
-# (933 position-days, Nifty 500, 2025-07-07..2026-07-09):
-#   mu_per_period    = sum(trade returns) / sum(days held)  = 0.00146 / day
-#   sigma_per_period = std(trade returns) / sqrt(avg hold)  = 0.1413 / sqrt(22.8)
-#                    = 0.0296 / day
-# The scanner picks change daily, so per-symbol stats are meaningless here —
-# every candidate uses default_for_unknown (strategy-level stats, not
-# symbol-level). Kelly* = mu/sigma^2 ~ 1.67 raw; fractional 0.25 and the 20%
-# per-symbol cap (5-slot equal weight) are the binding constraints in practice.
+# mu/sigma are POOLED per-1D-period stats over all 214 full-window backtest
+# trades (573 position-days, 2024-06..2026-07), on UNLEVERED position return
+# (pnl / notional, net of costs) -- the same convention the bucket's previous
+# occupant used, so the two are comparable:
+#   mu_per_period    = sum(trade returns) / sum(days held) = 4.2760 / 573
+#                    = 0.007465 / day
+#   sigma_per_period = std(trade returns) / sqrt(avg hold) = 0.051661 / sqrt(2.678)
+#                    = 0.031572 / day
+# Raw Kelly* = mu/sigma^2 ~ 7.49; fractional 0.25 gives 1.87, so as everywhere
+# else in this repo the CAP is the real sizer and Kelly just says "size up to
+# it". The strategy tf is 1h, but the holding period is days (avg 2.7), so the
+# per-period unit here is a DAY -- 1h only sets tick cadence and the dedup
+# window.
 #
-# Leverage: bucket leverage_max=4 in buckets.yaml covers the chosen 3x MTF
-# (Dhan productType=MTF, funded ~2/3 at ~14-18% p.a. — funding drag is NOT in
-# mu; at 3x the backtest-implied net is ~+54%/yr on margin with ~22% margin-DD).
+# SIZING, and why per_symbol_cap is 0.20:
+#   The backtest's unit of risk is a FIXED Rs 10,000 of own capital per trade,
+#   with notional = margin x the stock's own MTF leverage (2.86x-4.55x, avg
+#   3.79x => avg notional ~Rs 38k). required_margin = capital x weight, so at
+#   capital_inr = Rs 50,000 a 0.20 cap IS exactly Rs 10,000/slot. That also
+#   makes the book 5 concurrent positions rather than the backtest's 20-slot
+#   / Rs 200k base (user decision 2026-07-27, quarter scale): per-trade
+#   economics are identical, the rupee P&L is ~a quarter, and a 6th simultaneous
+#   signal is skipped as SKIPPED_INSUFFICIENT rather than sized down.
+#   To go to full scale, raise capital_inr in buckets.yaml -- do NOT raise
+#   per_symbol_cap, which would inflate the per-trade margin past the validated
+#   Rs 10k and change the cost profile.
+#
+# Leverage: bucket leverage_max=4 is the risk ceiling; BucketRunner._fit_to_margin
+# then sizes each order to the leverage Dhan actually grants that scrip
+# (required_margin preflight first, scrip-master MTF_LEVERAGE second, 1x if
+# neither answers). Do NOT ATR-normalise size -- tested and worse, because
+# equalising rupee risk shifts capital off the high-beta names that drive the
+# edge, and the drawdown did not even improve.
 
 fractional_kelly: 0.25
-per_symbol_cap: 0.20      # 5-slot equal-weight basket: 20% of bucket per name
+per_symbol_cap: 0.20      # 5-slot equal-weight book: Rs 10k margin per name
 aggregate_cap: 1.00
 
+# Deliberately FLAT (Decision 032). A market-regime gate was tested and REMOVES
+# the edge: gating on "index above SMA" cut net +30.7% -> +2-9%, because the
+# crash-rebound trades it filters out ARE the strategy. regime.yaml is disabled
+# for this bucket and the strategy_master row leaves both regime columns blank;
+# these 1.0s are belt-and-braces so no single edit re-introduces the gate.
 regime_multipliers:
-  bear: 0.00
-  neutral: 0.40
+  bear: 1.00
+  neutral: 1.00
   bull: 1.00
 
-# All scanner candidates use this (daily-rotating universe -> no per-symbol stats).
+# The scanned set re-ranks every 1h bin, so per-symbol stats are meaningless --
+# every candidate uses default_for_unknown.
 default_for_unknown:
-  mu_per_period: 0.00146    # per 1D bar, pooled from backtest trades
-  sigma_per_period: 0.0296  # per 1D bar
+  mu_per_period: 0.007465    # per 1D bar, pooled from 214 backtest trades
+  sigma_per_period: 0.031572 # per 1D bar
 
 stats: {}
