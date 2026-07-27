@@ -195,6 +195,25 @@ class Settings(BaseSettings):
     # heartbeat row is older than this (bot beats every ~60s tick).
     heartbeat_stale_seconds: int = 600
 
+    # -- Session invariants (src/safety/session_invariants.py) ---------------
+    # Per-tick assertions that the session is BEHAVING. Breakers watch equity;
+    # these watch process. A violation halts the bucket (kill switch) at most —
+    # flattening stays with the breakers.
+    # Grace after the 15:15 IST square-off before an intraday bucket that is
+    # still holding counts as a failure. Small: the session closes at 15:30 and
+    # the alert is only useful while there is time to act by hand.
+    squareoff_grace_minutes: int = 5
+    # The stop sweep runs every tick, so one uncovered reading can be a race
+    # against a just-placed order. Two consecutive means it really failed.
+    stop_coverage_sustain_ticks: int = 2
+    # Headroom over capital × leverage before committed notional reads as a
+    # sizing bug rather than rounding.
+    notional_ceiling_tolerance: float = 1.10
+    order_reject_window_minutes: int = 15
+    order_reject_max: int = 3
+    # A bucket is stalled once it has missed this many of its own cadences.
+    bucket_stale_multiple: float = 3.0
+
     # -- Retention (nightly prune job on the Railway scheduler) --------------
     # audit_log keeps 3× longer — it's the forensic record (House Rule #8).
     snapshot_retention_days: int = 60

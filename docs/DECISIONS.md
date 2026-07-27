@@ -1107,3 +1107,99 @@ missing stop argue for sitting out anyway.
   rather than chased.
 - **Mean-touch exits fill at the next bar's open**, not at the touching close.
 - **Cold-EMA / no-ATR names are skipped** (the 208/214 above).
+
+---
+
+## 033 — Session invariants: a process watchdog, and the agentic perimeter's authority ceiling
+
+**Date:** 2026-07-28 · **Status:** Tier 1 landed; Tiers 2–3 designed, not built
+
+### Why
+
+Two buckets now trade real money (`intraday-indian` 2026-07-22,
+`swing-indian` 2026-07-27) and the only automatic protection is
+`breakers.py`, which asks exactly one question: *has equity fallen off a
+cliff?* That is the right question for a leveraged crypto sub-account.
+It is the wrong question for Indian equity, whose failure modes are
+**procedural** and every one of which can happen at a perfectly healthy
+equity:
+
+- `intraday-indian`'s 15:15 square-off lives inside the STRATEGY's exit
+  (`gap_down_reversal.exits`), driven by the latest bar's timestamp. A stale
+  feed, a tick error, or a rejected exit each leave the position open — and
+  on the CNC fallback (Decision 031) there is no broker auto-square-off net
+  behind it. A leveraged intraday trade silently becomes an unwanted
+  overnight delivery.
+- A bot-owned position can end a tick with **no resting protective stop**
+  (Decision 022) when placement failed. Equity is fine; the crash net is not
+  there.
+- A sizing bug over-commits capital long before it shows as drawdown.
+- A single bucket's runner can wedge while the process heartbeat keeps
+  beating for the others — `core/heartbeat.py` is process-level, so one dead
+  bucket is invisible to the dead-man's switch.
+
+### The authority ladder (the load-bearing part)
+
+```
+L3  FLATTEN positions        ← deterministic breakers ONLY. Never an LLM.
+L2  HALT account             ← deterministic invariants
+L1  HALT bucket entries      ← invariants, and (Tier 2) the supervisor agent
+L0  Telegram notice          ← default
+```
+
+Enforcement is capped at **HALT**: engage that bucket's kill switch, which per
+Decision 024 blocks risk-INCREASING actions only — strategy exits, the stop
+sweep and the breakers all keep running while killed. Flattening stays in
+`enforcement.py`, reachable only by a deterministic breaker trip.
+
+This is what keeps House Rule #1 intact when Tier 2 lands. An invariant — and
+later an agent — is an assertion about **process**, not a view on the market.
+Engaging a kill switch is strictly risk-reducing and reversible; closing a
+position is a trading decision and stays deterministic. Recovery is manual
+from the dashboard, matching how a breaker trip already behaves.
+
+### Tier 1 — `src/safety/session_invariants.py` (landed)
+
+Runs once per 60s tick per account, **after** the stop sweep, so "no stop"
+means the sweep failed rather than hasn't run yet.
+
+| Invariant | Severity | Note |
+|---|---|---|
+| `squareoff` | HALT | intraday products only, 15:15 + grace |
+| `stop_coverage` | HALT | needs 2 consecutive ticks (races a just-placed stop) |
+| `notional_ceiling` | HALT | INR-native equity buckets only |
+| `reject_rate` | HALT | ≥3 rejects / 15 min |
+| `bucket_liveness` | NOTICE | per-bucket heartbeat row |
+| `foreign_positions` | NOTICE | **never acted on** — that is the user's book |
+
+Two design points worth keeping:
+
+- **`effective_holdings` intersects two independent sources.** The Trade
+  ledger alone goes stale the moment something closes a position without
+  writing a SELL row — Dhan's own MIS auto-square-off does exactly that, and
+  would leave a phantom holding failing the square-off invariant forever.
+  Exchange positions alone cannot tell the bot's rows from the user's on the
+  shared account (Decision 027).
+- **The notional ceiling is INR-equity only.** Delta positions are
+  contract-denominated and USD-priced, so `qty × entry_price` is neither a
+  base-unit size nor rupees. `BucketWatch.notional_budget_inr=None` skips it.
+
+### Tiers 2 and 3 — designed, not built
+
+- **Tier 2, intraday supervisor.** An LLM agent at ~6 fixed points (09:15,
+  09:30, 10:30, 12:00, 15:10, 15:20 IST) reading a Postgres-only snapshot.
+  Catches what thresholds cannot: entry rate far off the backtest baseline,
+  every fill at its bar's extreme, a symbol cycling in and out, a
+  `sizing_snapshot` skip reason spiking. Authority: L1 halt, then page.
+- **Tier 3, EOD postmortem.** 15:45 IST → Telegram digest + a committed
+  `docs/journal/YYYY-MM-DD.md` + a `/journal` dashboard route. Includes
+  per-trade slippage, signals that did NOT trade and why, the overnight
+  assertion for `swing-indian`, and rolling live-vs-backtest PF/win-rate.
+
+**Hard constraint on both:** they read **Postgres only** and must never call
+the Dhan API. A second session evicts the bot's token — a monitor that polled
+the broker would cause the very outage it exists to detect.
+
+**Placement:** not on the Mumbai VM. A dead VM must not be able to silence
+its own watchdog — the same reasoning that put the heartbeat watch on Railway
+(Decision 020's geo-block does not apply, since neither tier touches Binance).

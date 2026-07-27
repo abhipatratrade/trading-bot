@@ -49,10 +49,18 @@ from src.data_sources.symbol_loader import (
 from src.order_manager.manager import OrderManager
 from src.order_manager.reconciler import Reconciler
 from src.safety.enforcement import enforce_breakers
+from src.safety.session_invariants import (
+    BucketWatch,
+    InvariantThresholds,
+    bucket_service,
+    enforce_session_invariants,
+    run_session_invariants,
+)
 from src.safety.stop_protection import ensure_stop_protection
 from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import Market, load_buckets
 from src.shared.bucket_runner import BucketRunner
+from src.shared.market_calendar import NseSession, nse_session
 
 TICK_INTERVAL_SECONDS = 60
 
@@ -391,6 +399,75 @@ def main() -> None:
 
     _sweep_stops()
 
+    # ── Session invariants (per-tick process assertions) ────────────────
+    # Breakers watch EQUITY; these watch PROCESS — the square-off actually
+    # happening, every held position carrying a resting stop, notional inside
+    # budget, the order path not rejecting, each bucket still ticking. Runs
+    # AFTER the sweep so "no stop" means the sweep failed, not that it hasn't
+    # run yet. A violation halts that bucket (kill switch) at most; flattening
+    # stays with the breakers.
+    watches: dict[str, list[BucketWatch]] = {}
+    for runner in runners:
+        cfg = runner.bucket.config
+        indian = runner.bucket.market == Market.INDIAN
+        watches.setdefault(cfg.account_ref, []).append(
+            BucketWatch(
+                bucket_id=runner.bucket.id,
+                tick_interval_seconds=runner.tick_interval_seconds,
+                # Only a same-day product must be flat at 15:15. swing-indian
+                # carries MTF for days; crypto has no session at all.
+                intraday=(cfg.product == "INTRADAY"),
+                # INR-native equity only — see BucketWatch.notional_budget_inr.
+                notional_budget_inr=(
+                    cfg.capital_inr * cfg.leverage_max if indian else None
+                ),
+            )
+        )
+    invariant_thresholds = InvariantThresholds(
+        squareoff_grace_minutes=settings.squareoff_grace_minutes,
+        stop_coverage_sustain_ticks=settings.stop_coverage_sustain_ticks,
+        notional_tolerance=Decimal(str(settings.notional_ceiling_tolerance)),
+        reject_window_minutes=settings.order_reject_window_minutes,
+        reject_max=settings.order_reject_max,
+        bucket_stale_multiple=settings.bucket_stale_multiple,
+    )
+
+    def _check_invariants() -> None:
+        for ref, ref_watches in watches.items():
+            # An equity account is only "stalled" during a session; overnight
+            # idleness is correct behaviour, not a fault.
+            live_session = (
+                nse_session(clock.now()) is not NseSession.CLOSED
+                if ref in dhan_accounts
+                else True
+            )
+            try:
+                results = run_session_invariants(
+                    account_ref=ref,
+                    watches=ref_watches,
+                    broker=brokers[ref],
+                    broker_name=order_managers[ref].broker_name,
+                    thresholds=invariant_thresholds,
+                    clock=clock,
+                    shared_account=ref in dhan_accounts,
+                    check_liveness=live_session,
+                )
+                enforce_session_invariants(results, clock=clock)
+                _note_safety_ok(
+                    f"invariant_error:{ref}",
+                    f"[bot] session invariants recovered on account {ref}",
+                )
+            except Exception as exc:
+                _log.error(
+                    "session_invariants_failed", account_ref=ref, exc_info=True
+                )
+                _alert_safety_failure(
+                    f"invariant_error:{ref}",
+                    exc,
+                    f"[bot] session invariant check ERROR on account {ref} "
+                    f"— see logs",
+                )
+
     # ── Audit + alert startup ───────────────────────────────────────────
     bucket_ids = [r.bucket.id for r in runners]
     with session_scope() as session:
@@ -476,6 +553,10 @@ def main() -> None:
             )
             try:
                 runner.run_once()
+                # Per-bucket liveness. The process heartbeat below keeps
+                # beating for the OTHER buckets, so only this row can show
+                # that this bucket's pipeline is still completing passes.
+                beat(bucket_service(runner.bucket.id), clock)
                 # If this bucket had been paging tick errors, tell the
                 # user it's healthy again (and re-arm the dedup channel).
                 note_alert_recovery(
@@ -500,6 +581,9 @@ def main() -> None:
 
         # Protect every position opened/changed this tick (Decision 022).
         _sweep_stops()
+
+        # Assert the session is behaving, now that stops have been swept.
+        _check_invariants()
 
         # Dead-man's switch: certify this tick completed. The Railway
         # scheduler pages if this row goes stale (heartbeat_stale_seconds).

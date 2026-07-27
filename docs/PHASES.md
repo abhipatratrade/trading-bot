@@ -379,6 +379,47 @@ Plan around the HOLDOUT grade: ~PF 1.7, ~+13%/yr on margin, ~9% DD, ~0.8 trades/
 ## Phase 7+ — Agentic perimeter
 *(Postmortem, research, news, param tuner — advisory only, separate from core.)*
 
+### Phase 7a — Live-session supervision (Decision 033)
+
+Three tiers, authority DECREASING as intelligence increases. Enforcement is
+capped at HALT (kill switch, reversible, exits keep running per Decision 024);
+FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
+
+**Tier 1 — deterministic session invariants** *(landed 2026-07-28)*
+- [x] `src/safety/session_invariants.py`: six checks + `effective_holdings`
+- [x] `squareoff` (HALT) — intraday products flat by 15:15 + grace. The
+      square-off lives in the STRATEGY exit and the CNC fallback has no broker
+      net, so nothing asserted it before this.
+- [x] `stop_coverage` (HALT, 2-tick sustain) — every bot holding has a resting
+      reduce-only stop; runs AFTER the sweep
+- [x] `notional_ceiling` (HALT) — INR-native equity buckets only
+- [x] `reject_rate` (HALT) — ≥3 rejects / 15 min
+- [x] `bucket_liveness` (NOTICE) — per-bucket heartbeat row (`bucket:<id>`),
+      beat after each successful pass; the process heartbeat can't see one
+      wedged bucket
+- [x] `foreign_positions` (NOTICE, never acted on) — makes Decision 027's
+      ownership scoping visible
+- [x] Wired into the 60s loop after `_sweep_stops()`; 6 new settings
+- [x] 34 unit tests, pure (no DB) — checks AND the enforce/streak path
+- [ ] **UNEXERCISED LIVE**: no invariant has fired against a real session yet.
+      First live square-off is the acceptance test.
+- [ ] Consider: data-feed staleness + Dhan token-health invariants (need hooks
+      into `DhanData`), and an Indian daily-drawdown breaker off the trade
+      ledger (the existing one is wallet-shaped)
+
+**Tier 2 — intraday supervisor agent** *(designed, not built)*
+- [ ] `scripts/session_snapshot.py --json` — Postgres-only session state
+- [ ] Agent at 09:15 / 09:30 / 10:30 / 12:00 / 15:10 / 15:20 IST
+- [ ] Authority: L1 halt on a defined whitelist, then page
+- [ ] MUST NOT call the Dhan API (a second session evicts the bot's token)
+- [ ] MUST NOT run on the bot VM (a dead VM would silence its own watchdog)
+
+**Tier 3 — EOD postmortem agent** *(designed, not built)*
+- [ ] 15:45 IST → Telegram digest + `docs/journal/YYYY-MM-DD.md` + `/journal`
+- [ ] Per-trade slippage, signals that did NOT trade and why
+      (`sizing_snapshot`), overnight assertion for `swing-indian`, rolling
+      live-vs-backtest PF / win rate
+
 ## Phase 8+ — Options
 *(Deferred per Goal_Setting.txt priority [10]/[11].)*
 
@@ -387,6 +428,8 @@ Plan around the HOLDOUT grade: ~PF 1.7, ~+13%/yr on margin, ~9% DD, ~0.8 trades/
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-07-28 — Decision 033: session invariants (Phase 7a Tier 1) — a PROCESS watchdog beside the equity watchdog, now that two buckets trade real money. Breakers only ask "has equity fallen off a cliff?", which is right for a leveraged crypto sub-account and wrong for Indian equity, where every failure mode happens at a healthy equity. New `src/safety/session_invariants.py` runs once per 60s tick per account, AFTER the stop sweep (so "no stop" means the sweep FAILED, not that it hasn't run): `squareoff` HALT (intraday products flat by 15:15+grace — the square-off lives inside `gap_down_reversal.exits` driven by the latest BAR's timestamp, so a stale feed / tick error / rejected exit each leave it open, and the Decision 031 CNC fallback has NO broker auto-square-off behind it — a 5x intraday trade silently becomes an overnight delivery, and nothing asserted this before today); `stop_coverage` HALT w/ 2-tick sustain (one uncovered reading can race a just-placed stop); `notional_ceiling` HALT; `reject_rate` HALT (≥3/15min); `bucket_liveness` NOTICE (new per-bucket `bucket:<id>` heartbeat row — the process heartbeat keeps beating for the other buckets, so it cannot see ONE wedged bucket); `foreign_positions` NOTICE and NEVER acted on (makes Decision 027 scoping visible). THE AUTHORITY LADDER is the load-bearing decision: enforcement is capped at HALT (engage the bucket's kill switch — per Decision 024 exits + stop sweep + breakers all keep running while killed), and FLATTEN stays in `enforcement.py` reachable only by a deterministic breaker trip. That is what will keep House Rule #1 intact when the Tier 2 LLM supervisor lands: engaging a kill switch is risk-REDUCING and reversible, closing a position is a trading decision. Two subtleties: `effective_holdings` INTERSECTS the Trade ledger with exchange positions, because the ledger alone goes stale when Dhan's own MIS auto-square-off closes a position without writing our SELL row (phantom holding → square-off invariant fails forever), while positions alone can't tell the bot's rows from the user's on the shared account; and the notional ceiling is INR-equity ONLY, since Delta positions are contract-denominated and USD-priced so qty×entry_price is neither a base-unit size nor rupees. 34 new pure unit tests (checks AND the enforce/streak path), 435 green, ruff clean (the 4 reds are pre-existing local-env gaps — `apscheduler`/`jinja2` not installed here — identical on a stashed baseline). NOT YET EXERCISED LIVE — the first real 15:15 is the acceptance test. Tiers 2 (intraday supervisor agent, ~6 fixed IST wake-ups, Postgres-only, L1-halt authority) and 3 (EOD postmortem → Telegram + committed `docs/journal/` + `/journal` route) are DESIGNED in Decision 033 but NOT BUILT; both are hard-constrained to never call the Dhan API (a second session evicts the bot's token) and never to run on the bot VM (a dead VM must not silence its own watchdog).
 
 - 2026-07-23 (cont.) — LIVE-ARMED intraday-indian, hit a token bug, fixed it, re-paused for validation. (1) The shared-account scoping fix WORKED live: on boot the reconciler logged external_position_ignored for the user's 2 NIFTY options and touched nothing (0 stops, 0 adopted, 0 orders). (2) But ~15 min in, get_positions (→ reconciler + stop sweep + breaker) failed every tick with DhanAPIError [DH-906] Invalid Token. Root cause: Dhan tokens are single-session — a peer process minting invalidates every other process's token SERVER-SIDE while it's still valid by its own JWT timestamp; the client only retried on HTTP 401 (DH-906 is HTTP 400 in the envelope) and _refresh_locked MINTED before checking the shared cache, so invalidated processes minted COMPETING tokens = N-process thrash. My own VM diagnostic scripts (each building a Dhan client) were the peer minters that triggered it. Halted the bot (systemctl stop) — no bot positions, clean. (3) FIX 9fd5f87: client _request retries once on DH-906/'Invalid Token' envelope (_is_invalid_token), and the token manager adopts a PEER's cached token BEFORE minting + records the rejected token so it never re-adopts it — breaking the thrash. 9 new token tests, 363 green. Validated live: self-heal via mint works, a second client adopts the cached token (no thrash), user positions untouched, cache restored. (4) Re-PAUSED the bucket (enabled:false, e091c06) — chose to validate the token path before real money rides on it again, NOT re-arm under the entry-window clock. KNOWN BOUNDED LIMITATION: an EXTERNALLY invalidated token (e.g. the user logging into Dhan mobile — single-session) can't recover until Dhan's 2-min mint cooldown clears; self-recovers after. OPERATIONAL: avoid logging into Dhan while the bot runs. Order path STILL unexercised. Re-arm is a deliberate user action.
 
