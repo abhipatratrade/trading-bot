@@ -5,13 +5,20 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
+import pytest
+from sqlalchemy import inspect as sa_inspect
+
 from src.core.models import (
     AuditEventType,
+    AuditLog,
     BrokerName,
     OrderSide,
     OrderStatus,
+    Position,
     PositionSide,
     SizingDecision,
+    SizingSnapshot,
+    Trade,
 )
 from src.dashboard.routes.journal import render_markdown_to_html
 from src.reporting.eod import (
@@ -21,6 +28,7 @@ from src.reporting.eod import (
     payload_of,
     render_digest,
     render_markdown,
+    split_positions,
 )
 from src.shared.market_calendar import IST
 
@@ -86,13 +94,41 @@ class _Position:
         self.side = side
         self.bucket_id = bucket_id
         self.strategy_id = bucket_id
+        self.broker = BrokerName.DHAN
 
 
 class _Audit:
     def __init__(self, message: str = "Kill switch ENGAGED") -> None:
         self.event_type = AuditEventType.KILL_SWITCH_FLIPPED
         self.message = message
-        self.created_at = datetime(2026, 7, 28, 15, 20, tzinfo=IST)
+        # `ts`, not `created_at` — AuditLog is the one model that does not
+        # inherit TimestampMixin. test_fakes_match_the_real_orm_columns keeps
+        # this fake honest.
+        self.ts = datetime(2026, 7, 28, 15, 20, tzinfo=IST)
+
+
+@pytest.mark.parametrize(
+    ("fake", "model"),
+    [
+        (_Trade(), Trade),
+        (_Skip(), SizingSnapshot),
+        (_Position(), Position),
+        (_Audit(), AuditLog),
+    ],
+)
+def test_fakes_match_the_real_orm_columns(fake: object, model: type) -> None:
+    """Every attribute the fakes expose must exist on the real model.
+
+    These tests duck-type the ORM so they need no database, which means a fake
+    written to match a WRONG assumption passes happily. That is exactly what
+    happened: the report read ``AuditLog.created_at``, the fake obligingly had
+    one, and the real table has ``ts`` — AuditLog is the single model that
+    does not inherit TimestampMixin. It would have crashed at 15:45 on the
+    first day an event was logged. This is the check that catches it.
+    """
+    mapped = {attr.key for attr in sa_inspect(model).attrs}
+    missing = {k for k in vars(fake) if not k.startswith("_")} - mapped
+    assert not missing, f"{model.__name__} has no column(s): {sorted(missing)}"
 
 
 def _report(**kw) -> object:
@@ -102,6 +138,7 @@ def _report(**kw) -> object:
         skips=kw.get("skips", []),
         positions=kw.get("positions", []),
         events=kw.get("events", []),
+        owned=kw.get("owned"),
     )
 
 
@@ -156,6 +193,78 @@ def test_a_bucket_that_only_declined_signals_still_appears() -> None:
 def test_flat_positions_are_not_carried() -> None:
     sections = build_sections([], [], [_Position(side=PositionSide.FLAT)])
     assert sections == []
+
+
+# ---------------------------------------------------------------------------
+# Ownership split — the 2026-07-22 lesson, applied to reporting
+# ---------------------------------------------------------------------------
+def test_an_unattributed_position_is_not_the_bots() -> None:
+    """Live rows 244/245: orphan-imported before the scoping fix.
+
+    No bucket_id, so Decision 013 says the bot never opened it. Reporting the
+    user's NIFTY options as bot risk carried overnight would re-tell the
+    2026-07-22 lie in prose.
+    """
+    orphan = _Position(symbol="NIFTY-Jul2026-24450-CE")
+    orphan.bucket_id = None
+    bot, foreign = split_positions([orphan], owned={})
+    assert bot == []
+    assert [p.symbol for p in foreign] == ["NIFTY-Jul2026-24450-CE"]
+
+
+def test_an_attributed_position_absent_from_the_ledger_is_not_the_bots() -> None:
+    bot, foreign = split_positions([_Position(symbol="TCS")], owned={})
+    assert bot == []
+    assert len(foreign) == 1
+
+
+def test_an_attributed_and_owned_position_is_the_bots() -> None:
+    bot, foreign = split_positions(
+        [_Position(symbol="TCS")], owned={"TCS": Decimal("10")}
+    )
+    assert len(bot) == 1
+    assert foreign == []
+
+
+def test_the_ledger_check_is_scoped_to_the_shared_broker() -> None:
+    """Crypto sub-accounts are exclusively the bot's (Decision 019).
+
+    ``owned`` is built from Dhan trades alone, so applying it to a Delta
+    position would disown a perfectly legitimate one.
+    """
+    delta = _Position(symbol="BTCUSD", bucket_id="longterm-crypto")
+    delta.broker = BrokerName.DELTA_INDIA
+    bot, foreign = split_positions([delta], owned={})
+    assert len(bot) == 1
+    assert foreign == []
+
+
+def test_foreign_positions_are_excluded_from_carried_but_still_reported() -> None:
+    orphan = _Position(symbol="NIFTY-Jul2026-24450-CE")
+    orphan.bucket_id = None
+    report = _report(positions=[orphan, _Position(symbol="TCS")], owned={})
+    assert all(not s.carried for s in report.buckets)
+    assert [c.symbol for c in report.foreign] == [
+        "NIFTY-Jul2026-24450-CE",
+        "TCS",
+    ]
+
+
+def test_markdown_labels_foreign_positions_as_not_the_bots() -> None:
+    orphan = _Position(symbol="NIFTY-Jul2026-24450-CE")
+    orphan.bucket_id = None
+    text = render_markdown(_report(positions=[orphan], owned={}))
+    assert "## Not the bot's" in text
+    assert "excluded" in text
+    assert "### Carried overnight" not in text
+
+
+def test_digest_does_not_count_foreign_positions_as_overnight_risk() -> None:
+    orphan = _Position(symbol="NIFTY-Jul2026-24450-CE")
+    orphan.bucket_id = None
+    text = render_digest(_report(positions=[orphan], owned={}))
+    assert "OVERNIGHT" not in text
+    assert "not the bot's" in text
 
 
 def test_realized_ignores_a_missing_or_unparseable_extra() -> None:

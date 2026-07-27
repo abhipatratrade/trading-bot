@@ -39,6 +39,7 @@ from src.core.db import session_scope
 from src.core.models import (
     AuditEventType,
     AuditLog,
+    BrokerName,
     OrderSide,
     OrderStatus,
     Position,
@@ -47,6 +48,7 @@ from src.core.models import (
     SizingSnapshot,
     Trade,
 )
+from src.order_manager.ownership import bot_owned_quantities
 from src.order_manager.pnl import pnl_pct
 from src.shared.market_calendar import IST
 
@@ -121,6 +123,10 @@ class Report:
     buckets: list[BucketSection]
     events: list[str]
     quiet: bool  # nothing traded, nothing tripped, nothing carried
+    # Open positions on a shared account that the bot does NOT own — the
+    # user's own trading (Decision 027). Reported so the numbers above are
+    # visibly complete, never counted as the bot's.
+    foreign: list[CarriedPosition] = field(default_factory=list)
 
     @property
     def realized(self) -> Decimal:
@@ -161,6 +167,52 @@ def to_trade_line(trade: Trade) -> TradeLine:
     )
 
 
+def split_positions(
+    positions: list[Position],
+    owned: dict[str, Decimal] | None = None,
+    shared_broker: BrokerName = BrokerName.DHAN,
+) -> tuple[list[Position], list[Position]]:
+    """Split open positions into (the bot's, everyone else's). PURE.
+
+    The 2026-07-22 near-miss was caused by reading the ACCOUNT and calling it
+    the bot — the stop sweep tried to manage the user's NIFTY options. The
+    scoping fix (Decision 027) taught the runtime paths to ask ownership
+    first; a report that skipped the question would re-tell the same lie in
+    prose, claiming the user's own positions as bot risk carried overnight.
+
+    Two independent disqualifiers, either one is enough:
+
+    * **No ``bucket_id``.** Decision 013 stamps one on every bot position, so a
+      row without one was orphan-imported from the account, not opened here.
+      (The live rows 244/245 are exactly this — adopted on 2026-07-22 before
+      the scoping fix, and still non-flat.)
+    * **Not in ``owned``** — applied ONLY to ``shared_broker`` positions. Every
+      crypto bucket trades its own Delta sub-account (Decision 019), where the
+      whole account is the bot's and the ledger check would wrongly disown a
+      legitimate position (``owned`` is built from Dhan trades alone).
+      ``owned=None`` disables the ledger check entirely.
+    """
+    bot: list[Position] = []
+    foreign: list[Position] = []
+    for pos in positions:
+        attributed = bool(pos.bucket_id)
+        shared = pos.broker == shared_broker
+        in_ledger = (
+            owned is None or not shared or owned.get(pos.symbol, _ZERO) > 0
+        )
+        (bot if attributed and in_ledger else foreign).append(pos)
+    return bot, foreign
+
+
+def to_carried(pos: Position) -> CarriedPosition:
+    return CarriedPosition(
+        bucket_id=pos.bucket_id or pos.strategy_id,
+        symbol=pos.symbol,
+        quantity=pos.quantity,
+        entry_price=pos.entry_price,
+    )
+
+
 def build_sections(
     trades: list[Trade],
     skips: list[SizingSnapshot],
@@ -184,12 +236,7 @@ def build_sections(
         for s in skips
     ]
     carried = [
-        CarriedPosition(
-            bucket_id=p.bucket_id or p.strategy_id,
-            symbol=p.symbol,
-            quantity=p.quantity,
-            entry_price=p.entry_price,
-        )
+        to_carried(p)
         for p in positions
         if p.side != PositionSide.FLAT and p.quantity > 0
     ]
@@ -222,9 +269,14 @@ def build_sections(
 
 
 def build_events(rows: list[AuditLog]) -> list[str]:
-    """One line per thing that tripped today. PURE."""
+    """One line per thing that tripped today. PURE.
+
+    ``AuditLog`` timestamps its rows with ``ts``, not ``created_at`` — it is
+    the one model that does not inherit ``TimestampMixin``. Rendered in IST
+    because the whole report is about an IST session.
+    """
     return [
-        f"{r.created_at:%H:%M} · {r.event_type.value} · {r.message}"
+        f"{r.ts.astimezone(IST):%H:%M} · {r.event_type.value} · {r.message}"
         for r in rows
     ]
 
@@ -236,8 +288,10 @@ def build_report(
     skips: list[SizingSnapshot],
     positions: list[Position],
     events: list[AuditLog],
+    owned: dict[str, Decimal] | None = None,
 ) -> Report:
-    sections = build_sections(trades, skips, positions)
+    bot_positions, foreign_positions = split_positions(positions, owned)
+    sections = build_sections(trades, skips, bot_positions)
     event_lines = build_events(events)
     quiet = not event_lines and not any(
         s.traded or s.carried or s.skips for s in sections
@@ -247,6 +301,11 @@ def build_report(
         buckets=sections,
         events=event_lines,
         quiet=quiet,
+        foreign=[
+            to_carried(p)
+            for p in foreign_positions
+            if p.side != PositionSide.FLAT and p.quantity > 0
+        ],
     )
 
 
@@ -266,8 +325,18 @@ def _signed(value: Decimal) -> str:
 def render_digest(report: Report) -> str:
     """The 10-line Telegram version. Readable on a phone, no tables."""
     head = f"EOD {report.session_date:%a %d %b %Y}"
+    foreign_note = (
+        f"(+{len(report.foreign)} position(s) on the account not the bot's)"
+        if report.foreign
+        else None
+    )
     if report.quiet:
-        return f"{head}\nNo trades, no signals, nothing tripped. Quiet day."
+        # "Quiet" is a statement about the BOT. Anything on the account that
+        # is not ours still gets named, so silence never reads as "flat".
+        lines = [head, "No trades, no signals, nothing tripped. Quiet day."]
+        if foreign_note:
+            lines.append(foreign_note)
+        return "\n".join(lines)
 
     out = [head, f"Realized Rs {_signed(report.realized)} (fees {_money(report.fees)})"]
     for sec in report.buckets:
@@ -291,6 +360,8 @@ def render_digest(report: Report) -> str:
         out.append(
             f"OVERNIGHT: {', '.join(f'{c.symbol} x{c.quantity}' for c in carried)}"
         )
+    if foreign_note:
+        out.append(foreign_note)
     if report.events:
         out.append(f"EVENTS ({len(report.events)}):")
         out.extend(f"  {line}" for line in report.events[:5])
@@ -314,6 +385,33 @@ def _trade_table(lines: list[TradeLine]) -> list[str]:
     return out
 
 
+def _foreign_block(report: Report) -> list[str]:
+    """The "not the bot's" section. Rendered on quiet days too — a day the bot
+    sat out is still a day the account held something."""
+    if not report.foreign:
+        return []
+    total = sum((c.notional for c in report.foreign), _ZERO)
+    out = [
+        "## Not the bot's",
+        "",
+        f"{len(report.foreign)} open position(s) on the shared Dhan account, "
+        f"{_money(total)} at entry, that the bot did not open (Decision 027). "
+        f"Listed so the numbers above are visibly complete — they are "
+        f"**excluded** from every P&L and carried figure in this report, and "
+        f"no safety path acts on them.",
+        "",
+        "| symbol | qty | entry | notional |",
+        "|---|---|---|---|",
+    ]
+    for c in report.foreign:
+        out.append(
+            f"| {c.symbol} | {c.quantity} | {_money(c.entry_price)} | "
+            f"{_money(c.notional)} |"
+        )
+    out.append("")
+    return out
+
+
 def render_markdown(report: Report) -> str:
     """The full journal entry — one file per trading date."""
     out = [
@@ -333,7 +431,7 @@ def render_markdown(report: Report) -> str:
             "one.",
             "",
         ]
-        return "\n".join(out)
+        return "\n".join(out + _foreign_block(report))
 
     out += [
         "## Summary",
@@ -410,6 +508,8 @@ def render_markdown(report: Report) -> str:
                 )
             out.append("")
 
+    out += _foreign_block(report)
+
     if report.events:
         out += [
             "## Events",
@@ -471,12 +571,34 @@ def gather(session_date: date_) -> Report:
             session.execute(
                 select(AuditLog)
                 .where(
-                    AuditLog.created_at >= start,
-                    AuditLog.created_at < end,
+                    AuditLog.ts >= start,
+                    AuditLog.ts < end,
                     AuditLog.event_type.in_(_REPORTABLE_EVENTS),
                 )
-                .order_by(AuditLog.created_at)
+                .order_by(AuditLog.ts)
             ).scalars()
+        )
+        # Ownership for the SHARED Dhan account (Decision 027). Derived from
+        # the bot's own Trade rows, never from account state — the same source
+        # the stop sweep and reconciler use, so the report cannot disagree
+        # with what the safety paths believe.
+        dhan_buckets = sorted(
+            {
+                p.bucket_id
+                for p in positions
+                if p.broker == BrokerName.DHAN and p.bucket_id
+            }
+            | {
+                t.bucket_id
+                for t in trades
+                if t.broker == BrokerName.DHAN and t.bucket_id
+            }
+        )
+        owned = bot_owned_quantities(
+            session,
+            broker_name=BrokerName.DHAN,
+            bucket_ids=dhan_buckets,
+            now=end,
         )
         return build_report(
             session_date=session_date,
@@ -484,6 +606,7 @@ def gather(session_date: date_) -> Report:
             skips=skips,
             positions=positions,
             events=events,
+            owned=owned,
         )
 
 
