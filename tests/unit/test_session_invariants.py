@@ -453,3 +453,50 @@ def test_enforce_does_not_re_engage_an_already_killed_bucket(monkeypatch) -> Non
     rec.install(monkeypatch, engaged_already=True)
     assert enforce_session_invariants([_violation("squareoff", Severity.HALT)]) == []
     assert rec.engaged == []
+
+
+def test_observe_only_pages_but_never_halts(monkeypatch) -> None:
+    """Default mode: a brand-new invariant cannot halt a live bucket."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    halted = enforce_session_invariants(
+        [_violation("squareoff", Severity.HALT)], enforcing=False
+    )
+    assert halted == []
+    assert rec.engaged == []
+    assert rec.alerts  # still paged
+
+
+def test_observe_only_message_says_it_would_have_halted(monkeypatch) -> None:
+    rec = _Recorder()
+    sent: list[str] = []
+    rec.install(monkeypatch)
+    monkeypatch.setattr(si, "send_alert_dedup", lambda key, msg: sent.append(msg))
+    enforce_session_invariants(
+        [_violation("squareoff", Severity.HALT)], enforcing=False
+    )
+    assert sent[0].startswith("[OBSERVE-ONLY, would have HALTED]")
+
+
+def test_observe_only_leaves_a_notice_message_unprefixed(monkeypatch) -> None:
+    rec = _Recorder()
+    sent: list[str] = []
+    rec.install(monkeypatch)
+    monkeypatch.setattr(si, "send_alert_dedup", lambda key, msg: sent.append(msg))
+    enforce_session_invariants(
+        [_violation("bucket_liveness", Severity.NOTICE)], enforcing=False
+    )
+    assert not sent[0].startswith("[OBSERVE-ONLY")
+
+
+def test_observe_only_still_tracks_the_sustain_streak(monkeypatch) -> None:
+    """Streaks must keep counting, so flipping to enforcing needs no warm-up."""
+    rec = _Recorder()
+    sent: list[str] = []
+    rec.install(monkeypatch)
+    monkeypatch.setattr(si, "send_alert_dedup", lambda key, msg: sent.append(msg))
+    res = _violation("stop_coverage", Severity.HALT, sustain=2)
+    enforce_session_invariants([res], enforcing=False)
+    enforce_session_invariants([res], enforcing=False)
+    assert not sent[0].startswith("[OBSERVE-ONLY")  # tick 1: below the streak
+    assert sent[1].startswith("[OBSERVE-ONLY")  # tick 2: would have halted

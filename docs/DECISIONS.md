@@ -1172,6 +1172,14 @@ means the sweep failed rather than hasn't run yet.
 | `bucket_liveness` | NOTICE | per-bucket heartbeat row |
 | `foreign_positions` | NOTICE | **never acted on** — that is the user's book |
 
+**Ships OBSERVE-ONLY.** `session_invariants_enforcing` defaults to `false`:
+every check runs and pages, prefixed `[OBSERVE-ONLY, would have HALTED]`, but
+the kill switch is never touched. No invariant has fired against a real
+session, and an untested check that can halt a live bucket on its first false
+positive is a worse trade than a Telegram message. Sustain streaks keep
+counting while observing, so flipping the flag needs no warm-up. Flip it once
+the alerts have agreed with reality for a few sessions.
+
 Two design points worth keeping:
 
 - **`effective_holdings` intersects two independent sources.** The Trade

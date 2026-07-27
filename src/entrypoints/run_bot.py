@@ -431,6 +431,11 @@ def main() -> None:
         reject_max=settings.order_reject_max,
         bucket_stale_multiple=settings.bucket_stale_multiple,
     )
+    _log.info(
+        "session_invariants_ready",
+        enforcing=settings.session_invariants_enforcing,
+        buckets={ref: [w.bucket_id for w in ws] for ref, ws in watches.items()},
+    )
 
     def _check_invariants() -> None:
         for ref, ref_watches in watches.items():
@@ -452,7 +457,11 @@ def main() -> None:
                     shared_account=ref in dhan_accounts,
                     check_liveness=live_session,
                 )
-                enforce_session_invariants(results, clock=clock)
+                enforce_session_invariants(
+                    results,
+                    clock=clock,
+                    enforcing=settings.session_invariants_enforcing,
+                )
                 _note_safety_ok(
                     f"invariant_error:{ref}",
                     f"[bot] session invariants recovered on account {ref}",

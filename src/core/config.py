@@ -213,6 +213,11 @@ class Settings(BaseSettings):
     order_reject_max: int = 3
     # A bucket is stalled once it has missed this many of its own cadences.
     bucket_stale_multiple: float = 3.0
+    # OBSERVE-ONLY by default (Decision 033). Checks run and page, but never
+    # touch the kill switch, so a brand-new invariant cannot halt a live bucket
+    # on its first false positive. Flip to true once the alerts have agreed
+    # with reality for a few sessions.
+    session_invariants_enforcing: bool = False
 
     # -- Retention (nightly prune job on the Railway scheduler) --------------
     # audit_log keeps 3× longer — it's the forensic record (House Rule #8).

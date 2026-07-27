@@ -531,6 +531,7 @@ def enforce_session_invariants(
     results: list[InvariantResult],
     *,
     clock: Clock | None = None,
+    enforcing: bool = True,
 ) -> list[InvariantResult]:
     """Alert on violations and halt the offending bucket. Returns those halted.
 
@@ -538,6 +539,14 @@ def enforce_session_invariants(
     the bucket's strategy exits, its stop sweep and its breakers all keep
     running while killed — only new risk is blocked. Recovery is manual from
     the dashboard, matching how a breaker trip already behaves.
+
+    ``enforcing=False`` is OBSERVE-ONLY: every check still runs, every
+    violation still logs and pages — prefixed so it is unmistakable — but the
+    kill switch is never touched, and the returned list is empty. No invariant
+    has yet fired against a real session, so this is how a new one earns the
+    right to halt a live bucket: watch it agree with reality for a few
+    sessions first. A false positive here costs a Telegram message instead of
+    a halted bucket.
     """
     halted: list[InvariantResult] = []
 
@@ -550,17 +559,25 @@ def enforce_session_invariants(
 
         streak = _streaks.get(key, 0) + 1
         _streaks[key] = streak
+        would_halt = res.severity is Severity.HALT and streak >= res.sustain_ticks
         _log.warning(
             "session_invariant_violated",
             invariant=res.name,
             bucket_id=res.bucket_id,
             severity=res.severity.value,
             streak=streak,
+            enforcing=enforcing,
+            would_halt=would_halt,
             **res.detail,
         )
-        send_alert_dedup(key, f"[{res.bucket_id}] {res.message}")
+        prefix = (
+            "[OBSERVE-ONLY, would have HALTED] "
+            if would_halt and not enforcing
+            else ""
+        )
+        send_alert_dedup(key, f"{prefix}[{res.bucket_id}] {res.message}")
 
-        if res.severity is not Severity.HALT or streak < res.sustain_ticks:
+        if not would_halt or not enforcing:
             continue
         if kill_switch.is_engaged(res.bucket_id):
             continue  # already halted — don't re-engage or re-page every tick

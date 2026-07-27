@@ -399,10 +399,15 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
       wedged bucket
 - [x] `foreign_positions` (NOTICE, never acted on) — makes Decision 027's
       ownership scoping visible
-- [x] Wired into the 60s loop after `_sweep_stops()`; 6 new settings
-- [x] 34 unit tests, pure (no DB) — checks AND the enforce/streak path
+- [x] Wired into the 60s loop after `_sweep_stops()`; 7 new settings
+- [x] 38 unit tests, pure (no DB) — checks AND the enforce/streak path
+- [x] Ships OBSERVE-ONLY (`session_invariants_enforcing=false`): pages with an
+      `[OBSERVE-ONLY, would have HALTED]` prefix, never touches the kill
+      switch. Streaks still count, so flipping needs no warm-up.
 - [ ] **UNEXERCISED LIVE**: no invariant has fired against a real session yet.
       First live square-off is the acceptance test.
+- [ ] **Flip `session_invariants_enforcing=true`** once the observe-only
+      alerts have agreed with reality for a few sessions ← user-gated
 - [ ] Consider: data-feed staleness + Dhan token-health invariants (need hooks
       into `DhanData`), and an Indian daily-drawdown breaker off the trade
       ledger (the existing one is wallet-shaped)
