@@ -419,11 +419,27 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
 - [ ] MUST NOT call the Dhan API (a second session evicts the bot's token)
 - [ ] MUST NOT run on the bot VM (a dead VM would silence its own watchdog)
 
-**Tier 3 — EOD postmortem agent** *(designed, not built)*
-- [ ] 15:45 IST → Telegram digest + `docs/journal/YYYY-MM-DD.md` + `/journal`
-- [ ] Per-trade slippage, signals that did NOT trade and why
-      (`sizing_snapshot`), overnight assertion for `swing-indian`, rolling
-      live-vs-backtest PF / win rate
+**Tier 3 — EOD postmortem** *(landed 2026-07-28)*
+- [x] `src/reporting/eod.py` — pure builders + renderers, Postgres-only
+- [x] Scheduler job 10:15 UTC = 15:45 IST, weekdays, skips NSE holidays
+- [x] Telegram digest (phone-readable, truncates long event lists)
+- [x] `session_report` table (migration 0011), one row per date, UPSERT
+- [x] `/journal` dashboard route + nav link; local markdown→HTML subset
+      renderer that escapes before it formats
+- [x] `scripts/eod_report.py` (build by hand / backfill) and
+      `scripts/export_journal.py` (materialise into `docs/journal/*.md`;
+      `--commit` is opt-in and cannot restart the bot — `docs/` is outside
+      `RESTART_PATHS`)
+- [x] Signals seen but NOT taken, grouped by reason — first thing to ever read
+      `sizing_snapshot` back
+- [x] Carried-overnight section; quiet days say so instead of rendering an
+      empty skeleton
+- [x] 24 unit tests, pure (no DB)
+- [ ] **UNVERIFIED**: migration 0011 not yet applied; no report has been built
+      against real data. First run is 15:45 IST on the next trading day.
+- [ ] Per-trade slippage vs signal price — needs a signal-price record the
+      ledger does not currently carry
+- [ ] Rolling live-vs-backtest PF / win rate — same prerequisite
 
 ## Phase 8+ — Options
 *(Deferred per Goal_Setting.txt priority [10]/[11].)*
@@ -433,6 +449,8 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-07-28 (cont.) — Phase 7a Tier 3 shipped: the EOD session postmortem. New `src/reporting/eod.py` runs on the Railway scheduler at 10:15 UTC = 15:45 IST (weekdays, re-checks `is_trading_day`), AFTER the 15:15 square-off and the 15:30 close so what is still open genuinely IS carried overnight. The nightly Parquet export already archives the ledger at 06:00 IST the next morning, but that is an ARCHIVE not a REPORT — it says what was traded and nothing about whether the session behaved. This answers what you actually want at 15:45: per-bucket realized + fees; entries/exits/rejects tables; **signals seen but NOT taken grouped by reason** (straight from `sizing_snapshot`, which has held that record since Decision 026 and which nothing had ever read back — the literal answer to "why didn't it trade today?"); carried-overnight with notional; and events (breakers, kill-switch flips, regime changes, reconcile diffs) off `audit_log`. Three outputs from one source: a phone-readable Telegram digest, a `session_report` row (migration 0011 — Postgres is the store because the Railway scheduler container is EPHEMERAL and has no git credentials), and a `/journal` dashboard route. `scripts/export_journal.py` bridges Postgres → `docs/journal/*.md` for git; `--commit` is opt-in and cannot restart the bot, since ops/deploy.sh's RESTART_PATHS excludes `docs/`. `scripts/eod_report.py` builds one by hand for a backfill or re-run. The dashboard renders markdown with a ~60-line local subset renderer rather than a CommonMark dependency (the generator emits a known closed grammar), and it ESCAPES BEFORE IT FORMATS so a broker message or symbol with angle brackets can't inject markup. A quiet day says so plainly instead of rendering an empty skeleton — both live strategies wait for a specific setup and most days don't offer one, and a report that looks broken on a normal day is one you stop reading. Same hard constraint as Tier 1: Postgres ONLY, never the Dhan API (a second session evicts the bot's token). 24 new pure unit tests, 463 green, ruff clean on the enforced scope (src/ tests/; note scripts/ and migrations/ carry ~52 PRE-EXISTING UP007/UP035/UP017 findings and have never been in that scope — the new migration deliberately matches its 10 siblings' `Union[str, None]` style). NOT YET VERIFIED: migration 0011 is unapplied and no report has run against real data — first live run is 15:45 IST on the next trading day. Deliberately deferred: per-trade slippage vs signal price and rolling live-vs-backtest PF/win-rate, both of which need a signal-price record the ledger doesn't currently carry.
 
 - 2026-07-28 — Decision 033: session invariants (Phase 7a Tier 1) — a PROCESS watchdog beside the equity watchdog, now that two buckets trade real money. Breakers only ask "has equity fallen off a cliff?", which is right for a leveraged crypto sub-account and wrong for Indian equity, where every failure mode happens at a healthy equity. New `src/safety/session_invariants.py` runs once per 60s tick per account, AFTER the stop sweep (so "no stop" means the sweep FAILED, not that it hasn't run): `squareoff` HALT (intraday products flat by 15:15+grace — the square-off lives inside `gap_down_reversal.exits` driven by the latest BAR's timestamp, so a stale feed / tick error / rejected exit each leave it open, and the Decision 031 CNC fallback has NO broker auto-square-off behind it — a 5x intraday trade silently becomes an overnight delivery, and nothing asserted this before today); `stop_coverage` HALT w/ 2-tick sustain (one uncovered reading can race a just-placed stop); `notional_ceiling` HALT; `reject_rate` HALT (≥3/15min); `bucket_liveness` NOTICE (new per-bucket `bucket:<id>` heartbeat row — the process heartbeat keeps beating for the other buckets, so it cannot see ONE wedged bucket); `foreign_positions` NOTICE and NEVER acted on (makes Decision 027 scoping visible). THE AUTHORITY LADDER is the load-bearing decision: enforcement is capped at HALT (engage the bucket's kill switch — per Decision 024 exits + stop sweep + breakers all keep running while killed), and FLATTEN stays in `enforcement.py` reachable only by a deterministic breaker trip. That is what will keep House Rule #1 intact when the Tier 2 LLM supervisor lands: engaging a kill switch is risk-REDUCING and reversible, closing a position is a trading decision. Two subtleties: `effective_holdings` INTERSECTS the Trade ledger with exchange positions, because the ledger alone goes stale when Dhan's own MIS auto-square-off closes a position without writing our SELL row (phantom holding → square-off invariant fails forever), while positions alone can't tell the bot's rows from the user's on the shared account; and the notional ceiling is INR-equity ONLY, since Delta positions are contract-denominated and USD-priced so qty×entry_price is neither a base-unit size nor rupees. 34 new pure unit tests (checks AND the enforce/streak path), 435 green, ruff clean (the 4 reds are pre-existing local-env gaps — `apscheduler`/`jinja2` not installed here — identical on a stashed baseline). NOT YET EXERCISED LIVE — the first real 15:15 is the acceptance test. Tiers 2 (intraday supervisor agent, ~6 fixed IST wake-ups, Postgres-only, L1-halt authority) and 3 (EOD postmortem → Telegram + committed `docs/journal/` + `/journal` route) are DESIGNED in Decision 033 but NOT BUILT; both are hard-constrained to never call the Dhan API (a second session evicts the bot's token) and never to run on the bot VM (a dead VM must not silence its own watchdog).
 

@@ -31,6 +31,8 @@ from src.core.export import export_trades, upload_to_gdrive
 from src.core.heartbeat import SERVICE_BOT_WORKER, last_beat, staleness
 from src.core.logging import configure_logging, get_logger
 from src.core.retention import prune_old_rows
+from src.reporting import eod
+from src.shared.market_calendar import IST, is_trading_day
 
 _log = get_logger("scheduler")
 
@@ -90,6 +92,27 @@ def _nightly_export() -> None:
         send_alert("Nightly export FAILED — check logs")
 
 
+def _eod_report() -> None:
+    """Build and send the end-of-day session postmortem (Decision 033).
+
+    Runs at 10:15 UTC = 15:45 IST, after intraday-indian's 15:15 square-off and
+    the 15:30 close, so what is still open genuinely IS carried overnight.
+    Skips non-trading days: a Sunday has no session to report on.
+    """
+    today = datetime.now(tz=IST).date()
+    if not is_trading_day(today):
+        _log.info("eod_report_skipped_non_trading_day", date=str(today))
+        return
+    try:
+        report = eod.gather(today)
+        eod.store(report)
+        send_alert(eod.render_digest(report))
+        _log.info("eod_report_done", date=str(today), quiet=report.quiet)
+    except Exception:
+        _log.exception("eod_report_failed")
+        send_alert("EOD report FAILED — check logs (trading is unaffected)")
+
+
 def _nightly_prune() -> None:
     """Prune expired snapshot/audit rows; page only when a table fails."""
     counts = prune_old_rows()
@@ -127,6 +150,17 @@ def main() -> None:
         hour=1,
         minute=0,
         id="nightly_prune",
+        replace_existing=True,
+    )
+
+    # 10:15 UTC = 15:45 IST — after the 15:15 square-off and the 15:30 close.
+    scheduler.add_job(
+        _eod_report,
+        "cron",
+        day_of_week="mon-fri",
+        hour=10,
+        minute=15,
+        id="eod_report",
         replace_existing=True,
     )
 

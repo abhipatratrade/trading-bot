@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Session journal — Trading Bot{% endblock %}
+
+{% block content %}
+<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:1.5rem">
+  <div>
+    <h1 style="margin:0">Session journal</h1>
+    <div style="color:#8b949e;font-size:0.85rem">
+      End-of-day postmortems, built at 15:45 IST from Postgres (Decision 033)
+    </div>
+  </div>
+  {% if dates %}
+  <form method="get" action="/journal">
+    <select name="d" onchange="this.form.submit()">
+      {% for d in dates %}
+      <option value="{{ d }}" {% if d == selected %}selected{% endif %}>{{ d }}</option>
+      {% endfor %}
+    </select>
+    <noscript><button class="btn" type="submit">Go</button></noscript>
+  </form>
+  {% endif %}
+</div>
+
+{% if report %}
+<div class="section journal">
+  {{ report.html|safe }}
+</div>
+{% else %}
+<div class="empty">
+  No session reports yet. The first one lands at 15:45 IST on the next trading
+  day — or run <code>python -m scripts.eod_report</code> to build one now.
+</div>
+{% endif %}
+
+<style>
+  .journal h1 { font-size: 1.25rem; margin-top: 0; }
+  .journal h2 { font-size: 1.05rem; margin-top: 1.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.35rem; }
+  .journal h3 { font-size: 0.9rem; margin-top: 1.25rem; margin-bottom: 0.5rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.03em; }
+  .journal p { margin-bottom: 0.75rem; font-size: 0.9rem; }
+  .journal ul { margin: 0 0 1rem 1.25rem; }
+  .journal li { font-size: 0.9rem; margin-bottom: 0.2rem; }
+  .journal code { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0.05rem 0.3rem; font-size: 0.8rem; }
+  .journal table { margin-top: 0.5rem; }
+</style>
+{% endblock %}

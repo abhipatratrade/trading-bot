@@ -24,7 +24,14 @@ from fastapi.templating import Jinja2Templates
 
 from src.core.config import get_settings
 from src.core.logging import get_logger
-from src.dashboard.routes import buckets, export, kill_switch, overview, params
+from src.dashboard.routes import (
+    buckets,
+    export,
+    journal,
+    kill_switch,
+    overview,
+    params,
+)
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -115,5 +122,6 @@ def create_app() -> FastAPI:
     app.include_router(kill_switch.router)
     app.include_router(params.router)
     app.include_router(export.router)
+    app.include_router(journal.router)
 
     return app

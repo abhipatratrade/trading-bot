@@ -644,6 +644,33 @@ class DhanToken(Base, TimestampMixin):
     minted_by: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
+class SessionReport(Base, TimestampMixin):
+    """One end-of-day postmortem per trading date (Decision 033, Tier 3).
+
+    Postgres is the store rather than a file because the Railway scheduler
+    container is ephemeral and holds no git credentials. The dashboard reads
+    this at /journal; ``scripts/export_journal.py`` materialises rows into
+    docs/journal/*.md when the user wants them in git.
+
+    One row per date — a re-run overwrites, so the report is always the latest
+    view of that session rather than a pile of near-duplicates.
+    """
+
+    __tablename__ = "session_report"
+    __table_args__ = (
+        UniqueConstraint("session_date", name="uq_session_report_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_date: Mapped[date_] = mapped_column(Date, nullable=False)
+    # Short Telegram version.
+    digest: Mapped[str] = mapped_column(Text, nullable=False)
+    # Full journal entry.
+    markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    # The structured numbers behind the prose, for later analysis.
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
 # Re-export for convenience: ``from src.core.models import *`` grabs everything.
 __all__ = [
     "BrokerName",
@@ -668,4 +695,6 @@ __all__ = [
     "BucketState",
     "DailyEquityAnchor",
     "Heartbeat",
+    "DhanToken",
+    "SessionReport",
 ]

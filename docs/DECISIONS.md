@@ -1192,17 +1192,54 @@ Two design points worth keeping:
   contract-denominated and USD-priced, so `qty × entry_price` is neither a
   base-unit size nor rupees. `BucketWatch.notional_budget_inr=None` skips it.
 
-### Tiers 2 and 3 — designed, not built
+### Tier 2 — intraday supervisor agent (designed, not built)
 
-- **Tier 2, intraday supervisor.** An LLM agent at ~6 fixed points (09:15,
-  09:30, 10:30, 12:00, 15:10, 15:20 IST) reading a Postgres-only snapshot.
-  Catches what thresholds cannot: entry rate far off the backtest baseline,
-  every fill at its bar's extreme, a symbol cycling in and out, a
-  `sizing_snapshot` skip reason spiking. Authority: L1 halt, then page.
-- **Tier 3, EOD postmortem.** 15:45 IST → Telegram digest + a committed
-  `docs/journal/YYYY-MM-DD.md` + a `/journal` dashboard route. Includes
-  per-trade slippage, signals that did NOT trade and why, the overnight
-  assertion for `swing-indian`, and rolling live-vs-backtest PF/win-rate.
+An LLM agent at ~6 fixed points (09:15, 09:30, 10:30, 12:00, 15:10, 15:20 IST)
+reading a Postgres-only snapshot. Catches what thresholds cannot: entry rate
+far off the backtest baseline, every fill at its bar's extreme, a symbol
+cycling in and out, a `sizing_snapshot` skip reason spiking. Authority: L1
+halt, then page.
+### Tier 3 — `src/reporting/eod.py` (landed 2026-07-28)
+
+Scheduler job at 10:15 UTC = **15:45 IST**, after the 15:15 square-off and the
+15:30 close, so what is still open genuinely IS carried overnight. Weekdays
+only, and it re-checks `is_trading_day` (an NSE holiday has no session to
+report on).
+
+The nightly Parquet export already archives the ledger at 06:00 IST the
+morning after. That is an archive, not a report: it says what was traded and
+nothing about whether the session behaved. This answers the questions you
+actually have at 15:45 — what each bucket made, **which signals did not trade
+and why** (`sizing_snapshot` has held that record since Decision 026 and
+nothing had ever read it back), what tripped, what is carried overnight, and
+whether the live edge tracks the backtest.
+
+Three outputs, one source:
+
+- **Telegram digest** — phone-readable, no tables, truncates a long event list
+- **`session_report` table** (migration 0011) — Postgres is the store because
+  the Railway scheduler container is ephemeral and holds no git credentials.
+  One row per date; a re-run UPSERTs rather than piling up near-duplicates.
+- **`/journal` dashboard route** + `scripts/export_journal.py`, which
+  materialises rows into `docs/journal/*.md` for git. Committing is opt-in
+  (`--commit`) and safe on the VM: `ops/deploy.sh`'s `RESTART_PATHS` excludes
+  `docs/`, so a journal commit never restarts the bot.
+
+The dashboard renders the markdown with a ~60-line local subset renderer
+rather than a CommonMark dependency — the generator emits a known, closed
+grammar (headings, tables, lists, bold, code spans). It **escapes before it
+formats**, so a broker message or symbol containing angle brackets cannot
+inject markup.
+
+A quiet day says so plainly instead of rendering an empty skeleton. Both live
+strategies wait for a specific setup and most days do not offer one; a report
+that looks broken on a normal day is a report you stop reading.
+
+`scripts/eod_report.py` builds one by hand for a backfill or a re-run.
+
+**Not yet built:** per-trade slippage vs signal price, and rolling
+live-vs-backtest PF/win-rate. Both need a signal-price record the ledger does
+not currently carry.
 
 **Hard constraint on both:** they read **Postgres only** and must never call
 the Dhan API. A second session evicts the bot's token — a monitor that polled
