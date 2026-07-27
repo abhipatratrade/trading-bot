@@ -135,6 +135,13 @@ class MeanReversion1h(Strategy):
                     hint={
                         "signal": "meanrev_1h_fresh_cross",
                         "bar_key": sig.bar_key,
+                        # Decision 033: the close of the bar the decision was
+                        # made on. The backtest fills at the NEXT bar's open,
+                        # so this is the reference the live fill is measured
+                        # against — the gap between them IS the live-vs-backtest
+                        # execution difference, and it is unrecoverable unless
+                        # recorded here.
+                        "signal_price": str(sig.close),
                         "dist_pct": str(sig.dist_pct),
                         "ema20": str(sig.ema20),
                         "atr14": str(sig.atr14),

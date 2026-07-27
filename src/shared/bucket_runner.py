@@ -424,6 +424,7 @@ class BucketRunner:
                         extra_payload=_entry_extra(
                             hint=hints.get(sym, {}),
                             margin_inr=res.required_margin_inr,
+                            decision_price=mark_prices.get(sym),
                         ),
                     )
                     placed += 1
@@ -582,6 +583,12 @@ class BucketRunner:
         exit_side = (
             OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
         )
+        # Decision 033: the mark at the moment we decided to exit. Exits carry
+        # no signal_price — select_exits returns bare symbols, so there is no
+        # per-symbol reference bar to read a close off without changing that
+        # contract for every strategy. This still yields the EXECUTION half of
+        # the exit's slippage, which is the actionable half.
+        exit_mark = self._collect_mark_prices([pos.symbol]).get(pos.symbol)
         try:
             om.place_order(
                 strategy_id=self.bucket.id,
@@ -592,6 +599,9 @@ class BucketRunner:
                 size=pos.quantity,
                 order_type=OrderType.MARKET,
                 reduce_only=True,
+                extra_payload=(
+                    {"decision_price": str(exit_mark)} if exit_mark else None
+                ),
                 # Decision 024: strategy exits are risk-reducing and pass
                 # an engaged kill switch (same as breaker flatten / stops).
                 allow_when_killed=True,
@@ -812,7 +822,10 @@ class BucketRunner:
 # Helpers
 # ---------------------------------------------------------------------------
 def _entry_extra(
-    *, hint: dict[str, object], margin_inr: Decimal
+    *,
+    hint: dict[str, object],
+    margin_inr: Decimal,
+    decision_price: Decimal | None = None,
 ) -> dict[str, object]:
     """Facts stamped on the entry Trade for downstream stages to read back.
 
@@ -821,7 +834,16 @@ def _entry_extra(
     per-instrument ATR stop, instead of the bucket-wide percent net.
     ``margin_inr`` is the own-capital the sizer allotted this slot, which is
     what the MTF carry-interest charge measures the funded portion against.
-    Both are plain strings so the JSONB round-trips losslessly.
+
+    ``signal_price`` (the close of the bar the strategy decided on) and
+    ``decision_price`` (the mark when we actually placed the order) are the two
+    reference points slippage is measured from — Decision 033. Recording them
+    at decision time is the only chance we get: neither is recoverable
+    afterwards, because "what the strategy saw" is not a thing the exchange
+    knows. With ``avg_fill_price`` from the reconciler they separate latency
+    cost from execution cost; see ``src/reporting/slippage.py``.
+
+    All values are plain strings so the JSONB round-trips losslessly.
     """
     out: dict[str, object] = {"margin_inr": str(margin_inr)}
     distance = hint.get("stop_distance")
@@ -830,6 +852,11 @@ def _entry_extra(
     signal = hint.get("signal")
     if signal is not None:
         out["signal"] = str(signal)
+    signal_price = hint.get("signal_price")
+    if signal_price is not None:
+        out["signal_price"] = str(signal_price)
+    if decision_price is not None:
+        out["decision_price"] = str(decision_price)
     return out
 
 

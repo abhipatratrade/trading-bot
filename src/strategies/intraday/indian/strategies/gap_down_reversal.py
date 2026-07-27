@@ -125,6 +125,12 @@ class GapDownReversal(Strategy):
                     hint={
                         "pattern": pattern,
                         "pattern_close_ist": ist_time(today[index]).isoformat(),
+                        # Decision 033: the pattern candle's close — the price
+                        # the decision was made on. The backtest enters at the
+                        # NEXT bar's open, so this is what the live fill is
+                        # measured against. Recorded here because it is not
+                        # recoverable later; the exchange never knew it.
+                        "signal_price": str(today[index].close),
                     },
                 )
             )

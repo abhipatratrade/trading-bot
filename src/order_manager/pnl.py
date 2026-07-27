@@ -121,6 +121,30 @@ def realized_totals(pnls: list[Decimal]) -> tuple[Decimal, Decimal]:
     return profit, loss
 
 
+def profit_factor(pnls: list[Decimal]) -> Decimal | None:
+    """Gross profit ÷ gross loss — the backtest's headline number.
+
+    Scale-invariant, which is what makes a live figure in rupees directly
+    comparable to a backtest figure computed on unlevered position returns
+    (Decision 033). None when there are no losers yet: a bucket that has only
+    won has an undefined profit factor, not an infinite one, and printing ∞
+    next to a backtest's 2.31 would read as spectacular rather than as
+    "too early to say".
+    """
+    profit, loss = realized_totals(pnls)
+    if loss == 0:
+        return None
+    return profit / abs(loss)
+
+
+def win_rate(pnls: list[Decimal]) -> Decimal | None:
+    """Share of round-trips that made money, 0..1. None on an empty list."""
+    if not pnls:
+        return None
+    wins = sum(1 for p in pnls if p > 0)
+    return Decimal(wins) / Decimal(len(pnls))
+
+
 def bucket_cumulative_pnl(
     *,
     capital: Decimal,

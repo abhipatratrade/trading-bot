@@ -45,3 +45,26 @@ default_for_unknown:
   sigma_per_period: 0.018727 # per trade (one session)
 
 stats: {}
+
+# What the backtest achieved — REPORTING ONLY (Decision 033). The sizer never
+# reads this; the EOD report quotes it beside the live figures.
+#
+# Sources:
+#   profit_factor     buckets.yaml Decision 029 comment, "Holdout-validated
+#                     PF 1.68 / +13.3% on margin"
+#   trades / mean     this file's mu note above — 76 full-window trades,
+#                     mu_per_period = mean(trade returns) = 0.006238 (one
+#                     period IS one trade here: every trade squares off intraday)
+#
+# win_rate deliberately BLANK — not recorded in this repo, and the report omits
+# what it is not given rather than comparing against a guess.
+#
+# Read the live-vs-backtest section with THIS bucket's cost profile in mind:
+# the edge is thin relative to costs (~0.12% round-trip against a ~0.62% mean
+# trade), so execution slippage eats a larger share of it here than anywhere
+# else. A slippage figure that looks small in bps can still be a big fraction
+# of this strategy's edge.
+backtest_baseline:
+  profit_factor: 1.68
+  mean_trade_return: 0.006238   # per trade (one session), unlevered, net
+  trades: 76

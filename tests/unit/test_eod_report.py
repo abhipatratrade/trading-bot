@@ -22,14 +22,19 @@ from src.core.models import (
 )
 from src.dashboard.routes.journal import render_markdown_to_html
 from src.reporting.eod import (
+    EdgeStats,
+    build_edge,
     build_report,
     build_sections,
     ist_day_bounds,
+    load_baselines,
     payload_of,
     render_digest,
     render_markdown,
     split_positions,
+    to_trade_line,
 )
+from src.shared.allocator.sizer import BacktestBaseline
 from src.shared.market_calendar import IST
 
 DAY = date(2026, 7, 28)
@@ -139,6 +144,7 @@ def _report(**kw) -> object:
         positions=kw.get("positions", []),
         events=kw.get("events", []),
         owned=kw.get("owned"),
+        edge=kw.get("edge"),
     )
 
 
@@ -362,6 +368,130 @@ def test_payload_carries_the_numbers_behind_the_prose() -> None:
     bucket = payload["buckets"]["swing-indian"]
     assert bucket["entries"] == 1
     assert bucket["skip_reasons"]["skipped_insufficient"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Slippage in the report
+# ---------------------------------------------------------------------------
+def test_trade_line_carries_the_decomposed_slippage() -> None:
+    t = _Trade()
+    t.extra = {
+        "signal_price": "100",
+        "decision_price": "100.5",
+        "avg_fill_price": "100.8",
+    }
+    line = to_trade_line(t)
+    assert line.slip.lag_bps == Decimal("50")
+    assert line.slip.total_bps == Decimal("80")
+
+
+def test_a_pre_change_trade_reports_unknown_slippage_not_zero() -> None:
+    """Trades placed before signal prices were recorded must not read as 0bps."""
+    line = to_trade_line(_Trade())
+    assert not line.slip.known
+
+
+def test_markdown_shows_the_slippage_breakdown() -> None:
+    t = _Trade()
+    t.extra = {
+        "signal_price": "100",
+        "decision_price": "100.5",
+        "avg_fill_price": "100.8",
+    }
+    text = render_markdown(_report(trades=[t]))
+    assert "### Slippage" in text
+    assert "decision lag" in text
+    assert "execution" in text
+
+
+def test_slippage_block_is_omitted_when_nothing_is_known() -> None:
+    text = render_markdown(_report(trades=[_Trade()]))
+    assert "### Slippage" not in text
+
+
+# ---------------------------------------------------------------------------
+# Live vs backtest
+# ---------------------------------------------------------------------------
+def _edge(trades: int, pf_pnls: list[str] | None = None) -> EdgeStats:
+    pnls = pf_pnls or (["100"] * (trades - 1) + ["-50"] if trades else [])
+    return build_edge(
+        bucket_id="swing-indian",
+        round_trips=[(Decimal(p), Decimal("10000")) for p in pnls],
+        baseline=BacktestBaseline(profit_factor=Decimal("2.31"), trades=214),
+    )
+
+
+def test_edge_computes_live_pf_and_win_rate() -> None:
+    e = build_edge(
+        bucket_id="swing-indian",
+        round_trips=[(Decimal("200"), Decimal("10000")), (Decimal("-100"), Decimal("10000"))],
+        baseline=None,
+    )
+    assert e.profit_factor == Decimal("2")
+    assert e.win_rate == Decimal("0.5")
+    assert e.mean_return == Decimal("0.005")
+
+
+def test_a_thin_sample_is_flagged_as_too_early_to_read() -> None:
+    """Both buckets went live in July 2026 — every early report hits this."""
+    e = _edge(3)
+    assert not e.significant
+    text = render_markdown(_report(edge=[e]))
+    assert "Too early to read" in text
+    assert "2.31" in text  # the baseline is still shown alongside
+
+
+def test_a_sufficient_sample_is_not_flagged() -> None:
+    e = _edge(25)
+    assert e.significant
+    text = render_markdown(_report(edge=[e]))
+    assert "Too early to read" not in text
+
+
+def test_an_undefined_live_pf_is_explained_not_printed_as_infinity() -> None:
+    e = build_edge(
+        bucket_id="swing-indian",
+        round_trips=[(Decimal("100"), Decimal("10000"))],
+        baseline=None,
+    )
+    assert e.profit_factor is None
+    text = render_markdown(_report(edge=[e]))
+    assert "undefined, not" in text
+
+
+def test_edge_section_is_omitted_with_no_closed_round_trips() -> None:
+    text = render_markdown(_report(edge=[_edge(0)]))
+    assert "## Live vs backtest" not in text
+
+
+def test_the_edge_section_survives_a_quiet_day() -> None:
+    """It is a 90-day view, so a day the bot sat out does not erase it."""
+    report = _report(edge=[_edge(25)])
+    assert report.quiet
+    assert "## Live vs backtest" in render_markdown(report)
+
+
+def test_payload_carries_edge_and_slippage() -> None:
+    t = _Trade()
+    t.extra = {"signal_price": "100", "avg_fill_price": "101"}
+    payload = payload_of(_report(trades=[t], edge=[_edge(3)]))
+    total = payload["buckets"]["swing-indian"]["slippage_bps"]["total"]
+    assert Decimal(total) == Decimal("100")  # str keeps Decimal scale ("100.00")
+    assert payload["edge"]["swing-indian"]["significant"] is False
+
+
+# ---------------------------------------------------------------------------
+# The real allocator.yaml files must actually carry baselines
+# ---------------------------------------------------------------------------
+def test_both_live_buckets_declare_a_backtest_baseline() -> None:
+    """A baseline that fails to load makes the comparison silently blank."""
+    baselines = load_baselines()
+    for bucket_id, expected_pf in (
+        ("swing-indian", Decimal("2.31")),
+        ("intraday-indian", Decimal("1.68")),
+    ):
+        assert bucket_id in baselines, bucket_id
+        assert baselines[bucket_id].profit_factor == expected_pf
 
 
 # ---------------------------------------------------------------------------

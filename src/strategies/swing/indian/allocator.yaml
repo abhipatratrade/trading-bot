@@ -58,3 +58,30 @@ default_for_unknown:
   sigma_per_period: 0.031572 # per 1D bar
 
 stats: {}
+
+# What the backtest achieved — REPORTING ONLY (Decision 033). The sizer never
+# reads this; the EOD report quotes it beside the live figures so "swing-indian
+# made Rs X" becomes "swing-indian is/isn't earning what was promised".
+#
+# PF and win_rate are scale-invariant, so these backtest numbers (unlevered
+# position return, net of costs) compare directly to live figures in rupees.
+# mean_trade_return is NOT — it is the unlevered per-trade return, and the live
+# side normalises by notional to match.
+#
+# Sources, so a wrong number is traceable rather than mysterious:
+#   profit_factor     buckets.yaml Decision 032 comment, "holdout-validated
+#                     PF 2.31 / +24.7% on margin (train fold)"
+#   trades / mean     this file's own mu/sigma note above — 214 full-window
+#                     trades, sum(trade returns) = 4.2760 => 4.2760/214
+#
+# win_rate is deliberately BLANK: it is not recorded anywhere in this repo, and
+# a guessed baseline is worse than no baseline (the report omits what it is not
+# given). Fill it from the backtest_ref JSON above when you have it to hand.
+backtest_baseline:
+  profit_factor: 2.31
+  mean_trade_return: 0.019981   # 4.2760 / 214, unlevered, net of costs
+  trades: 214
+  note: >-
+    PF from the Decision 032 buckets.yaml comment, whose "(train fold)"
+    parenthetical is ambiguous about which fold produced 2.31. Re-read the
+    backtest_ref JSON and correct if it disagrees.

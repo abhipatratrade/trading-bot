@@ -94,6 +94,29 @@ class KellySymbolStats(BaseModel):
     sigma_per_period: Decimal = Field(gt=0)
 
 
+class BacktestBaseline(BaseModel):
+    """What the backtest achieved, for the live report to be measured against.
+
+    Decision 033. Purely descriptive — nothing in the trading path reads this;
+    it exists so the EOD report can say "live PF 1.4 vs backtest 2.31" instead
+    of quoting a number with nothing to compare it to. Every field is optional:
+    a baseline you have not verified should stay blank rather than be guessed,
+    and the report simply omits what it is not given.
+
+    Profit factor and win rate are scale-invariant, so a backtest figure
+    computed on unlevered position returns is directly comparable to a live
+    figure computed in rupees. ``mean_trade_return`` is not — it is the
+    UNLEVERED per-trade return (pnl / notional, net of costs), and the live
+    side must normalise the same way to compare.
+    """
+
+    profit_factor: Decimal | None = Field(default=None, gt=0)
+    win_rate: Decimal | None = Field(default=None, ge=0, le=1)
+    mean_trade_return: Decimal | None = None
+    trades: int | None = Field(default=None, ge=0)
+    note: str = ""
+
+
 class AllocatorConfig(BaseModel):
     fractional_kelly: Decimal = Field(gt=0, le=1, default=Decimal("0.25"))
     per_symbol_cap: Decimal = Field(gt=0, le=1, default=Decimal("0.30"))
@@ -107,6 +130,8 @@ class AllocatorConfig(BaseModel):
         }
     )
     stats: dict[str, KellySymbolStats] = Field(default_factory=dict)
+    # Decision 033 — reporting only, never read by the sizer.
+    backtest_baseline: BacktestBaseline | None = None
 
     # FX + contract sizing — required for correct contracts math when the
     # bucket capital is in one currency (INR) and the broker quotes prices

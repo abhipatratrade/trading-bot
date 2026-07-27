@@ -1237,9 +1237,59 @@ that looks broken on a normal day is a report you stop reading.
 
 `scripts/eod_report.py` builds one by hand for a backfill or a re-run.
 
-**Not yet built:** per-trade slippage vs signal price, and rolling
-live-vs-backtest PF/win-rate. Both need a signal-price record the ledger does
-not currently carry.
+### Signal price at decision time (added 2026-07-28)
+
+The prerequisite for both deferred sections, and the reason they were deferred:
+**"what the strategy saw" is not something the exchange knows.** It is
+unrecoverable unless recorded at the moment of the decision, so every day it
+went unrecorded was a day of live evidence permanently lost — with two buckets
+newly on real money, that was the most expensive thing still missing.
+
+Three prices now ride on every entry `Trade.extra` (no migration — the
+`hint` → `_entry_extra` → JSONB path already carried `stop_distance`):
+
+| key | meaning | written by |
+|---|---|---|
+| `signal_price` | close of the bar the strategy decided on | the strategy's `hint` |
+| `decision_price` | mark when the runner actually placed the order | `BucketRunner` |
+| `avg_fill_price` | what the exchange gave us | the reconciler (already existed) |
+
+Which splits the gap into two costs that have **completely different fixes**:
+
+```
+decision lag = decision_price − signal_price   → scan latency / tick cadence
+execution    = fill_price − decision_price     → spread, impact, order type
+```
+
+Reporting only the total would say "you are losing 16bps" without saying which
+one to go and fix. Sign convention: **positive is always a cost**, on both
+sides of the book, so entries and exits can be averaged without cancelling into
+a comforting zero.
+
+Exits carry `decision_price` but no `signal_price` — `select_exits` returns
+bare symbols, so there is no per-symbol reference bar to read without changing
+that contract for every strategy. The execution half is the actionable half
+anyway. Cost: one extra `get_ticker` per exit, exception-safe and ~0.22s under
+Dhan's pacing, which is negligible against the 15:15→15:30 square-off window.
+
+### Live vs backtest
+
+`backtest_baseline` in each bucket's `allocator.yaml` — the file that already
+carries `backtest_ref` and the pooled mu/sigma, so House Rule 7 holds. Purely
+descriptive; **the sizer never reads it**. Every field is optional, and
+`win_rate` is deliberately blank for both live buckets: it is not recorded
+anywhere in this repo, and a guessed baseline is worse than none.
+
+Profit factor and win rate are scale-invariant, which is what makes a live
+figure in rupees directly comparable to a backtest figure computed on unlevered
+returns. A live PF with no losing round-trip yet is reported as **undefined,
+not infinite** — printing ∞ beside a backtest's 2.31 would read as spectacular
+rather than as "too early to say".
+
+Below `MIN_TRADES_FOR_SIGNAL` (20) closed round-trips the section leads with a
+"too early to read" banner. Both buckets went live in July 2026, so every
+report for months will be under it, and a 3-trade profit factor of 4.90 must
+not read as a verdict.
 
 **Hard constraint on both:** they read **Postgres only** and must never call
 the Dhan API. A second session evicts the bot's token — a monitor that polled

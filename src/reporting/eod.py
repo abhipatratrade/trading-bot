@@ -36,6 +36,7 @@ from decimal import Decimal
 from sqlalchemy import select
 
 from src.core.db import session_scope
+from src.core.logging import get_logger
 from src.core.models import (
     AuditEventType,
     AuditLog,
@@ -49,8 +50,13 @@ from src.core.models import (
     Trade,
 )
 from src.order_manager.ownership import bot_owned_quantities
-from src.order_manager.pnl import pnl_pct
+from src.order_manager.pnl import pnl_pct, profit_factor, win_rate
+from src.reporting.slippage import Slippage, decompose, mean_bps, to_decimal
+from src.shared.allocator.sizer import BacktestBaseline, load_allocator_config
+from src.shared.bucket import load_buckets
 from src.shared.market_calendar import IST
+
+_log = get_logger("reporting.eod")
 
 _ZERO = Decimal("0")
 
@@ -72,6 +78,7 @@ class TradeLine:
     fees: Decimal
     realized: Decimal | None
     at: datetime | None
+    slip: Slippage = field(default_factory=Slippage)
 
     @property
     def notional(self) -> Decimal:
@@ -117,6 +124,31 @@ class BucketSection:
         return bool(self.entries or self.exits or self.rejects)
 
 
+# A live edge estimate below this many round-trips is noise, not evidence. Both
+# buckets went live in July 2026, so every early report is under it — and must
+# say so rather than let a 3-trade profit factor read as a verdict.
+MIN_TRADES_FOR_SIGNAL = 20
+
+# How far back the live-vs-backtest comparison looks.
+EDGE_WINDOW_DAYS = 90
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeStats:
+    """Live edge for one bucket over the rolling window, vs its backtest."""
+
+    bucket_id: str
+    trades: int
+    profit_factor: Decimal | None
+    win_rate: Decimal | None
+    mean_return: Decimal | None
+    baseline: BacktestBaseline | None
+
+    @property
+    def significant(self) -> bool:
+        return self.trades >= MIN_TRADES_FOR_SIGNAL
+
+
 @dataclass(frozen=True, slots=True)
 class Report:
     session_date: date_
@@ -127,6 +159,8 @@ class Report:
     # user's own trading (Decision 027). Reported so the numbers above are
     # visibly complete, never counted as the bot's.
     foreign: list[CarriedPosition] = field(default_factory=list)
+    # Rolling live-vs-backtest edge per bucket (Decision 033).
+    edge: list[EdgeStats] = field(default_factory=list)
 
     @property
     def realized(self) -> Decimal:
@@ -153,6 +187,7 @@ def _realized_of(trade: Trade) -> Decimal | None:
 
 
 def to_trade_line(trade: Trade) -> TradeLine:
+    extra = trade.extra or {}
     return TradeLine(
         bucket_id=trade.bucket_id or trade.strategy_id,
         strategy_name=trade.strategy_name or "—",
@@ -164,6 +199,14 @@ def to_trade_line(trade: Trade) -> TradeLine:
         fees=trade.fees or _ZERO,
         realized=_realized_of(trade),
         at=trade.filled_at or trade.submitted_at or trade.created_at,
+        # Decision 033. Trades placed before the signal-price change simply
+        # report unknown rather than a misleading zero.
+        slip=decompose(
+            signal_price=extra.get("signal_price"),
+            decision_price=extra.get("decision_price"),
+            fill_price=extra.get("avg_fill_price"),
+            side=trade.side,
+        ),
     )
 
 
@@ -268,6 +311,35 @@ def build_sections(
     return sections
 
 
+def build_edge(
+    *,
+    bucket_id: str,
+    round_trips: list[tuple[Decimal, Decimal]],
+    baseline: BacktestBaseline | None,
+) -> EdgeStats:
+    """Live edge from closed round-trips. PURE.
+
+    ``round_trips`` is [(realized_pnl, notional)]. Profit factor and win rate
+    are scale-invariant, so a live figure in rupees compares directly to a
+    backtest figure computed on unlevered returns. ``mean_return`` normalises
+    by notional to match the baseline's convention — measured on the EXIT leg's
+    notional, which is the closest thing the ledger carries to the position's
+    size and differs from the entry's only by the move itself.
+    """
+    pnls = [pnl for pnl, _ in round_trips]
+    returns = [pnl / notional for pnl, notional in round_trips if notional > 0]
+    return EdgeStats(
+        bucket_id=bucket_id,
+        trades=len(pnls),
+        profit_factor=profit_factor(pnls),
+        win_rate=win_rate(pnls),
+        mean_return=(
+            sum(returns, _ZERO) / Decimal(len(returns)) if returns else None
+        ),
+        baseline=baseline,
+    )
+
+
 def build_events(rows: list[AuditLog]) -> list[str]:
     """One line per thing that tripped today. PURE.
 
@@ -289,6 +361,7 @@ def build_report(
     positions: list[Position],
     events: list[AuditLog],
     owned: dict[str, Decimal] | None = None,
+    edge: list[EdgeStats] | None = None,
 ) -> Report:
     bot_positions, foreign_positions = split_positions(positions, owned)
     sections = build_sections(trades, skips, bot_positions)
@@ -306,6 +379,7 @@ def build_report(
             for p in foreign_positions
             if p.side != PositionSide.FLAT and p.quantity > 0
         ],
+        edge=edge or [],
     )
 
 
@@ -370,18 +444,115 @@ def render_digest(report: Report) -> str:
     return "\n".join(out)
 
 
+def _bps(value: Decimal | None) -> str:
+    """bps, cost-positive. Em-dash when the price it needs was not recorded."""
+    if value is None:
+        return "—"
+    return f"{value:+.1f}"
+
+
 def _trade_table(lines: list[TradeLine]) -> list[str]:
     out = [
-        "| time | symbol | strategy | qty | price | notional | fees | realized |",
-        "|---|---|---|---|---|---|---|---|",
+        "| time | symbol | strategy | qty | price | notional | fees | realized "
+        "| lag bps | exec bps | slip bps |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for t in lines:
         when = f"{t.at.astimezone(IST):%H:%M}" if t.at else "—"
         out.append(
             f"| {when} | {t.symbol} | {t.strategy_name} | {t.quantity} | "
             f"{_money(t.price)} | {_money(t.notional)} | {_money(t.fees)} | "
-            f"{_money(t.realized)} |"
+            f"{_money(t.realized)} | {_bps(t.slip.lag_bps)} | "
+            f"{_bps(t.slip.execution_bps)} | {_bps(t.slip.total_bps)} |"
         )
+    return out
+
+
+def _slippage_block(sec: BucketSection) -> list[str]:
+    """Per-bucket slippage summary. Positive bps = cost."""
+    lines = sec.entries + sec.exits
+    lag = mean_bps([t.slip.lag_bps for t in lines])
+    execution = mean_bps([t.slip.execution_bps for t in lines])
+    total = mean_bps([t.slip.total_bps for t in lines])
+    if lag is None and execution is None and total is None:
+        return []
+    return [
+        "### Slippage",
+        "",
+        "Positive is cost, on both sides of the book. **Lag** is the market "
+        "moving between the signal bar closing and the order going out — a "
+        "latency problem. **Exec** is spread and impact on the market order — "
+        "a liquidity or order-type problem. They have different fixes, which "
+        "is why they are shown apart.",
+        "",
+        f"- decision lag: **{_bps(lag)} bps**",
+        f"- execution: **{_bps(execution)} bps**",
+        f"- total signal→fill: **{_bps(total)} bps**",
+        "",
+    ]
+
+
+def _pct(value: Decimal | None) -> str:
+    return "—" if value is None else f"{value * 100:.1f}%"
+
+
+def _ratio(value: Decimal | None) -> str:
+    return "—" if value is None else f"{value:.2f}"
+
+
+def _edge_block(report: Report) -> list[str]:
+    """Live edge vs the backtest that justified running the strategy.
+
+    The point of the whole exercise: a rupee P&L tells you what happened, not
+    whether the thing still works.
+    """
+    stats = [e for e in report.edge if e.trades]
+    if not stats:
+        return []
+
+    out = [
+        "## Live vs backtest",
+        "",
+        f"Closed round-trips over the last {EDGE_WINDOW_DAYS} days. Profit "
+        f"factor and win rate are scale-invariant, so the live figures compare "
+        f"directly to backtest figures computed on unlevered returns.",
+        "",
+    ]
+
+    thin = [e for e in stats if not e.significant]
+    if thin:
+        out += [
+            f"> **Too early to read.** "
+            f"{', '.join(e.bucket_id for e in thin)} "
+            f"{'has' if len(thin) == 1 else 'have'} fewer than "
+            f"{MIN_TRADES_FOR_SIGNAL} closed round-trips. At this sample size "
+            f"a profit factor is noise — one trade moves it enormously. These "
+            f"numbers are here to accumulate, not yet to judge.",
+            "",
+        ]
+
+    out += [
+        "| bucket | trades | PF live | PF backtest | win live | win backtest "
+        "| mean live | mean backtest |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for e in stats:
+        b = e.baseline
+        out.append(
+            f"| {e.bucket_id} | {e.trades} | {_ratio(e.profit_factor)} | "
+            f"{_ratio(b.profit_factor if b else None)} | "
+            f"{_pct(e.win_rate)} | {_pct(b.win_rate if b else None)} | "
+            f"{_pct(e.mean_return)} | "
+            f"{_pct(b.mean_trade_return if b else None)} |"
+        )
+    out.append("")
+
+    if any(e.profit_factor is None and e.trades for e in stats):
+        out += [
+            "A blank live PF means no losing round-trip yet — undefined, not "
+            "infinite.",
+            "",
+        ]
     return out
 
 
@@ -431,7 +602,9 @@ def render_markdown(report: Report) -> str:
             "one.",
             "",
         ]
-        return "\n".join(out + _foreign_block(report))
+        # The rolling edge still matters on a day the bot sat out — it is a
+        # 90-day view, not a today view.
+        return "\n".join(out + _edge_block(report) + _foreign_block(report))
 
     out += [
         "## Summary",
@@ -468,6 +641,8 @@ def render_markdown(report: Report) -> str:
                 *_trade_table(sec.rejects),
                 "",
             ]
+
+        out += _slippage_block(sec)
 
         if sec.skips:
             out += [
@@ -508,6 +683,7 @@ def render_markdown(report: Report) -> str:
                 )
             out.append("")
 
+    out += _edge_block(report)
     out += _foreign_block(report)
 
     if report.events:
@@ -534,6 +710,66 @@ _REPORTABLE_EVENTS = (
     AuditEventType.DRIFT_ALERT,
     AuditEventType.RECONCILE_DIFF,
 )
+
+
+def load_baselines() -> dict[str, BacktestBaseline]:
+    """``{bucket_id: baseline}`` from each bucket's allocator.yaml.
+
+    Best-effort: a bucket whose config fails to load simply reports no
+    baseline. The EOD report must never be the thing that surfaces a YAML
+    error as a crash — the trading path already fails fast on those.
+    """
+    out: dict[str, BacktestBaseline] = {}
+    try:
+        buckets = load_buckets()
+    except Exception:
+        _log.warning("edge_baseline_bucket_load_failed", exc_info=True)
+        return out
+    for bucket in buckets:
+        try:
+            cfg = load_allocator_config(bucket.allocator_yaml_path)
+        except Exception:
+            _log.warning(
+                "edge_baseline_allocator_load_failed",
+                bucket_id=bucket.id,
+                exc_info=True,
+            )
+            continue
+        if cfg.backtest_baseline is not None:
+            out[bucket.id] = cfg.backtest_baseline
+    return out
+
+
+def round_trips_by_bucket(
+    session, since: datetime
+) -> dict[str, list[tuple[Decimal, Decimal]]]:
+    """``{bucket_id: [(realized_pnl, exit_notional)]}`` for closed round-trips.
+
+    A round-trip is an exit the reconciler stamped ``realized_pnl`` on. Its
+    notional is taken from the exit's own fill (qty × avg_fill_price), falling
+    back to the recorded price.
+    """
+    rows = (
+        session.execute(
+            select(Trade).where(
+                Trade.created_at >= since,
+                Trade.status.in_([OrderStatus.FILLED, OrderStatus.PARTIAL]),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[str, list[tuple[Decimal, Decimal]]] = {}
+    for trade in rows:
+        pnl = _realized_of(trade)
+        if pnl is None:
+            continue
+        extra = trade.extra or {}
+        price = to_decimal(extra.get("avg_fill_price")) or trade.price
+        notional = (trade.quantity or _ZERO) * (price or _ZERO)
+        bucket_id = trade.bucket_id or trade.strategy_id
+        out.setdefault(bucket_id, []).append((pnl, notional))
+    return out
 
 
 def ist_day_bounds(session_date: date_) -> tuple[datetime, datetime]:
@@ -600,6 +836,22 @@ def gather(session_date: date_) -> Report:
             bucket_ids=dhan_buckets,
             now=end,
         )
+        # Rolling live-vs-backtest edge (Decision 033) — a wider window than
+        # the rest of the report, because one session is never enough trades
+        # to say anything about an edge.
+        baselines = load_baselines()
+        trips = round_trips_by_bucket(
+            session, end - timedelta(days=EDGE_WINDOW_DAYS)
+        )
+        edge = [
+            build_edge(
+                bucket_id=bucket_id,
+                round_trips=rt,
+                baseline=baselines.get(bucket_id),
+            )
+            for bucket_id, rt in sorted(trips.items())
+        ]
+
         return build_report(
             session_date=session_date,
             trades=trades,
@@ -607,7 +859,12 @@ def gather(session_date: date_) -> Report:
             positions=positions,
             events=events,
             owned=owned,
+            edge=edge,
         )
+
+
+def _opt_str(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
 
 
 def payload_of(report: Report) -> dict:
@@ -626,8 +883,31 @@ def payload_of(report: Report) -> dict:
                 "realized": str(s.realized),
                 "fees": str(s.fees),
                 "skip_reasons": dict(Counter(x.decision for x in s.skips)),
+                "slippage_bps": {
+                    "lag": _opt_str(
+                        mean_bps([t.slip.lag_bps for t in s.entries + s.exits])
+                    ),
+                    "execution": _opt_str(
+                        mean_bps(
+                            [t.slip.execution_bps for t in s.entries + s.exits]
+                        )
+                    ),
+                    "total": _opt_str(
+                        mean_bps([t.slip.total_bps for t in s.entries + s.exits])
+                    ),
+                },
             }
             for s in report.buckets
+        },
+        "edge": {
+            e.bucket_id: {
+                "trades": e.trades,
+                "profit_factor": _opt_str(e.profit_factor),
+                "win_rate": _opt_str(e.win_rate),
+                "mean_return": _opt_str(e.mean_return),
+                "significant": e.significant,
+            }
+            for e in report.edge
         },
     }
 
