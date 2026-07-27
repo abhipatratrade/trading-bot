@@ -324,11 +324,17 @@ rupee P&L.
       (5 on 2024-06-04 with 96 of 100 bins; WAAREEENER = an 11-day-old IPO)
 - [x] 36 new unit tests; full suite 401 green (4 pre-existing env failures); ruff clean
 - [x] **LIVE**: `enabled: true`, real money, from the first qualifying 1h close
+- [x] DEPLOYED + VALIDATED 2026-07-27 23:20 IST (commit 3ef3cf0, CI green): VM selfcheck
+      `enabled_buckets=['swing-indian','intraday-indian'] trading_mode=live`;
+      `bucket_initialised strategies=['mean_reversion_1h']`, `tick_interval_seconds=60`,
+      ticking clean (`bucket_market_closed` after hours), zero errors
+- [x] READ PATH VALIDATED on the VM via `scripts/meanrev_dryrun.py`: **94/94 symbols in
+      55s** (~190 Dhan calls, well inside 5 req/s), ZERO fetch errors, ZERO rejects —
+      no scale-guard hits, no cold EMA20, every daily ATR14 resolved. Reused the shared
+      token (`dhan_token_loaded_from_cache`), so it did NOT evict the live bot's session.
+      No signal on that bar, which is the normal answer (~2 entries/day across 94 names)
 - [ ] **UNEXERCISED — watch the first trade**: an MTF entry, a mean-touch exit, and the
-      ATR-distance resting stop have never run against the real venue. Run
-      `scripts/meanrev_dryrun.py` just after a bin close to check the read path first
-- [ ] Confirm the 90-day 15m pull succeeds for all 94 names inside the rate limit
-      (~190 calls/bin at 4.5 req/s ≈ 45s) and that the EMA20 series comes back warm
+      ATR-distance resting stop have never run against the real venue
 - [ ] Confirm `carry_interest` lands on the first closed round-trip (`Trade.extra`)
 - [ ] Re-derive the 94-name universe after each Midcap-150 rebalance
 - [ ] Expect return BELOW the backtest: 5 concurrent slots, not 20
