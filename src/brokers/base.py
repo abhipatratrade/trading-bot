@@ -48,6 +48,15 @@ class OrderRequest:
     # one Dhan account and therefore one client (Decision 029). None ⇒ the
     # broker adapter's configured default. Delta India ignores it.
     product: str | None = None
+    # Largest size affordable UNLEVERAGED (1x), for adapters that retry a
+    # rejected leveraged order on a cash product (Decision 029 amended
+    # 2026-07-27: an MIS-ineligible scrip falls back to 1x CNC).
+    #
+    # ``size`` is sized for the LEVERAGED product, so re-sending it verbatim
+    # on a 1x product would demand `leverage`× the margin the sizer budgeted —
+    # a ₹10k slot silently consuming ₹40k of cash. The fallback must clamp to
+    # this. None ⇒ no fallback; the rejection propagates.
+    fallback_max_size: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

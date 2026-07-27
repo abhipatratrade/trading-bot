@@ -80,6 +80,13 @@ class BucketConfig(BaseModel):
     # Dhan has a single account, so both Indian buckets share one adapter.
     # None ⇒ the adapter's own default. Crypto buckets leave it unset.
     product: str | None = None
+    # Product to retry on when ``product`` is rejected as ineligible for this
+    # scrip (Decision 029, amended 2026-07-27 by user decision). intraday-indian
+    # sets CNC: a scrip Dhan grants no MIS on is traded 1x delivery rather than
+    # skipped. The retry is ALWAYS sized 1x — the runner passes the cash-
+    # affordable quantity — so the bucket never spends more margin than budgeted.
+    # None ⇒ no fallback; an ineligible scrip fails loudly.
+    fallback_product: str | None = None
 
 
 class BucketsConfig(BaseModel):

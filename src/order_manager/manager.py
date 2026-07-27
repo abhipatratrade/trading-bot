@@ -109,6 +109,7 @@ class OrderManager:
         reduce_only: bool = False,
         stop_price: Decimal | None = None,
         product: str | None = None,
+        fallback_max_size: Decimal | None = None,
         intent_id: str = "",
         bucket_id: str | None = None,
         strategy_name: str | None = None,
@@ -215,6 +216,7 @@ class OrderManager:
                     client_order_id=client_oid,
                     stop_price=stop_price,
                     product=product,
+                    fallback_max_size=fallback_max_size,
                 )
             )
         except Exception:
@@ -260,6 +262,19 @@ class OrderManager:
             if t:
                 t.exchange_order_id = result.exchange_order_id
                 t.status = mapped_status
+                # An adapter may place LESS than requested — Dhan clamps an
+                # MIS→CNC fallback to the 1x-affordable size (Decision 029,
+                # amended). The row must record what the exchange actually
+                # holds: ownership scoping, P&L and stop sizing all read it.
+                if result.size and result.size != size:
+                    self._log.warning(
+                        "placed_size_differs_from_request",
+                        client_order_id=client_oid,
+                        symbol=symbol,
+                        requested=str(size),
+                        placed=str(result.size),
+                    )
+                    t.quantity = result.size
             session.add(
                 AuditLog(
                     strategy_id=strategy_id,

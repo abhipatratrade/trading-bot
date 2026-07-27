@@ -103,6 +103,61 @@ def test_mtf_rejection_no_fallback_raises() -> None:
         _client(http, fallback=False).place_order(req)
 
 
+def test_mis_rejection_falls_back_to_cnc_at_1x_size() -> None:
+    # Decision 029 (amended): an MIS-ineligible scrip retries as CNC, and the
+    # size MUST drop to the 1x-affordable quantity — re-sending the leveraged
+    # size on a cash product would spend `leverage`x the budgeted margin.
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"}),
+        _Resp({"orderId": "888", "orderStatus": "PENDING"})]})
+    req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("40"),
+                       product="INTRADAY", fallback_max_size=Decimal("10"))
+    res = _client(http).place_order(req)
+    assert len(http.calls) == 2
+    assert http.calls[0]["json"]["productType"] == "INTRADAY"
+    assert http.calls[0]["json"]["quantity"] == 40
+    assert http.calls[1]["json"]["productType"] == "CNC"
+    assert http.calls[1]["json"]["quantity"] == 10, "must clamp to 1x size"
+    # The result reports what was actually placed, so the Trade row is honest.
+    assert res.size == Decimal("10")
+    assert res.raw["productType"] == "CNC"
+
+
+def test_mis_rejection_without_cap_raises() -> None:
+    # No fallback_max_size ⇒ bucket didn't opt in ⇒ the rejection stands.
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"})]})
+    req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("40"),
+                       product="INTRADAY")
+    with pytest.raises(DhanAPIError):
+        _client(http).place_order(req)
+    assert len(http.calls) == 1, "must not retry without an explicit 1x cap"
+
+
+def test_mis_fallback_never_upsizes() -> None:
+    # A cap ABOVE the requested size must not inflate the order.
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"}),
+        _Resp({"orderId": "9", "orderStatus": "PENDING"})]})
+    req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("5"),
+                       product="INTRADAY", fallback_max_size=Decimal("50"))
+    res = _client(http).place_order(req)
+    assert http.calls[1]["json"]["quantity"] == 5
+    assert res.size == Decimal("5")
+
+
+def test_mis_fallback_below_one_share_raises() -> None:
+    # Budget can't afford a single share at 1x → surface the rejection rather
+    # than place a 0-quantity order.
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"})]})
+    req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("40"),
+                       product="INTRADAY", fallback_max_size=Decimal("0"))
+    with pytest.raises(DhanAPIError):
+        _client(http).place_order(req)
+    assert len(http.calls) == 1
+
+
 def test_stop_order_uses_trigger_and_snaps_tick() -> None:
     http = _FakeHttp({"POST /v2/orders": [
         _Resp({"orderId": "9", "orderStatus": "PENDING"})]})

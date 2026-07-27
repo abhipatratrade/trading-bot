@@ -406,6 +406,10 @@ class BucketRunner:
                         symbol=sym,
                         side=sides.get(sym, "buy"),
                         size=size,
+                        fallback_max_size=self._one_x_size(
+                            price=mark_prices.get(sym),
+                            margin_budget=res.required_margin_inr,
+                        ),
                     )
                     placed += 1
                 else:
@@ -721,6 +725,27 @@ class BucketRunner:
         )
         return scaled
 
+    def _one_x_size(
+        self, *, price: Decimal | None, margin_budget: Decimal
+    ) -> Decimal | None:
+        """Largest whole quantity affordable with NO leverage, or None.
+
+        This is the clamp for a leveraged→cash product fallback (Decision 029
+        amended: an MIS-ineligible scrip trades 1x CNC instead of being
+        skipped). At 1x, margin == notional, so the budget buys
+        ``margin_budget / price`` shares — a quarter of what the same budget
+        buys at 4x, which is exactly the point: the fallback must not spend
+        more cash than the sizer allotted this slot.
+
+        None when the bucket declares no ``fallback_product``, or the price is
+        unusable — either way the adapter leaves the rejection to propagate.
+        """
+        if self.bucket.config.fallback_product is None:
+            return None
+        if price is None or price <= 0:
+            return None
+        return (margin_budget / price).to_integral_value(rounding="ROUND_DOWN")
+
     def _place_order(
         self,
         *,
@@ -730,6 +755,7 @@ class BucketRunner:
         symbol: str,
         side: str,
         size: Decimal,
+        fallback_max_size: Decimal | None = None,
     ) -> None:
         try:
             om.place_order(
@@ -742,6 +768,7 @@ class BucketRunner:
                 order_type=OrderType.MARKET,
                 leverage=self.bucket.config.leverage_max,
                 product=self.bucket.config.product,
+                fallback_max_size=fallback_max_size,
                 intent_id=f"open-{self._clock.now().strftime('%Y%m%d%H%M')}",
             )
         except KillSwitchEngagedError:

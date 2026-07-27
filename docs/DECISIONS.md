@@ -934,3 +934,48 @@ refreshes on the reconciler sweep:
   Indian bucket. Indian buckets now use `bucket_ledger_pnl` — realized +
   unrealized from that bucket's own Trade rows. Crypto keeps the wallet
   mirror, which is correct there (Decision 019 sub-accounts).
+
+---
+
+## 031 — intraday-indian: MIS-ineligible scrips fall back to 1x CNC
+Date: 2026-07-27
+Status: Accepted (user decision, 2026-07-27)
+Amends: 029, 030(4)
+
+Decision 030(4) ruled **no CNC fallback for INTRADAY**: an MIS-ineligible
+scrip failed loudly, because retrying as CNC would convert a leveraged
+same-day trade into a 1x overnight *delivery* position. Presented with the
+trade-off, the user chose to **trade it at 1x CNC rather than skip it**.
+
+**The hazard this had to solve.** A naive product swap is a silent
+over-spend. `size` reaching the broker was sized for leveraged MIS — at 4x a
+₹10k slot buys ₹40k of stock — and CNC is a *cash* product, so re-sending
+that same quantity demands the full ₹40k, four times the margin the sizer
+budgeted for the slot. Repeated across 5 slots it would try to spend ₹2L of a
+₹50k bucket.
+
+**Implementation — the fallback is always sized 1x.** `OrderRequest` carries
+`fallback_max_size`, the quantity affordable with NO leverage
+(`margin_budget / price`, floored), computed by
+`BucketRunner._one_x_size`. On an INTRADAY rejection the Dhan adapter retries
+as CNC with `min(size, fallback_max_size)`. Guards:
+
+- **Opt-in per bucket.** `fallback_product: CNC` in `buckets.yaml`; a bucket
+  that omits it passes no cap, and the adapter lets the rejection propagate
+  (`swing-indian` keeps its separate MTF→CNC path unchanged).
+- **Never upsizes.** The cap is a `min`, so it can only reduce.
+- **Never places a stub.** A cap below 1 share re-raises rather than sending
+  a 0-quantity order.
+- **The Trade row records what was actually placed.** `OrderResult.size`
+  reports the clamped quantity and `OrderManager` writes it back to
+  `Trade.quantity` (it previously only updated status/exchange id). Ownership
+  scoping (`net_owned`), P&L and stop sizing all read that column, so a
+  stale leveraged quantity there would have mis-scoped every one of them.
+
+**Residual risk the user accepted.** (a) CNC has no broker auto-square-off
+net, so if the 15:15 square-off fails the position is held overnight as
+delivery — the exact exposure 030(4) avoided. (b) At 1x the notional is
+₹10k, where the ₹20 brokerage cap is 0.2%/leg ≈ 0.4% round-trip against a
+~0.62% mean trade — Decision 030(1)'s "real cliff". The fallback therefore
+trades a thin-to-negative edge in exchange for participating at all; it is
+expected to be rare, since MIS-ineligibility is uncommon among liquid names.

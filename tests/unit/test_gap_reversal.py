@@ -588,3 +588,49 @@ def test_margin_fitting_never_touches_crypto_sizes() -> None:
         margin_budget=Decimal("10000"), # INR
     )
     assert fitted == Decimal("3"), "crypto size must pass through untouched"
+
+
+# ---------------------------------------------------------------------------
+# 1x CNC fallback sizing (Decision 029, amended 2026-07-27)
+# ---------------------------------------------------------------------------
+def test_one_x_size_is_the_cash_affordable_quantity() -> None:
+    """The CNC fallback must buy only what the margin budget covers at 1x.
+
+    This is the guard against the fallback overspending: a quantity sized for
+    4x MIS needs 4x the cash as CNC. At ₹100/share a ₹10k slot is 100 shares,
+    NOT the 400 that 4x MIS would have bought.
+    """
+    r = _runner_with(_LevFeed(Decimal("4")))
+    assert r._one_x_size(
+        price=Decimal("100"), margin_budget=Decimal("10000")
+    ) == Decimal("100")
+
+
+def test_one_x_size_rounds_down_to_whole_shares() -> None:
+    r = _runner_with(_LevFeed(None))
+    assert r._one_x_size(
+        price=Decimal("330"), margin_budget=Decimal("10000")
+    ) == Decimal("30")  # 30.3 → 30
+
+
+def test_one_x_size_none_without_price() -> None:
+    r = _runner_with(_LevFeed(None))
+    assert r._one_x_size(price=None, margin_budget=Decimal("10000")) is None
+    assert r._one_x_size(
+        price=Decimal("0"), margin_budget=Decimal("10000")
+    ) is None
+
+
+def test_one_x_size_none_when_bucket_declares_no_fallback() -> None:
+    """A bucket without ``fallback_product`` never opts into the retry."""
+    r = object.__new__(BucketRunner)
+    r.bucket = load_bucket("swing-indian")   # MTF path, no CNC-1x fallback
+    r._data = _LevFeed(None)
+    assert r.bucket.config.fallback_product is None
+    assert r._one_x_size(
+        price=Decimal("100"), margin_budget=Decimal("10000")
+    ) is None
+
+
+def test_intraday_bucket_declares_cnc_fallback() -> None:
+    assert load_bucket("intraday-indian").config.fallback_product == "CNC"

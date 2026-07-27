@@ -32,6 +32,7 @@ the correlationId so a transport-error retry finds an order that already landed.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -244,18 +245,33 @@ class DhanClient(Broker):
             product=product_type,
             stop=str(request.stop_price) if request.stop_price is not None else None,
         )
+        effective = request
         try:
             result = self._request("POST", "/v2/orders", body)
         except DhanAPIError:
             # MTF-ineligible scrips reject; retry once as CNC (1× delivery).
-            # NOT applied to INTRADAY: falling an intraday trade back to CNC
-            # would silently turn a 5x same-day position into a 1x DELIVERY
-            # position — a different product, a different risk profile, and
-            # an overnight holding the strategy never asked for. An
-            # MIS-ineligible scrip must fail loudly instead.
             if product_type == "MTF" and self._mtf_fallback_cnc:
                 self._log.warning("mtf_rejected_retry_cnc", symbol=request.symbol)
                 body = self._order_body(request, security_id, exchange, "CNC")
+                result = self._request("POST", "/v2/orders", body)
+            # MIS-ineligible scrips reject too. Decision 029 originally failed
+            # loudly here; amended 2026-07-27 (user decision) to fall back to
+            # 1× CNC so the trade still happens. The size MUST be clamped to
+            # ``fallback_max_size``: ``size`` was sized for leveraged MIS, so
+            # re-sending it on a cash product would consume `leverage`× the
+            # budgeted margin. No cap supplied ⇒ no fallback, rejection stands.
+            elif product_type == "INTRADAY" and request.fallback_max_size is not None:
+                capped = min(request.size, request.fallback_max_size)
+                if capped < 1:
+                    raise
+                effective = replace(request, size=capped)
+                self._log.warning(
+                    "mis_rejected_retry_cnc_1x",
+                    symbol=request.symbol,
+                    requested_size=str(request.size),
+                    cnc_size=str(capped),
+                )
+                body = self._order_body(effective, security_id, exchange, "CNC")
                 result = self._request("POST", "/v2/orders", body)
             else:
                 raise
@@ -266,7 +282,8 @@ class DhanClient(Broker):
             client_order_id=request.client_order_id,
             symbol=request.symbol,
             side=request.side,
-            size=request.size,
+            # The size actually accepted — a CNC fallback may have clamped it.
+            size=effective.size,
             price=None,  # market order — fill price comes from get_fills
             status=_STATUS_MAP.get(str(result.get("orderStatus", "")).upper(), "pending"),
             raw={**result, "productType": product},

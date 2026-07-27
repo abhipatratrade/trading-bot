@@ -102,10 +102,20 @@ buckets:
     # OPERATIONAL: do not log into Dhan while the bot runs (single-session token).
     enabled: true
     account_ref: dhan
-    # MIS. Decision 029: NO CNC fallback here (unlike swing-indian's MTF path) —
-    # falling back would turn a 5x same-day trade into a 1x overnight DELIVERY
-    # position. An MIS-ineligible scrip must fail loudly instead.
+    # MIS.
     product: INTRADAY
+    # Decision 029 AMENDED 2026-07-27 (user decision). Originally an
+    # MIS-ineligible scrip failed loudly, because falling back would turn a
+    # leveraged same-day trade into a 1x overnight DELIVERY position. The user
+    # chose to trade it 1x CNC rather than skip it. Two guards make that safe:
+    #   * the retry is ALWAYS sized 1x (runner passes the cash-affordable qty),
+    #     so the slot never spends more than its Rs 10k margin budget;
+    #   * the 15:15 square-off closes CNC exactly as it closes MIS.
+    # Residual risk the user accepted: no broker auto-square-off net on CNC, so
+    # a failed square-off leaves an overnight delivery position; and at 1x the
+    # notional is Rs 10k, where the Rs 20 brokerage cap is ~0.4% round-trip
+    # against a ~0.62% mean trade.
+    fallback_product: CNC
     # Entry window differs from swing-indian's 09:45: the earliest reversal
     # candle closes at 09:30 (Decision 029).
     entry_start: "09:30"
