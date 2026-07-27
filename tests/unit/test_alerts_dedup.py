@@ -76,3 +76,60 @@ def test_recovery_noop_when_never_fired(monkeypatch) -> None:
 
     assert alerts.note_alert_recovery("never", "ok") is False
     assert sent == []
+
+
+# ── sustained-failure gate (Dhan token-eviction noise suppression) ──────
+
+
+def test_sustained_stays_quiet_inside_grace(monkeypatch) -> None:
+    alerts.reset_alert_dedup()
+    sent = _capture(monkeypatch)
+    clock = _fake_clock(monkeypatch)
+
+    # Repeated failures within the grace window must NOT page.
+    for _ in range(3):
+        assert alerts.note_sustained_failure("tok", "stuck", grace_seconds=180) is False
+        clock[0] += 50  # 0, 50, 100s — all under 180s
+    assert sent == []
+
+
+def test_sustained_pages_once_past_grace(monkeypatch) -> None:
+    alerts.reset_alert_dedup()
+    sent = _capture(monkeypatch)
+    clock = _fake_clock(monkeypatch)
+
+    assert alerts.note_sustained_failure("tok", "stuck", grace_seconds=180) is False
+    clock[0] += 200  # now past the grace threshold
+    assert alerts.note_sustained_failure("tok", "stuck", grace_seconds=180) is True
+    # Still failing → no repeat page.
+    clock[0] += 200
+    assert alerts.note_sustained_failure("tok", "stuck", grace_seconds=180) is False
+    assert sent == ["stuck"]
+
+
+def test_sustained_blip_recovers_silently(monkeypatch) -> None:
+    # A failure that self-heals inside the grace window pages nothing, and
+    # its recovery is silent — exactly the DH-906 < 2min case.
+    alerts.reset_alert_dedup()
+    sent = _capture(monkeypatch)
+    clock = _fake_clock(monkeypatch)
+
+    alerts.note_sustained_failure("tok", "stuck", grace_seconds=180)
+    clock[0] += 90  # cleared before grace elapsed
+    assert alerts.note_sustained_recovery("tok", "recovered") is False
+    assert sent == []
+
+
+def test_sustained_recovery_pages_once_if_it_alerted(monkeypatch) -> None:
+    alerts.reset_alert_dedup()
+    sent = _capture(monkeypatch)
+    clock = _fake_clock(monkeypatch)
+
+    alerts.note_sustained_failure("tok", "stuck", grace_seconds=180)
+    clock[0] += 200
+    alerts.note_sustained_failure("tok", "stuck", grace_seconds=180)  # pages
+    assert alerts.note_sustained_recovery("tok", "recovered") is True
+    assert sent == ["stuck", "recovered"]
+
+    # A fresh episode is timed from scratch (state was cleared).
+    assert alerts.note_sustained_failure("tok", "stuck", grace_seconds=180) is False

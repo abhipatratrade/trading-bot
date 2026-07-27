@@ -8,7 +8,11 @@ import pytest
 
 from src.brokers.base import OrderRequest, OrderType
 from src.brokers.dhan.auth import DhanTokenManager
-from src.brokers.dhan.client import DhanAPIError, DhanClient
+from src.brokers.dhan.client import (
+    DhanAPIError,
+    DhanClient,
+    is_invalid_token_error,
+)
 
 _UNIVERSE = {
     "SWIGGY": ("1001", "NSE_EQ"),
@@ -229,6 +233,16 @@ def test_non_json_403_raises_clean_error() -> None:
     )
     with pytest.raises(DhanAPIError, match="403"):
         client.get_balances()
+
+
+def test_is_invalid_token_error_classifies() -> None:
+    # DH-906 (any case) and the bare "Invalid Token" message → True.
+    assert is_invalid_token_error(DhanAPIError("DH-906", "Invalid Token")) is True
+    assert is_invalid_token_error(DhanAPIError("dh-906", "x")) is True
+    assert is_invalid_token_error(DhanAPIError("DH-XXX", "Invalid Token")) is True
+    # A different Dhan error, or a non-Dhan exception → False (pages normally).
+    assert is_invalid_token_error(DhanAPIError("DH-905", "Bad request")) is False
+    assert is_invalid_token_error(ValueError("boom")) is False
 
 
 def test_set_leverage_is_noop() -> None:

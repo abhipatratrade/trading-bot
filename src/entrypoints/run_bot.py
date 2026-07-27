@@ -21,8 +21,15 @@ from decimal import Decimal
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
-from src.brokers.dhan.client import DhanClient
-from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
+from src.brokers.dhan.client import DhanClient, is_invalid_token_error
+from src.core.alerts import (
+    note_alert_recovery,
+    note_sustained_failure,
+    note_sustained_recovery,
+    reset_alert_dedup,
+    send_alert,
+    send_alert_dedup,
+)
 from src.core.clock import RealClock
 from src.core.config import get_settings
 from src.core.db import session_scope
@@ -316,6 +323,31 @@ def main() -> None:
     # Idempotent: place missing stops, resize on adds, cancel orphans.
     # Runs at startup and once per tick (after the runners, so fresh
     # entries are protected within seconds).
+    # Dhan single-session tokens get evicted whenever a second session is
+    # created for the account (the user logs into the Dhan app/web, a linked
+    # platform, or the depth recorder). The bot self-heals once Dhan's "one
+    # token / 2 min" cooldown clears, so a DH-906 that lasts under ~2 min is
+    # noise. Page only if it PERSISTS past the cooldown (genuinely stuck creds
+    # / TOTP / IP block). Every non-token failure pages immediately as before.
+    _TOKEN_GRACE_SECONDS = 180.0
+
+    def _alert_safety_failure(key: str, exc: Exception, message: str) -> None:
+        if is_invalid_token_error(exc):
+            note_sustained_failure(
+                key,
+                f"{message} (Dhan token still invalid after "
+                f"{int(_TOKEN_GRACE_SECONDS // 60)}m — not self-healing)",
+                grace_seconds=_TOKEN_GRACE_SECONDS,
+            )
+        else:
+            send_alert_dedup(key, message)
+
+    def _note_safety_ok(key: str, message: str) -> None:
+        # Ping once if a sustained token episode had paged, then re-arm both
+        # channels so the next real failure alerts immediately.
+        note_sustained_recovery(key, message)
+        reset_alert_dedup(key)
+
     def _sweep_stops() -> None:
         for ref, ref_bucket_ids in accounts.items():
             pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
@@ -331,12 +363,17 @@ def main() -> None:
                     clock=clock,
                     shared_account=ref in dhan_accounts,
                 )
-            except Exception:
+                _note_safety_ok(
+                    f"stop_sweep_error:{ref}",
+                    f"[bot] stop-protection sweep recovered on account {ref}",
+                )
+            except Exception as exc:
                 _log.error(
                     "stop_protection_sweep_failed", account_ref=ref, exc_info=True
                 )
-                send_alert_dedup(
+                _alert_safety_failure(
                     f"stop_sweep_error:{ref}",
+                    exc,
                     f"[bot] stop-protection sweep ERROR on account {ref} — see logs",
                 )
 
@@ -403,12 +440,17 @@ def main() -> None:
                     clock=clock,
                     shared_account=ref in dhan_accounts,
                 )
-            except Exception:
+                _note_safety_ok(
+                    f"breaker_error:{ref}",
+                    f"[bot] breaker enforcement recovered on account {ref}",
+                )
+            except Exception as exc:
                 _log.error(
                     "breaker_enforcement_error", account_ref=ref, exc_info=True
                 )
-                send_alert_dedup(
+                _alert_safety_failure(
                     f"breaker_error:{ref}",
+                    exc,
                     f"[bot] breaker enforcement ERROR on account {ref} — see logs",
                 )
 

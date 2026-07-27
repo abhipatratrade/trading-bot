@@ -84,6 +84,19 @@ class DhanAPIError(Exception):
         super().__init__(f"Dhan API error [{code}]: {message}")
 
 
+def is_invalid_token_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a Dhan single-session token invalidation (DH-906).
+
+    Used by the caller to distinguish a self-healing token eviction (a second
+    Dhan session was created — e.g. the user logged into the app — which the
+    bot recovers from once Dhan's "one token / 2 min" cooldown clears) from a
+    genuine safety-path failure that must page immediately.
+    """
+    if isinstance(exc, DhanAPIError):
+        return exc.code.upper() == "DH-906" or "invalid token" in str(exc).lower()
+    return False
+
+
 def _is_invalid_token(resp: httpx.Response) -> bool:
     """True when a response means the access token was rejected.
 

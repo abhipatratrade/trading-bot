@@ -120,9 +120,51 @@ def note_alert_recovery(key: str, message: str) -> bool:
     return send_alert(message)
 
 
+# key -> (first_failure_monotonic, already_alerted). Unlike the dedup
+# channel (which pages on the FIRST hit), this stays silent until a failure
+# has *persisted* for ``grace_seconds`` — for conditions that routinely
+# self-heal within a known window (a Dhan single-session token eviction
+# clears once the "one token / 2 min" cooldown passes), so a transient blip
+# should not page at all. Only a genuinely stuck failure outlives the grace.
+_sustained_state: dict[str, tuple[float, bool]] = {}
+
+
+def note_sustained_failure(key: str, message: str, grace_seconds: float) -> bool:
+    """Record a failure for ``key``; page only once it has lasted ``grace_seconds``.
+
+    Call on every failed attempt while the condition persists. Returns True
+    only on the single call that crosses the grace threshold (one page per
+    episode); every earlier call within the grace window, and every call
+    after the page, is a silent no-op. Clear with ``note_sustained_recovery``
+    when the condition resolves so the next episode is timed afresh.
+    """
+    now = time.monotonic()
+    first_seen, alerted = _sustained_state.get(key, (now, False))
+    if alerted or now - first_seen < grace_seconds:
+        _sustained_state[key] = (first_seen, alerted)
+        return False
+    _sustained_state[key] = (first_seen, True)
+    return send_alert(message)
+
+
+def note_sustained_recovery(key: str, message: str) -> bool:
+    """Clear ``key``'s sustained-failure state.
+
+    Sends a one-off recovery ``message`` only if the episode had actually
+    paged (crossed the grace threshold); a blip that self-healed inside the
+    grace window clears silently. Cheap to call on every success.
+    """
+    state = _sustained_state.pop(key, None)
+    if state is not None and state[1]:
+        return send_alert(message)
+    return False
+
+
 def reset_alert_dedup(key: str | None = None) -> None:
-    """Clear one or all dedup counters. Test helper."""
+    """Clear one or all dedup + sustained counters. Test helper / success hook."""
     if key is None:
         _dedup_state.clear()
+        _sustained_state.clear()
     else:
         _dedup_state.pop(key, None)
+        _sustained_state.pop(key, None)
