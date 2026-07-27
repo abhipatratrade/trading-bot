@@ -351,14 +351,15 @@ def test_entry_window_is_per_bucket() -> None:
 # ---------------------------------------------------------------------------
 # Multi-scanner set (Decision 026 + 029)
 # ---------------------------------------------------------------------------
-def test_only_validated_set_is_active_broad_is_staged() -> None:
-    """Live scoping (2026-07-22): only the validated NIFTY-100 set trades.
+def test_both_sets_active_and_universes_disjoint() -> None:
+    """Broad set taken live (user decision 2026-07-27): both sets now trade.
 
-    The broad Midcap/Smallcap set stays OUT of strategy_master.csv until it
-    has its own backtest — re-enabling is a one-line CSV add. Its scanner +
-    allocator files remain in place, and the two universes must stay disjoint
-    so that add can't double-enter a name (dedup is per bucket+strategy+symbol
-    and the sets run as different strategies).
+    The validated NIFTY-100 set (``gap_down_reversal``, default scanner) and
+    the broad Midcap150+Smallcap100 set (``gap_down_reversal_broad``, ``broad``
+    scanner) are BOTH active in strategy_master.csv. The two universes MUST
+    stay disjoint: dedup is per (bucket, strategy, symbol) and the sets run as
+    different strategies, so an overlapping name could be entered twice (once
+    per set) within one tick. Disjoint universes are what prevent that.
     """
     b = load_bucket("intraday-indian")
     master = load_strategy_master(
@@ -366,9 +367,9 @@ def test_only_validated_set_is_active_broad_is_staged() -> None:
     )
     assert {(r.strategy_name, r.scanner) for r in master.rows} == {
         ("gap_down_reversal", ""),
-    }, "only the validated set may be active on real money"
-    # Broad config still present for a future re-enable, and still disjoint.
-    assert b.scanner_yaml_path_for("broad").is_file()
+        ("gap_down_reversal_broad", "broad"),
+    }, "both the validated and broad sets should be active"
+    # The two scanned universes must never overlap (double-entry guard).
     narrow = set(load_scanner_config(b.scanner_yaml_path_for("")).symbols)
     broad = set(load_scanner_config(b.scanner_yaml_path_for("broad")).symbols)
     assert not (narrow & broad), sorted(narrow & broad)[:5]
