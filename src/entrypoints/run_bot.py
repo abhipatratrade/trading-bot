@@ -56,6 +56,12 @@ from src.shared.bucket_runner import BucketRunner
 
 TICK_INTERVAL_SECONDS = 60
 
+# A Dhan single-session token eviction (a second session is created for the
+# account) self-heals once Dhan's "one token / 2 min" mint cooldown clears.
+# Safety-path DH-906s are silenced for this grace so a routine eviction never
+# pages; only a token stuck past it (bad creds/TOTP, IP block) alerts.
+_TOKEN_GRACE_SECONDS = 180.0
+
 _log = get_logger("entrypoints.run_bot")
 _shutdown = False
 _tick_count = 0
@@ -329,8 +335,6 @@ def main() -> None:
     # token / 2 min" cooldown clears, so a DH-906 that lasts under ~2 min is
     # noise. Page only if it PERSISTS past the cooldown (genuinely stuck creds
     # / TOTP / IP block). Every non-token failure pages immediately as before.
-    _TOKEN_GRACE_SECONDS = 180.0
-
     def _alert_safety_failure(key: str, exc: Exception, message: str) -> None:
         if is_invalid_token_error(exc):
             note_sustained_failure(
