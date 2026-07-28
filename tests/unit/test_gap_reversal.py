@@ -651,3 +651,68 @@ def test_swing_bucket_declares_cnc_fallback_so_mtf_retry_is_capped() -> None:
 
 def test_intraday_bucket_declares_cnc_fallback() -> None:
     assert load_bucket("intraday-indian").config.fallback_product == "CNC"
+
+
+# ---------------------------------------------------------------------------
+# Rejection reasons + metrics (Decision 033)
+#
+# Before this, ScannerSnapshot stored an empty metrics dict for every rejected
+# symbol, so "0/99 gapped down" looked identical whether the market was flat or
+# the intraday series was malformed for all 99 names. These assert the screen
+# now says which.
+# ---------------------------------------------------------------------------
+def test_a_rejected_gap_still_reports_the_gap_it_had() -> None:
+    """The point of the whole change: -2% is recorded, not discarded as {}."""
+    intraday, daily = _screen_inputs(-2.0)
+    out = gr.screen_with_reason("TEST", intraday, daily, _DAY, _cfg())
+    assert out.candidate is None
+    assert out.reason == gr.REASON_GAP_OUT_OF_BAND
+    assert round(float(out.metrics["gap_pct"]), 1) == -2.0
+    assert out.data_ok  # evaluated fine, simply did not qualify
+
+
+def test_a_passing_symbol_reports_no_reason_and_full_metrics() -> None:
+    intraday, daily = _screen_inputs(-5.0)
+    out = gr.screen_with_reason("TEST", intraday, daily, _DAY, _cfg())
+    assert out.candidate is not None
+    assert out.reason == gr.REASON_OK
+    assert {"prev_close", "open_0915", "gap_pct", "body_atr_ratio"} <= set(out.metrics)
+
+
+def test_a_malformed_open_is_flagged_as_a_data_problem() -> None:
+    """This is the case that used to hide behind '0/99 gapped down'."""
+    intraday, daily = _screen_inputs(-5.0)
+    trimmed = [b for b in intraday if gr.ist_time(b) != time(9, 15)]
+    out = gr.screen_with_reason("TEST", trimmed, daily, _DAY, _cfg())
+    assert out.candidate is None
+    assert not out.data_ok
+    assert out.reason.startswith("data_")
+
+
+def test_missing_daily_history_is_a_data_problem_not_a_no_signal() -> None:
+    intraday, _ = _screen_inputs(-5.0)
+    out = gr.screen_with_reason("TEST", intraday, [], _DAY, _cfg())
+    assert out.reason == gr.REASON_NO_DAILY_CTX
+    assert not out.data_ok
+
+
+def test_weak_body_and_corporate_action_are_evaluable_rejections() -> None:
+    """Both looked at real data and declined — not data faults."""
+    intraday, daily = _screen_inputs(-5.0, body_frac=0.001)
+    weak = gr.screen_with_reason("TEST", intraday, daily, _DAY, _cfg())
+    assert weak.reason == gr.REASON_WEAK_BODY
+    assert weak.data_ok
+
+    intraday2, _ = _screen_inputs(-5.0)
+    corp = gr.screen_with_reason("TEST", intraday2, _daily(30, 50.0), _DAY, _cfg())
+    assert corp.reason == gr.REASON_CORP_ACTION
+    assert corp.data_ok
+
+
+def test_gap_screen_wrapper_matches_screen_with_reason_exactly() -> None:
+    """The wrapper must not change behaviour for the 4 existing callers."""
+    for gap in (-5.0, -2.0, -13.0, +5.0):
+        intraday, daily = _screen_inputs(gap)
+        wrapped = gr.gap_screen("TEST", intraday, daily, _DAY, _cfg())
+        full = gr.screen_with_reason("TEST", intraday, daily, _DAY, _cfg())
+        assert wrapped == full.candidate, gap

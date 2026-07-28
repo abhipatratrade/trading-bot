@@ -166,6 +166,39 @@ def daily_context(
     )
 
 
+# Why a symbol did not become a candidate. Recorded on every ScannerSnapshot
+# row so a no-signal morning is auditable AFTER the fact (Decision 033).
+#
+# Without this the snapshot stored an empty ``metrics`` for every rejected
+# symbol, which made two very different states identical in the database: a
+# genuinely flat market, and a session where the intraday series was malformed
+# for all 99 names. Both render as "0/99 gapped down". The reasons below split
+# them — everything prefixed ``data_`` means we could not evaluate the symbol,
+# everything else means we evaluated it and it did not qualify.
+REASON_OK = ""
+REASON_FEW_BARS = "data_too_few_session_bars"
+REASON_BAD_OPEN = "data_open_bars_not_0915_0925"
+REASON_NO_PREV_CLOSE = "data_no_prev_session_close"
+REASON_NO_DAILY_CTX = "data_no_daily_context"
+REASON_GAP_OUT_OF_BAND = "gap_out_of_band"
+REASON_CORP_ACTION = "corporate_action_mismatch"
+REASON_WEAK_BODY = "first15_body_below_atr"
+
+
+@dataclass(frozen=True, slots=True)
+class GapScreenOutcome:
+    """The screen's verdict plus everything it managed to compute getting there."""
+
+    candidate: GapCandidate | None
+    reason: str
+    metrics: dict[str, str]
+
+    @property
+    def data_ok(self) -> bool:
+        """True when the symbol was actually evaluable, whatever the verdict."""
+        return not self.reason.startswith("data_")
+
+
 def gap_screen(
     symbol: str,
     intraday_bars: list[OHLCVBar],
@@ -178,32 +211,62 @@ def gap_screen(
     ``intraday_bars`` must be 5m bars spanning at least the prior session and
     today's open; ``daily_bars`` daily bars ending at or before the prior
     session. Returns a ``GapCandidate`` or None.
+
+    Thin wrapper over :func:`screen_with_reason` — the screening logic lives
+    there so callers that want the rejection reason can have it. This
+    signature is unchanged and is what the strategy, the parity script and the
+    dry-run tooling call.
     """
+    return screen_with_reason(symbol, intraday_bars, daily_bars, day, cfg).candidate
+
+
+def screen_with_reason(
+    symbol: str,
+    intraday_bars: list[OHLCVBar],
+    daily_bars: list[OHLCVBar],
+    day: date_type,
+    cfg: GapReversalConfig,
+) -> GapScreenOutcome:
+    """:func:`gap_screen` plus WHY, and the numbers computed along the way.
+
+    ``metrics`` accumulates as the screen proceeds, so a symbol rejected at the
+    gap test still reports the gap it actually had. That is what makes "the
+    deepest gap this morning was -0.8%" answerable from stored data instead of
+    requiring a re-fetch of a market that has since moved on.
+    """
+    metrics: dict[str, str] = {}
+
     today = session_bars(intraday_bars, day)
+    metrics["session_bars"] = str(len(today))
     if len(today) < _MIN_SESSION_BARS:
-        return None
+        return GapScreenOutcome(None, REASON_FEW_BARS, metrics)
     # A clean open is required: the engine refuses any day whose first bar
     # isn't 09:15, and needs 09:15/09:20/09:25 present to measure the body.
+    metrics["first_bar_ist"] = ist_time(today[0]).isoformat()
     if ist_time(today[0]) != _OPEN_BAR or ist_time(today[2]) != _THIRD_BAR:
-        return None
+        return GapScreenOutcome(None, REASON_BAD_OPEN, metrics)
 
     prev_close = prev_session_close(intraday_bars, day)
     if prev_close is None or prev_close <= 0:
-        return None
+        return GapScreenOutcome(None, REASON_NO_PREV_CLOSE, metrics)
+    metrics["prev_close"] = str(prev_close)
 
     ctx = daily_context(daily_bars, day, cfg.atr_period)
     if ctx is None:
-        return None
+        return GapScreenOutcome(None, REASON_NO_DAILY_CTX, metrics)
     atr_pct, prev_daily_close = ctx
     if atr_pct <= 0 or prev_daily_close <= 0:
-        return None
+        return GapScreenOutcome(None, REASON_NO_DAILY_CTX, metrics)
+    metrics["atr_pct"] = str(round(atr_pct, 6))
 
     open_0915 = Decimal(str(today[0].open))
     gap_pct = (open_0915 / prev_close - 1) * 100
+    metrics["open_0915"] = str(open_0915)
+    metrics["gap_pct"] = str(round(gap_pct, 4))
 
     # 1. gap DOWN, within the sane band (beyond gap_max it's a circuit/corp action)
     if not (-cfg.gap_max_pct <= gap_pct <= -cfg.gap_min_pct):
-        return None
+        return GapScreenOutcome(None, REASON_GAP_OUT_OF_BAND, metrics)
 
     # 2. corporate-action guard — the same gap, recomputed against the ADJUSTED
     #    daily prev-close, must agree within gap_mismatch_pct. LIVE both series
@@ -230,21 +293,28 @@ def gap_screen(
     #    auction, so it disagrees with the official daily close by ~1% on
     #    ordinary days — that guard rejected IOC and TORNTPHARM on pure noise.
     gap_1d_pct = (open_0915 / prev_daily_close - 1) * 100
+    metrics["gap_1d_pct"] = str(round(gap_1d_pct, 4))
     if abs(gap_pct - gap_1d_pct) > cfg.gap_mismatch_pct:
-        return None
+        return GapScreenOutcome(None, REASON_CORP_ACTION, metrics)
 
     # 3. first-15m body vs daily ATR, both as fractions of their own scale
     close_0930 = Decimal(str(today[2].close))
     body_frac = abs(close_0930 - open_0915) / prev_close
+    body_atr_ratio = body_frac / atr_pct
+    metrics["body_atr_ratio"] = str(round(body_atr_ratio, 4))
     if body_frac < cfg.first15_body_atr_frac * atr_pct:
-        return None
+        return GapScreenOutcome(None, REASON_WEAK_BODY, metrics)
 
-    return GapCandidate(
-        symbol=symbol,
-        prev_close=prev_close,
-        open_0915=open_0915,
-        gap_pct=gap_pct,
-        body_atr_ratio=body_frac / atr_pct,
+    return GapScreenOutcome(
+        GapCandidate(
+            symbol=symbol,
+            prev_close=prev_close,
+            open_0915=open_0915,
+            gap_pct=gap_pct,
+            body_atr_ratio=body_atr_ratio,
+        ),
+        REASON_OK,
+        metrics,
     )
 
 

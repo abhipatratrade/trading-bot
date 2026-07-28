@@ -721,8 +721,9 @@ def run_gap_reversal_scan(
     from src.shared.scanner.gap_reversal import (
         GapCandidate,
         GapReversalConfig,
-        gap_screen,
+        GapScreenOutcome,
         rank_top,
+        screen_with_reason,
     )
 
     gcfg = GapReversalConfig.from_scanner_config(config)
@@ -775,7 +776,7 @@ def run_gap_reversal_scan(
         symbols = safe
 
     candidates: list[GapCandidate] = []
-    evaluated: list[tuple[str, GapCandidate | None]] = []
+    evaluated: list[tuple[str, GapScreenOutcome]] = []
     for symbol in symbols:
         try:
             intraday = data.get_ohlcv(symbol, "5m")
@@ -784,10 +785,23 @@ def run_gap_reversal_scan(
             # A single unfetchable name must not sink the whole morning cut.
             _log.warning("gap_scan_fetch_failed", symbol=symbol, exc_info=True)
             continue
-        cand = gap_screen(symbol, intraday, daily, scan_date, gcfg)
-        evaluated.append((symbol, cand))
-        if cand is not None:
-            candidates.append(cand)
+        outcome = screen_with_reason(symbol, intraday, daily, scan_date, gcfg)
+        evaluated.append((symbol, outcome))
+        if outcome.candidate is not None:
+            candidates.append(outcome.candidate)
+
+    # Decision 033: a symbol we could not evaluate is a DATA problem and must
+    # never be mistaken for "did not qualify". Surface the count up front —
+    # 99/99 unevaluable and 99/99 flat both produce zero candidates.
+    unevaluable = [sym for sym, o in evaluated if not o.data_ok]
+    if unevaluable:
+        _log.warning(
+            "gap_scan_symbols_unevaluable",
+            bucket_id=bucket_id,
+            count=len(unevaluable),
+            of=len(evaluated),
+            symbols=sorted(unevaluable)[:20],
+        )
 
     chosen = rank_top(candidates, gcfg.universe_size)
     chosen_symbols = [c.symbol for c in chosen]
@@ -806,23 +820,17 @@ def run_gap_reversal_scan(
                 DailyUniverse.strategy_id == bucket_id,
             )
         )
-        for symbol, cand in evaluated:
+        for symbol, outcome in evaluated:
+            cand = outcome.candidate
             session.add(
                 ScannerSnapshot(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=symbol,
-                    metrics=(
-                        {
-                            "prev_close": str(cand.prev_close),
-                            "open_0915": str(cand.open_0915),
-                            "gap_pct": str(round(cand.gap_pct, 4)),
-                            "body_atr_ratio": str(round(cand.body_atr_ratio, 4)),
-                        }
-                        if cand is not None
-                        else {}
-                    ),
-                    filter_results={},
+                    # Whatever the screen computed before it stopped — so a
+                    # rejected symbol still reports the gap it actually had.
+                    metrics=outcome.metrics,
+                    filter_results={"reason": outcome.reason} if outcome.reason else {},
                     rank_score=abs(cand.gap_pct) if cand is not None else None,
                     passed=cand is not None,
                 )
