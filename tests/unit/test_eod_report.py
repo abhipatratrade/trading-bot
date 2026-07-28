@@ -102,9 +102,22 @@ class _Position:
         self.broker = BrokerName.DHAN
 
 
+class _Scan:
+    def __init__(
+        self,
+        message: str = "gap-reversal scan: 0/99 gapped down, top-5",
+        strategy_id: str = "intraday-indian",
+    ) -> None:
+        self.event_type = AuditEventType.SCANNER_RUN
+        self.strategy_id = strategy_id
+        self.message = message
+        self.ts = datetime(2026, 7, 28, 9, 31, tzinfo=IST)
+
+
 class _Audit:
     def __init__(self, message: str = "Kill switch ENGAGED") -> None:
         self.event_type = AuditEventType.KILL_SWITCH_FLIPPED
+        self.strategy_id = None
         self.message = message
         # `ts`, not `created_at` — AuditLog is the one model that does not
         # inherit TimestampMixin. test_fakes_match_the_real_orm_columns keeps
@@ -119,6 +132,7 @@ class _Audit:
         (_Skip(), SizingSnapshot),
         (_Position(), Position),
         (_Audit(), AuditLog),
+        (_Scan(), AuditLog),
     ],
 )
 def test_fakes_match_the_real_orm_columns(fake: object, model: type) -> None:
@@ -145,6 +159,7 @@ def _report(**kw) -> object:
         events=kw.get("events", []),
         owned=kw.get("owned"),
         edge=kw.get("edge"),
+        scans=kw.get("scans"),
     )
 
 
@@ -296,9 +311,16 @@ def test_a_day_with_only_an_event_is_not_quiet() -> None:
 
 
 def test_quiet_digest_says_so_plainly() -> None:
-    text = render_digest(_report())
-    assert "Quiet day" in text
+    text = render_digest(_report(scans=[_Scan()]))
+    assert "quiet day" in text
     assert "Realized" not in text
+
+
+def test_quiet_label_is_withheld_when_no_scan_ran() -> None:
+    """"Quiet day" is a claim about the bot working. Don't make it unevidenced."""
+    text = render_digest(_report())
+    assert "quiet day" not in text
+    assert "NO SCANNER PASS RECORDED" in text
 
 
 def test_quiet_markdown_explains_rather_than_looking_broken() -> None:
@@ -492,6 +514,52 @@ def test_both_live_buckets_declare_a_backtest_baseline() -> None:
     ):
         assert bucket_id in baselines, bucket_id
         assert baselines[bucket_id].profit_factor == expected_pf
+
+
+# ---------------------------------------------------------------------------
+# Scanner passes — telling "looked and found nothing" from "never looked"
+# ---------------------------------------------------------------------------
+def test_scans_do_not_make_a_day_non_quiet() -> None:
+    """Scanners running and finding nothing IS a quiet day, not a busy one."""
+    report = _report(scans=[_Scan()])
+    assert report.quiet
+
+
+def test_a_quiet_day_still_shows_what_the_scanners_saw() -> None:
+    """The whole point: proof the bot looked, on the day it did nothing.
+
+    Without this, a genuinely quiet session and a bot that never woke up
+    render as the same report.
+    """
+    text = render_markdown(_report(scans=[_Scan(), _Scan(strategy_id="swing-indian")]))
+    assert "## What the scanners saw" in text
+    assert "0/99 gapped down" in text
+    assert "swing-indian" in text
+
+
+def test_digest_reports_the_scan_count_on_a_quiet_day() -> None:
+    text = render_digest(_report(scans=[_Scan(), _Scan()]))
+    assert "Scanners ran 2 pass(es)" in text
+
+
+def test_digest_shouts_when_no_scanner_pass_was_recorded() -> None:
+    """Zero scans on a trading day means the bot didn't look — say so loudly."""
+    text = render_digest(_report())
+    assert "NO SCANNER PASS RECORDED" in text
+
+
+def test_scan_block_is_omitted_when_there_are_no_scans() -> None:
+    assert "## What the scanners saw" not in render_markdown(_report())
+
+
+def test_scans_render_alongside_a_busy_day() -> None:
+    text = render_markdown(_report(trades=[_Trade()], scans=[_Scan()]))
+    assert "## What the scanners saw" in text
+    assert "### Entries" in text
+
+
+def test_payload_counts_scans() -> None:
+    assert payload_of(_report(scans=[_Scan(), _Scan()]))["scans"] == 2
 
 
 # ---------------------------------------------------------------------------

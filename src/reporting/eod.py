@@ -150,11 +150,24 @@ class EdgeStats:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanLine:
+    """One scanner pass — proof the bot looked, and what it saw."""
+
+    at: datetime
+    strategy_id: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
 class Report:
     session_date: date_
     buckets: list[BucketSection]
     events: list[str]
     quiet: bool  # nothing traded, nothing tripped, nothing carried
+    # Every SCANNER_RUN of the session. Without these a no-signal day renders
+    # identically to a day the bot never woke up — and "the scanners ran and
+    # found nothing" is the single most common true state of this system.
+    scans: list[ScanLine] = field(default_factory=list)
     # Open positions on a shared account that the bot does NOT own — the
     # user's own trading (Decision 027). Reported so the numbers above are
     # visibly complete, never counted as the bot's.
@@ -340,6 +353,18 @@ def build_edge(
     )
 
 
+def build_scans(rows: list[AuditLog]) -> list[ScanLine]:
+    """SCANNER_RUN rows → display lines, oldest first. PURE."""
+    return [
+        ScanLine(
+            at=r.ts,
+            strategy_id=r.strategy_id or "—",
+            message=r.message,
+        )
+        for r in rows
+    ]
+
+
 def build_events(rows: list[AuditLog]) -> list[str]:
     """One line per thing that tripped today. PURE.
 
@@ -362,10 +387,14 @@ def build_report(
     events: list[AuditLog],
     owned: dict[str, Decimal] | None = None,
     edge: list[EdgeStats] | None = None,
+    scans: list[AuditLog] | None = None,
 ) -> Report:
     bot_positions, foreign_positions = split_positions(positions, owned)
     sections = build_sections(trades, skips, bot_positions)
     event_lines = build_events(events)
+    # Scans deliberately do NOT clear `quiet` — a day the scanners ran and
+    # found nothing IS a quiet day. They are evidence for that verdict, not
+    # a contradiction of it.
     quiet = not event_lines and not any(
         s.traded or s.carried or s.skips for s in sections
     )
@@ -380,6 +409,7 @@ def build_report(
             if p.side != PositionSide.FLAT and p.quantity > 0
         ],
         edge=edge or [],
+        scans=build_scans(scans or []),
     )
 
 
@@ -404,10 +434,22 @@ def render_digest(report: Report) -> str:
         if report.foreign
         else None
     )
+    scan_note = (
+        f"Scanners ran {len(report.scans)} pass(es); nothing qualified."
+        if report.scans
+        else "NO SCANNER PASS RECORDED — check the bot is alive."
+    )
     if report.quiet:
-        # "Quiet" is a statement about the BOT. Anything on the account that
-        # is not ours still gets named, so silence never reads as "flat".
-        lines = [head, "No trades, no signals, nothing tripped. Quiet day."]
+        # "Quiet" is a statement about the BOT, and it is only earned when the
+        # scanners actually ran: a genuinely quiet day and a dead bot both
+        # trade nothing. With no scan on record we report the facts and drop
+        # the reassuring label rather than assert something unevidenced.
+        verdict = (
+            "No trades, nothing tripped — quiet day."
+            if report.scans
+            else "No trades, nothing tripped."
+        )
+        lines = [head, verdict, scan_note]
         if foreign_note:
             lines.append(foreign_note)
         return "\n".join(lines)
@@ -434,6 +476,7 @@ def render_digest(report: Report) -> str:
         out.append(
             f"OVERNIGHT: {', '.join(f'{c.symbol} x{c.quantity}' for c in carried)}"
         )
+    out.append(scan_note)
     if foreign_note:
         out.append(foreign_note)
     if report.events:
@@ -556,6 +599,33 @@ def _edge_block(report: Report) -> list[str]:
     return out
 
 
+def _scan_block(report: Report) -> list[str]:
+    """What the scanners looked at. Rendered on quiet days above all.
+
+    A report that says only "quiet day" cannot be distinguished from a report
+    written while the bot was dead. This section is the difference — it shows
+    the passes that ran, what each evaluated, and that each found nothing.
+    """
+    if not report.scans:
+        return []
+    out = [
+        "## What the scanners saw",
+        "",
+        f"{len(report.scans)} scanner pass(es) completed. Each line is the "
+        f"universe the bot actually evaluated and what came back — the "
+        f"evidence behind a no-signal day.",
+        "",
+        "| time | strategy | result |",
+        "|---|---|---|",
+    ]
+    for s in report.scans:
+        out.append(
+            f"| {s.at.astimezone(IST):%H:%M} | {s.strategy_id} | {s.message} |"
+        )
+    out.append("")
+    return out
+
+
 def _foreign_block(report: Report) -> list[str]:
     """The "not the bot's" section. Rendered on quiet days too — a day the bot
     sat out is still a day the account held something."""
@@ -603,8 +673,11 @@ def render_markdown(report: Report) -> str:
             "",
         ]
         # The rolling edge still matters on a day the bot sat out — it is a
-        # 90-day view, not a today view.
-        return "\n".join(out + _edge_block(report) + _foreign_block(report))
+        # 90-day view, not a today view. The scan block matters MORE here than
+        # anywhere else: on a quiet day it is the only proof the bot looked.
+        return "\n".join(
+            out + _scan_block(report) + _edge_block(report) + _foreign_block(report)
+        )
 
     out += [
         "## Summary",
@@ -683,6 +756,7 @@ def render_markdown(report: Report) -> str:
                 )
             out.append("")
 
+    out += _scan_block(report)
     out += _edge_block(report)
     out += _foreign_block(report)
 
@@ -814,6 +888,19 @@ def gather(session_date: date_) -> Report:
                 .order_by(AuditLog.ts)
             ).scalars()
         )
+        # Kept separate from `events`: a scanner pass is not something that
+        # went wrong, it is the record of routine work being done.
+        scans = list(
+            session.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.ts >= start,
+                    AuditLog.ts < end,
+                    AuditLog.event_type == AuditEventType.SCANNER_RUN,
+                )
+                .order_by(AuditLog.ts)
+            ).scalars()
+        )
         # Ownership for the SHARED Dhan account (Decision 027). Derived from
         # the bot's own Trade rows, never from account state — the same source
         # the stop sweep and reconciler use, so the report cannot disagree
@@ -860,6 +947,7 @@ def gather(session_date: date_) -> Report:
             events=events,
             owned=owned,
             edge=edge,
+            scans=scans,
         )
 
 
@@ -874,6 +962,7 @@ def payload_of(report: Report) -> dict:
         "fees": str(report.fees),
         "quiet": report.quiet,
         "events": len(report.events),
+        "scans": len(report.scans),
         "buckets": {
             s.bucket_id: {
                 "entries": len(s.entries),
