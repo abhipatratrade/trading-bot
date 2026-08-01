@@ -372,11 +372,14 @@ rupee P&L.
       warm-up misses). 13 new/strengthened unit tests; full suite **558 green**
 - [ ] **UNEXERCISED — watch the first trade**: an MTF entry, a mean-touch exit, and the
       ATR-distance resting stop have never run against the real venue
-- [ ] **USER DECISION before re-enabling** — the engine's book holds SUZLON open from
-      28-Jul @ ₹48.10 (Friday close 48.05 vs EMA20 48.106, ~flat, stop never threatened).
-      A fixed bot starts FLAT and will not hold it. Handoff recommends (a) start flat and
-      take the next fresh cross — adopting mid-flight breaks entry parity for no P&L, and
-      a corrected bot would mean-touch out of it almost immediately anyway
+- [x] **USER DECISION 2026-08-01 — option (a), START FLAT.** The engine's book holds
+      SUZLON open from 28-Jul @ ₹48.10 (Fri close 48.05 vs EMA20 48.106, ~flat, stop
+      never threatened). The bot never opened it, so starting flat needs no code and no
+      intervention: it simply takes the next fresh cross. Adopting the position
+      mid-flight was REJECTED — it is not what the backtest did, so it breaks entry
+      parity, for no P&L; and sitting 0.12% under its EMA20 a corrected bot would
+      mean-touch out of it almost immediately anyway. Live book and backtest book are
+      therefore knowingly one trade apart until SUZLON closes on the engine's side
 - [ ] Confirm `carry_interest` lands on the first closed round-trip (`Trade.extra`)
 - [ ] Re-derive the 94-name universe after each Midcap-150 rebalance
 - [ ] Expect return BELOW the backtest: 5 concurrent slots, not 20
