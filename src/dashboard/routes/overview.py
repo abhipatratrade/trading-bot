@@ -18,7 +18,14 @@ def home(request: Request):
         positions = list(
             session.execute(
                 select(Position)
-                .where(Position.side != PositionSide.FLAT)
+                .where(
+                    Position.side != PositionSide.FLAT,
+                    # Decision 027/033: only the bot's own positions. On the
+                    # shared Dhan account an orphan-imported row (bucket_id
+                    # NULL, as rows 244/245 were) would otherwise render here
+                    # as if the bot opened it.
+                    Position.bucket_id.is_not(None),
+                )
                 .order_by(Position.updated_at.desc())
             ).scalars()
         )
@@ -61,7 +68,14 @@ def positions_partial(request: Request):
         positions = list(
             session.execute(
                 select(Position)
-                .where(Position.side != PositionSide.FLAT)
+                .where(
+                    Position.side != PositionSide.FLAT,
+                    # Decision 027/033: only the bot's own positions. On the
+                    # shared Dhan account an orphan-imported row (bucket_id
+                    # NULL, as rows 244/245 were) would otherwise render here
+                    # as if the bot opened it.
+                    Position.bucket_id.is_not(None),
+                )
                 .order_by(Position.updated_at.desc())
             ).scalars()
         )

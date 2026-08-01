@@ -213,11 +213,18 @@ class Settings(BaseSettings):
     order_reject_max: int = 3
     # A bucket is stalled once it has missed this many of its own cadences.
     bucket_stale_multiple: float = 3.0
-    # OBSERVE-ONLY by default (Decision 033). Checks run and page, but never
-    # touch the kill switch, so a brand-new invariant cannot halt a live bucket
-    # on its first false positive. Flip to true once the alerts have agreed
-    # with reality for a few sessions.
-    session_invariants_enforcing: bool = False
+    # ENFORCING since 2026-08-01 (Decision 033). Shipped observe-only on
+    # 2026-07-28 and ran four sessions (28-31 Jul) with no false positive.
+    #
+    # Read that evidence honestly: those sessions carried ZERO positions, so
+    # squareoff, stop_coverage and notional_ceiling were vacuous, and with zero
+    # orders so was reject_rate. Only bucket_liveness was genuinely exercised
+    # (clean), and foreign_positions fired as designed. Four of the six checks
+    # will therefore act for the first time on the first day the bot holds
+    # something. What bounds that risk is not the observe period — it is that
+    # a trip HALTS only (Decision 024: exits, stops and breakers keep running)
+    # and is reversible from the dashboard.
+    session_invariants_enforcing: bool = True
 
     # -- Retention (nightly prune job on the Railway scheduler) --------------
     # audit_log keeps 3× longer — it's the forensic record (House Rule #8).

@@ -455,6 +455,57 @@ def test_enforce_does_not_re_engage_an_already_killed_bucket(monkeypatch) -> Non
     assert rec.engaged == []
 
 
+def test_a_steady_state_violation_pages_once_not_every_tick(monkeypatch) -> None:
+    """The 2026-07-28 bug: foreign_positions paged ~72x a day.
+
+    send_alert_dedup's window re-arms hourly, which is right for a recurring
+    transient and wrong for a condition that is simply always true. Noise on
+    its own — and it buries the alerts this system exists to deliver.
+    """
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    res = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="not the bot's", detail={"foreign": ["NIFTY24000CE"]},
+    )
+    for _ in range(50):
+        enforce_session_invariants([res])
+    assert len(rec.alerts) == 1
+
+
+def test_a_changed_violation_pages_again(monkeypatch) -> None:
+    """Silence is for an UNCHANGED condition — new content is news."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    first = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"foreign": ["A"]},
+    )
+    second = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"foreign": ["A", "B"]},
+    )
+    enforce_session_invariants([first])
+    enforce_session_invariants([first])
+    enforce_session_invariants([second])
+    assert len(rec.alerts) == 2
+
+
+def test_clearing_then_recurring_pages_again(monkeypatch) -> None:
+    """Suppression must not outlive the condition that caused it."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    bad = si.InvariantResult(
+        "stop_coverage", "swing-indian", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"uncovered": ["TCS"]},
+    )
+    good = si.InvariantResult("stop_coverage", "swing-indian", ok=True)
+    enforce_session_invariants([bad])
+    enforce_session_invariants([good])
+    enforce_session_invariants([bad])
+    assert len(rec.alerts) == 2
+
+
 def test_observe_only_pages_but_never_halts(monkeypatch) -> None:
     """Default mode: a brand-new invariant cannot halt a live bucket."""
     rec = _Recorder()
@@ -500,3 +551,37 @@ def test_observe_only_still_tracks_the_sustain_streak(monkeypatch) -> None:
     enforce_session_invariants([res], enforcing=False)
     assert not sent[0].startswith("[OBSERVE-ONLY")  # tick 1: below the streak
     assert sent[1].startswith("[OBSERVE-ONLY")  # tick 2: would have halted
+
+
+def test_a_volatile_detail_does_not_defeat_suppression(monkeypatch) -> None:
+    """bucket_liveness carries an age that grows every tick.
+
+    Keyed on detail alone, a stalled bucket would page forever — the exact
+    spam this suppression exists to stop.
+    """
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    now = _ist("2026-07-28", "11:00")
+    for extra in range(0, 500, 60):
+        res = check_bucket_liveness(
+            bucket=INTRADAY,
+            beat_at=now - timedelta(seconds=600 + extra),
+            now=now,
+            stale_multiple=3.0,
+        )
+        enforce_session_invariants([res])
+    assert len(rec.alerts) == 1
+
+
+def test_escalation_to_would_halt_still_pages(monkeypatch) -> None:
+    """Suppression must not swallow the moment a warning becomes a halt."""
+    rec = _Recorder()
+    sent: list[str] = []
+    rec.install(monkeypatch)
+    monkeypatch.setattr(si, "send_alert_dedup", lambda key, msg: sent.append(msg))
+    res = _violation("stop_coverage", Severity.HALT, sustain=2)
+    enforce_session_invariants([res], enforcing=False)
+    enforce_session_invariants([res], enforcing=False)
+    assert len(sent) == 2
+    assert not sent[0].startswith("[OBSERVE-ONLY")
+    assert sent[1].startswith("[OBSERVE-ONLY")

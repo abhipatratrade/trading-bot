@@ -36,6 +36,7 @@ never acted on.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from decimal import Decimal
@@ -106,6 +107,12 @@ class InvariantResult:
     # runs every tick, so a single miss can be a race against a just-placed
     # order; a real failure persists.
     sustain_ticks: int = 1
+    # What counts as "the same alert" for suppression. None derives it from
+    # ``detail``, which is right when detail is an identity (which symbols are
+    # uncovered). Set it explicitly when detail carries a value that moves on
+    # its own — an age in seconds ticks every second, and re-alerting on that
+    # would defeat the suppression entirely.
+    alert_signature: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +330,9 @@ def check_bucket_liveness(
             f"open. The process is alive — this bucket is not."
         ),
         detail={"age_seconds": age, "threshold_seconds": threshold},
+        # age_seconds grows every tick; without a fixed signature a stalled
+        # bucket would page forever instead of once.
+        alert_signature="stalled",
     )
 
 
@@ -518,13 +528,19 @@ def run_session_invariants(
 # passes, so a transient race never accumulates toward a halt.
 _streaks: dict[str, int] = {}
 
+# Digest of the detail last ALERTED per key, so a steady-state violation pages
+# once rather than every hour. Cleared when the check passes.
+_last_alerted: dict[str, str] = {}
+
 
 def reset_streaks(key: str | None = None) -> None:
     """Clear violation streaks — one key, or all of them (tests, restart)."""
     if key is None:
         _streaks.clear()
+        _last_alerted.clear()
     else:
         _streaks.pop(key, None)
+        _last_alerted.pop(key, None)
 
 
 def enforce_session_invariants(
@@ -554,6 +570,7 @@ def enforce_session_invariants(
         key = f"invariant:{res.name}:{res.bucket_id}"
         if res.ok:
             _streaks.pop(key, None)
+            _last_alerted.pop(key, None)
             note_alert_recovery(key, f"[{res.bucket_id}] {res.name} OK again")
             continue
 
@@ -575,7 +592,28 @@ def enforce_session_invariants(
             if would_halt and not enforcing
             else ""
         )
-        send_alert_dedup(key, f"{prefix}[{res.bucket_id}] {res.message}")
+        # Alert on the CONTENT changing, not on the condition merely persisting.
+        #
+        # send_alert_dedup's window re-arms hourly, which is right for a
+        # transient error that keeps recurring and wrong for a steady state.
+        # foreign_positions is permanently violated whenever the user holds
+        # anything on the shared Dhan account, so from 2026-07-28 it paged 3x an
+        # hour — ~72 messages a day about positions the bot is correctly
+        # ignoring. That is noise on its own, and worse, it buries the alerts
+        # this system exists to deliver.
+        #
+        # Keying on a digest of the detail means: page when the condition
+        # appears, page again only when what it says changes, otherwise stay
+        # quiet until it clears (which re-arms via note_alert_recovery above).
+        # ``would_halt`` is part of the signature: escalating from "seen once"
+        # to "would have HALTED" is new news even when the content is identical.
+        signature = res.alert_signature
+        if signature is None:
+            signature = json.dumps(res.detail, sort_keys=True, default=str)
+        digest = f"{would_halt}|{signature}"
+        if _last_alerted.get(key) != digest:
+            _last_alerted[key] = digest
+            send_alert_dedup(key, f"{prefix}[{res.bucket_id}] {res.message}")
 
         if not would_halt or not enforcing:
             continue
