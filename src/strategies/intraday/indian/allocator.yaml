@@ -64,7 +64,25 @@ stats: {}
 # trade), so execution slippage eats a larger share of it here than anywhere
 # else. A slippage figure that looks small in bps can still be a big fraction
 # of this strategy's edge.
+# ALL FOUR NUMBERS COME FROM THE **HOLDOUT** FOLD — one fold, not a mix.
+# scanner.yaml is explicit: "Plan around the holdout grade — NOT the full-period
+# +36.6%." An earlier version of this block took profit_factor from the holdout
+# but trades/mean from the full run, which flattered the comparison in one
+# direction and inflated the sample size in the other.
+#
+# Recomputed 2026-08-01 directly from the backtest_ref JSON
+# (Backtesting Engine/results/scanners/
+#  nifty100_gap_reversal_opt_opt_holdout_20260719_030225.json) — note the real
+# path has no strategies/optimized/... prefix, unlike the backtest_ref above:
+#   trades 35 · PF 1.684 · win 51.43% · mean unlevered pnl/(entry×qty) 0.003803
+# The full-period fold, for contrast, is PF 1.99 / win 56.58% / 76 trades — do
+# not quietly substitute it because the live figures look bad against holdout.
 backtest_baseline:
-  profit_factor: 1.68
-  mean_trade_return: 0.006238   # per trade (one session), unlevered, net
-  trades: 76
+  profit_factor: 1.684
+  win_rate: 0.5143
+  mean_trade_return: 0.003803   # per trade (one session), unlevered, net
+  trades: 35
+  note: >-
+    HOLDOUT fold (2024-07→2025-06, includes the Apr-2025 crash). The
+    allocator's mu/sigma above are pooled over the FULL 76 trades and are a
+    different statistic — sizing input, not a performance baseline.

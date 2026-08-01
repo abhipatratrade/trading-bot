@@ -77,11 +77,33 @@ stats: {}
 # win_rate is deliberately BLANK: it is not recorded anywhere in this repo, and
 # a guessed baseline is worse than no baseline (the report omits what it is not
 # given). Fill it from the backtest_ref JSON above when you have it to hand.
+# ALL FOUR NUMBERS COME FROM THE **TRAIN** FOLD — one fold, not a mix.
+# The 2.31 ambiguity is resolved: TRADING_BOT_HANDOFF.md §3 carries a three-fold
+# table, and 2.31 is the TRAIN fold (2025-07→2026-07, calm tape, 82 trades).
+# buckets.yaml calls it "holdout-validated ... (train fold)", which is loose
+# wording, not a second number — there is no saved run with PF 2.31 anywhere
+# else, and the train fold reproduces it to three decimals.
+#
+# Train is also the RIGHT baseline here, and deliberately not the highest one:
+#   train   82 trades  PF 2.313  win 73.2%  +24.7%   <- the planning grade
+#   holdout 132 trades PF 3.04   win ~75%   +57.1%   crash-heavy, flattering
+#   full    214 trades PF 2.75   win 73.8%  +81.8%
+# The handoff is explicit: "Plan around the TRAIN grade." Unusually, the holdout
+# is HIGHER because mean-reversion feasts on the Apr-2025 crash — so treating
+# corrections as upside rather than the base case means benchmarking against
+# the calm-tape fold.
+#
+# Recomputed 2026-08-01 from the backtest_ref JSON's own trade list (filtered to
+# the train window; the file itself is at Backtesting Engine/results/scanners/,
+# without the strategies/optimized/... prefix written above):
+#   trades 82 · PF 2.313 · win 73.17% · mean unlevered pnl/notional 0.015094
 backtest_baseline:
-  profit_factor: 2.31
-  mean_trade_return: 0.019981   # 4.2760 / 214, unlevered, net of costs
-  trades: 214
+  profit_factor: 2.313
+  win_rate: 0.7317
+  mean_trade_return: 0.015094   # per trade, unlevered, net of costs
+  trades: 82
   note: >-
-    PF from the Decision 032 buckets.yaml comment, whose "(train fold)"
-    parenthetical is ambiguous about which fold produced 2.31. Re-read the
-    backtest_ref JSON and correct if it disagrees.
+    TRAIN fold (2025-07→2026-07, calm tape) — the grade the handoff says to
+    plan around, and the most conservative of the three. The allocator's
+    mu/sigma above are pooled per-DAY over all 214 full-window trades: a
+    different statistic for a different purpose (sizing, not benchmarking).

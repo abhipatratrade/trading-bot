@@ -506,14 +506,34 @@ def test_payload_carries_edge_and_slippage() -> None:
 # The real allocator.yaml files must actually carry baselines
 # ---------------------------------------------------------------------------
 def test_both_live_buckets_declare_a_backtest_baseline() -> None:
-    """A baseline that fails to load makes the comparison silently blank."""
+    """A baseline that fails to load makes the comparison silently blank.
+
+    Values are the fold each strategy's own docs nominate as the planning
+    grade — intraday's HOLDOUT, swing's TRAIN — recomputed from the
+    backtest_ref JSONs on 2026-08-01.
+    """
     baselines = load_baselines()
     for bucket_id, expected_pf in (
-        ("swing-indian", Decimal("2.31")),
-        ("intraday-indian", Decimal("1.68")),
+        ("swing-indian", Decimal("2.313")),
+        ("intraday-indian", Decimal("1.684")),
     ):
         assert bucket_id in baselines, bucket_id
         assert baselines[bucket_id].profit_factor == expected_pf
+
+
+def test_every_baseline_is_complete_and_internally_consistent() -> None:
+    """Guards the bug this replaced: PF from one fold, trades from another.
+
+    A baseline mixing folds silently benchmarks live results against a
+    composite that never existed. Completeness is the only cheap proxy — a
+    fold supplies all four numbers or it wasn't really read.
+    """
+    for bucket_id, b in load_baselines().items():
+        assert b.profit_factor is not None, bucket_id
+        assert b.win_rate is not None, bucket_id
+        assert b.mean_trade_return is not None, bucket_id
+        assert b.trades, bucket_id
+        assert 0 < b.win_rate < 1, f"{bucket_id} win_rate must be a fraction"
 
 
 # ---------------------------------------------------------------------------
