@@ -143,6 +143,29 @@ def test_stub_bin_is_actionable_until_the_next_bin_closes() -> None:
     ) == "2026-07-21#0"
 
 
+def test_monday_morning_reaches_back_to_fridays_stub() -> None:
+    """Before 10:15 the wanted bin is the previous TRADING day's stub.
+
+    The previous *calendar* day would be Sunday, whose #6 bin cannot exist —
+    so the Friday-stub → Monday-open entry (3 of the backtest's 214 trades)
+    was unreachable. The 15:16 scan is the last of a session, so this morning
+    pass is the only chance the stub bin ever gets.
+    """
+    monday = datetime(2026, 7, 27, 9, 20, tzinfo=_IST)
+    assert monday.weekday() == 0
+    assert meanrev.last_complete_bar_key(monday) == "2026-07-24#6"   # Friday
+
+    # A listed NSE holiday is stepped over too: 2026-08-15 is a Saturday, so
+    # Monday 2026-08-17 still reaches Friday the 14th.
+    assert meanrev.last_complete_bar_key(
+        datetime(2026, 8, 17, 9, 20, tzinfo=_IST)
+    ) == "2026-08-14#6"
+    # Tue 2026-01-27 sits behind Republic Day (Mon 26th) → Friday the 23rd.
+    assert meanrev.last_complete_bar_key(
+        datetime(2026, 1, 27, 9, 20, tzinfo=_IST)
+    ) == "2026-01-23#6"
+
+
 # ---------------------------------------------------------------------------
 # Signal: FRESH cross only
 # ---------------------------------------------------------------------------
@@ -204,6 +227,124 @@ def test_signal_on_an_older_bin_is_skipped() -> None:
     daily = _daily(40, 100.0, end=last.timestamp.astimezone(_IST) - timedelta(days=1))
     stale = meanrev.bar_key(last.timestamp.astimezone(_IST).date(), 3)
     assert meanrev.evaluate("TEST", intraday, daily, cfg, want_bar_key=stale) is None
+
+
+# ---------------------------------------------------------------------------
+# Bar selection: the scanned bin is NOT the newest bin in the frame
+#
+# Regression cover for the bug that made this scanner structurally incapable of
+# opening a position for its whole first live week (28 scans, 0 signals).
+# bugfix_ref: Backtesting Engine/strategies/optimized/
+#   midcap150_meanrev_1h_swing/MEANREV_1H_BUGFIX_HANDOFF.md
+# ---------------------------------------------------------------------------
+def _with_in_progress_bin(bin5_closes: float, in_progress_close: float):
+    """30 flat sessions, then a last session whose bin 5 moved and bin 6 forms.
+
+    Bars 20..23 are 14:15…15:00 (bin 5, the last COMPLETE bin at 15:16 IST);
+    bar 24 is 15:15, the stub bin that Dhan is still filling in. This is the
+    exact shape a live 15m fetch has when the scan fires at HH:16.
+    """
+    closes = [100.0] * 20 + [bin5_closes] * 4 + [in_progress_close]
+    return _series_15m(30, 100.0, last_session_closes=closes)
+
+
+def _last_day(bars) -> datetime:
+    return max(bars, key=lambda b: b.timestamp).timestamp.astimezone(_IST)
+
+
+def test_cross_fires_while_the_next_bin_is_still_forming() -> None:
+    """BUG 1: the wanted bin is located, not required to be last in the frame.
+
+    The scan fires at HH:16, one minute after the bin boundary, so the feed
+    already carries the next (in-progress) bin. Requiring the wanted bin to be
+    newest meant the guard never matched and every symbol returned None.
+    """
+    cfg = _cfg()
+    intraday = _with_in_progress_bin(88.0, 100.0)   # bin 5 dislocated, bin 6 back up
+    day = _last_day(intraday)
+    daily = _daily(40, 100.0, end=day - timedelta(days=1))
+
+    sig = meanrev.evaluate(
+        "TEST", intraday, daily, cfg,
+        want_bar_key=meanrev.bar_key(day.date(), 5),
+    )
+    assert sig is not None, "the completed bin's cross must still be found"
+    assert sig.bar_key == meanrev.bar_key(day.date(), 5)
+    assert sig.dist_pct < -cfg.dist_threshold
+    # The in-progress bin 6 must not have leaked into the reading.
+    assert sig.close == Decimal("88")
+
+
+def test_in_progress_bin_cannot_manufacture_a_signal() -> None:
+    """The mirror case: a poke down in the FORMING bin is not tradeable."""
+    cfg = _cfg()
+    intraday = _with_in_progress_bin(100.0, 88.0)   # bin 5 flat, bin 6 dumping
+    day = _last_day(intraday)
+    daily = _daily(40, 100.0, end=day - timedelta(days=1))
+    assert meanrev.evaluate(
+        "TEST", intraday, daily, cfg,
+        want_bar_key=meanrev.bar_key(day.date(), 5),
+    ) is None
+
+
+def test_absent_bin_is_skipped_and_says_so() -> None:
+    """A stale feed (or a name that did not trade that hour) is not entered."""
+    cfg = _cfg()
+    intraday = _with_in_progress_bin(88.0, 100.0)
+    day = _last_day(intraday)
+    daily = _daily(40, 100.0, end=day - timedelta(days=1))
+    out = meanrev.evaluate_with_reason(
+        "TEST", intraday, daily, cfg,
+        want_bar_key=meanrev.bar_key(day.date() + timedelta(days=1), 3),
+    )
+    assert out.signal is None
+    assert out.reason == meanrev.REASON_BIN_ABSENT
+    assert not out.data_ok
+
+
+def test_a_stray_later_bar_does_not_kill_the_scan() -> None:
+    """Dhan emitted a lone Sat 2026-08-01 14:30 IST bar for many NSE names.
+
+    Under the old "wanted bin must be last" rule that one bar made the newest
+    bin ``2026-08-01#5`` and returned None for every symbol.
+    """
+    cfg = _cfg()
+    intraday = _with_in_progress_bin(88.0, 100.0)
+    day = _last_day(intraday)
+    stray = day + timedelta(days=9)          # some later, unrelated session
+    intraday = intraday + [_bar(stray.replace(hour=14, minute=30), 250.0)]
+    daily = _daily(40, 100.0, end=day - timedelta(days=1))
+
+    sig = meanrev.evaluate(
+        "TEST", intraday, daily, cfg,
+        want_bar_key=meanrev.bar_key(day.date(), 5),
+    )
+    assert sig is not None and sig.close == Decimal("88")
+
+
+def test_outcome_reasons_name_the_guard_that_stopped_the_symbol() -> None:
+    """The scan counts these; "0 of 94" must be attributable to a cause."""
+    cfg = _cfg()
+    day = _last_day(_series_15m(30, 100.0))
+
+    flat = _series_15m(30, 100.0)
+    assert meanrev.evaluate_with_reason(
+        "TEST", flat, _daily(40, 100.0, end=day - timedelta(days=1)), cfg,
+        want_bar_key=meanrev.bar_key(day.date(), 5),
+    ).reason == meanrev.REASON_NO_CROSS
+
+    cold = _series_15m(2, 100.0)
+    cold_day = _last_day(cold)
+    assert meanrev.evaluate_with_reason(
+        "TEST", cold, _daily(40, 100.0, end=cold_day - timedelta(days=1)), cfg,
+        want_bar_key=meanrev.bar_key(cold_day.date(), 5),
+    ).reason == meanrev.REASON_COLD_EMA
+
+    dislocated = _with_in_progress_bin(88.0, 100.0)
+    assert meanrev.evaluate_with_reason(
+        "TEST", dislocated, _daily(5, 100.0, end=day - timedelta(days=1)), cfg,
+        want_bar_key=meanrev.bar_key(day.date(), 5),
+    ).reason == meanrev.REASON_NO_DAILY_ATR
 
 
 def test_short_history_never_signals() -> None:
@@ -278,14 +419,52 @@ def test_mean_touch_fires_only_on_a_completed_bin() -> None:
     cfg = _cfg()
     # Recover: flat at 100, last bin closes at 108 → above a ~100 EMA.
     intraday = _series_15m(30, 100.0, last_session_closes=[100] * 24 + [108.0])
-    touched = meanrev.mean_touched(intraday, cfg.ema_len)
+    day = _last_day(intraday)
+    touched = meanrev.mean_touched(
+        intraday, cfg.ema_len, want_bar_key=meanrev.bar_key(day.date(), 6)
+    )
     assert touched is not None and touched[0] is True
 
     below = meanrev.mean_touched(
         _series_15m(30, 100.0, last_session_closes=[100] * 24 + [92.0]),
         cfg.ema_len,
+        want_bar_key=meanrev.bar_key(day.date(), 6),
     )
     assert below is not None and below[0] is False
+
+
+def test_mean_touch_ignores_a_poke_above_the_mean_in_the_forming_bin() -> None:
+    """BUG 2: the exit used to read ``iloc[-1]`` — the bin still forming.
+
+    Swept over the 2026-07-27..31 live week that flipped 161 exit decisions in
+    both directions. Here bin 5 (complete) closed BELOW the mean and the
+    forming bin 6 pokes above: the position must be held.
+    """
+    cfg = _cfg()
+    intraday = _with_in_progress_bin(92.0, 108.0)
+    day = _last_day(intraday)
+
+    pinned = meanrev.mean_touched(
+        intraday, cfg.ema_len, want_bar_key=meanrev.bar_key(day.date(), 5)
+    )
+    assert pinned is not None
+    touched, close, _ema = pinned
+    assert close == Decimal("92")
+    assert touched is False, "an in-progress poke above the mean is not an exit"
+
+    # Unpinned reads the forming bin and would have exited — the old behaviour.
+    assert meanrev.mean_touched(intraday, cfg.ema_len)[0] is True
+
+
+def test_mean_touch_returns_none_when_the_bin_is_absent() -> None:
+    """No completed bin to read ⇒ no opinion, rather than a stale one."""
+    cfg = _cfg()
+    intraday = _series_15m(30, 100.0)
+    day = _last_day(intraday)
+    assert meanrev.mean_touched(
+        intraday, cfg.ema_len,
+        want_bar_key=meanrev.bar_key(day.date() + timedelta(days=1), 2),
+    ) is None
 
 
 def test_max_hold_is_counted_in_trading_days() -> None:

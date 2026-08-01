@@ -176,10 +176,15 @@ class MeanReversion1h(Strategy):
         protective stop — is NOT here: it rests on the exchange (Decision 022 /
         032), which is both faithful to the backtest's gap-through modelling and
         the only version that protects while the bot is down.
+
+        The mean touch is pinned to the last COMPLETE bin, exactly as entries
+        are. Without that pin it read the bin still forming at HH:16 and exited
+        on a poke above the mean that the bar never closed above.
         """
         cfg = self._cfg()
         exits: list[str] = []
         now = datetime.now(UTC)
+        want = last_complete_bar_key(now)
         for symbol, pos in held.items():
             opened = getattr(pos, "opened_at", None) or getattr(pos, "created_at", None)
             if opened is not None:
@@ -197,7 +202,7 @@ class MeanReversion1h(Strategy):
             except Exception:
                 _log.warning("exit_ohlcv_fetch_failed", symbol=symbol, exc_info=True)
                 continue
-            touch = mean_touched(intraday, cfg.ema_len)
+            touch = mean_touched(intraday, cfg.ema_len, want_bar_key=want)
             if touch is None:
                 continue
             touched, close, ema = touch
@@ -206,6 +211,7 @@ class MeanReversion1h(Strategy):
                 _log.info(
                     "meanrev_exit_mean_touch",
                     symbol=symbol,
+                    bar=want,
                     close=str(close),
                     ema20=str(ema),
                 )

@@ -333,8 +333,50 @@ rupee P&L.
       no scale-guard hits, no cold EMA20, every daily ATR14 resolved. Reused the shared
       token (`dhan_token_loaded_from_cache`), so it did NOT evict the live bot's session.
       No signal on that bar, which is the normal answer (~2 entries/day across 94 names)
+- [x] **BAR-SELECTION BUGFIX 2026-08-01** — the scanner was structurally incapable of
+      opening a position for its entire first live week. bugfix_ref:
+      `…/midcap150_meanrev_1h_swing/MEANREV_1H_BUGFIX_HANDOFF.md`. Root cause is one
+      fact with two consequences: a scan fires at HH:16, one minute AFTER the bin
+      boundary, so Dhan's 15m feed already carries the bar stamped `HH:15` — the NEXT,
+      in-progress bin. (1) ENTRIES: `evaluate()` required the wanted bin to be the
+      newest in the frame, so it was always off by exactly one and every symbol
+      returned None on every pass. (2) EXITS: `mean_touched()` read `iloc[-1]` with no
+      pinning at all, i.e. the bin still forming — the opposite of what its docstring
+      promised. Both now go through one helper (`locate_bin` / `_through_bin`) that
+      LOCATES the wanted bin and truncates there; `ewm(adjust=False)` is causal, so
+      retained values are bit-identical. Also makes the scan immune to stray bars
+      (Dhan emitted a lone Sat 2026-08-01 14:30 IST bar for many NSE names, which
+      under the old rule killed the scan for every symbol)
+- [x] **Third defect found here, not in the handoff**: before 10:15 `last_complete_bar_key`
+      named the previous CALENDAR day, so on a Monday it asked for Sunday`#6` — a bin
+      that cannot exist. That made the Friday-stub → Monday-09:15 entry unreachable
+      (3 of the 214 backtest trades), and the morning pass is the ONLY chance the stub
+      bin gets, since the last scan of a session runs at 15:16. Now walks back to the
+      previous TRADING day (holidays included)
+- [x] Observability, the reason this hid for a week (Decision 033): `evaluated` was
+      incremented BEFORE the cut ran, so "94 checked, none crossed" and "94 bailed at
+      the first guard" were the same log line; and `ScannerSnapshot` rows were written
+      only `for sig in signals`, so a zero-signal bin left no per-symbol audit trail at
+      all. Now `evaluate_with_reason` → `MeanRevOutcome{signal, reason, metrics}` with
+      `data_`-prefixed reasons (mirroring the gap-reversal branch), an outcome histogram
+      in the audit message + payload, an `unevaluable` warning, and one snapshot row per
+      EVALUATED symbol carrying whatever the cut computed before it stopped. On the bug
+      day this would have logged `{'data_bin_absent': 94}` instead of "0 of 94 evaluated"
+- [x] VERIFIED: repro script (drives this repo's module against cached Dhan CSVs) now
+      finds SUZLON −7.0873% on `2026-07-28#5`, matching the engine to 4dp, and gives the
+      SAME answer with and without the in-progress bar present. Golden case exact:
+      `atr14=1.3023`, `stop_distance=4.55805` (= 3.5×ATR), entry next bin open ₹48.10.
+      Production audit log independently confirms the dead week — all 28 scans 0/0,
+      including the 15:16 IST pass on the exact signal bar.
+      `scripts/meanrev_1h_parity.py` **unchanged at 208/214** (same six documented
+      warm-up misses). 13 new/strengthened unit tests; full suite **558 green**
 - [ ] **UNEXERCISED — watch the first trade**: an MTF entry, a mean-touch exit, and the
       ATR-distance resting stop have never run against the real venue
+- [ ] **USER DECISION before re-enabling** — the engine's book holds SUZLON open from
+      28-Jul @ ₹48.10 (Friday close 48.05 vs EMA20 48.106, ~flat, stop never threatened).
+      A fixed bot starts FLAT and will not hold it. Handoff recommends (a) start flat and
+      take the next fresh cross — adopting mid-flight breaks entry parity for no P&L, and
+      a corrected bot would mean-touch out of it almost immediately anyway
 - [ ] Confirm `carry_interest` lands on the first closed round-trip (`Trade.extra`)
 - [ ] Re-derive the 94-name universe after each Midcap-150 rebalance
 - [ ] Expect return BELOW the backtest: 5 concurrent slots, not 20

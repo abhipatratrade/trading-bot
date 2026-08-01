@@ -15,6 +15,7 @@ output for the same inputs and persists a ``ScannerSnapshot`` per
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -538,8 +539,9 @@ def run_meanrev_scan(
     """
     from src.shared.scanner.meanrev import (
         MeanRevConfig,
+        MeanRevOutcome,
         MeanRevSignal,
-        evaluate,
+        evaluate_with_reason,
         last_complete_bar_key,
         rank_top,
     )
@@ -569,7 +571,7 @@ def run_meanrev_scan(
         symbols = eligible
 
     signals: list[MeanRevSignal] = []
-    evaluated = 0
+    evaluated: list[tuple[str, MeanRevOutcome]] = []
     for symbol in symbols:
         try:
             intraday = _intraday_history(data, symbol, cfg.intraday_lookback_days)
@@ -578,10 +580,28 @@ def run_meanrev_scan(
             # One unfetchable name must never sink the whole bin's scan.
             _log.warning("meanrev_scan_fetch_failed", symbol=symbol, exc_info=True)
             continue
-        evaluated += 1
-        sig = evaluate(symbol, intraday, daily, cfg, want_bar_key=key)
-        if sig is not None:
-            signals.append(sig)
+        outcome = evaluate_with_reason(symbol, intraday, daily, cfg, want_bar_key=key)
+        evaluated.append((symbol, outcome))
+        if outcome.signal is not None:
+            signals.append(outcome.signal)
+
+    # Decision 033: "evaluated" used to be incremented BEFORE the cut ran, so
+    # it only ever meant "the fetch succeeded". That made "94 names checked,
+    # none crossed" and "94 names bailed at the first guard" the same log line
+    # — which is precisely how a scanner that was structurally incapable of
+    # firing read as a quiet market for a full week. Count the outcomes.
+    by_reason = Counter(o.reason or "signal" for _, o in evaluated)
+    unevaluable = [sym for sym, o in evaluated if not o.data_ok]
+    if unevaluable:
+        _log.warning(
+            "meanrev_scan_symbols_unevaluable",
+            bucket_id=bucket_id,
+            bar_key=key,
+            count=len(unevaluable),
+            of=len(evaluated),
+            reasons=dict(by_reason),
+            symbols=sorted(unevaluable)[:20],
+        )
 
     # Portfolio rule: at most ``daily_entry_cap`` NEW entries per session, filled
     # chronologically — earlier bins already consumed part of today's budget.
@@ -612,23 +632,26 @@ def run_meanrev_scan(
                 DailyUniverse.strategy_id == bucket_id,
             )
         )
-        for sig in signals:
+        # One row per EVALUATED symbol, not just the ones that crossed —
+        # mirroring the gap-reversal branch below. On a zero-signal bin the old
+        # loop wrote nothing at all, so "why wasn't SUZLON picked?" was
+        # unanswerable from Postgres, which is the other half of why the bar
+        # bug hid for a week. ``metrics`` carries whatever the cut computed
+        # before it stopped, so a rejected name still reports its dislocation.
+        for symbol, outcome in evaluated:
+            sig = outcome.signal
             session.add(
                 ScannerSnapshot(
                     date=scan_date,
                     strategy_id=bucket_id,
-                    symbol=sig.symbol,
-                    metrics={
-                        "bar_key": sig.bar_key,
-                        "close": str(sig.close),
-                        "ema20": str(sig.ema20),
-                        "dist_pct": str(sig.dist_pct),
-                        "atr14": str(sig.atr14),
-                        "stop_distance": str(sig.stop_distance),
-                    },
-                    filter_results={},
-                    rank_score=-sig.dist_pct,  # deeper dislocation ranks higher
-                    passed=True,
+                    symbol=symbol,
+                    metrics=outcome.metrics,
+                    filter_results=(
+                        {"reason": outcome.reason} if outcome.reason else {}
+                    ),
+                    # deeper dislocation ranks higher
+                    rank_score=-sig.dist_pct if sig is not None else None,
+                    passed=sig is not None,
                 )
             )
         for rank, sig in enumerate(chosen, start=1):
@@ -648,15 +671,18 @@ def run_meanrev_scan(
                 event_type=AuditEventType.SCANNER_RUN,
                 message=(
                     f"meanrev 1h scan [{key}]: {len(chosen)}/{len(signals)} crossed "
-                    f"of {evaluated} evaluated (day budget {budget})"
+                    f"of {len(evaluated)} evaluated (day budget {budget}); "
+                    f"outcomes {dict(sorted(by_reason.items()))}"
                 ),
                 payload={
                     "bucket_id": bucket_id,
                     "date": str(scan_date),
                     "bar_key": key,
                     "universe": chosen_symbols,
-                    "evaluated": evaluated,
+                    "evaluated": len(evaluated),
                     "passed": len(signals),
+                    "outcomes": dict(by_reason),
+                    "unevaluable": len(unevaluable),
                     "entries_taken_today": taken,
                 },
             )
@@ -667,14 +693,15 @@ def run_meanrev_scan(
         bucket_id=bucket_id,
         bar_key=key,
         universe=chosen_symbols,
-        evaluated=evaluated,
+        evaluated=len(evaluated),
         passed=len(signals),
+        outcomes=dict(by_reason),
     )
     result = ScanResult(
         bucket_id=bucket_id,
         date=scan_date,
         universe=chosen_symbols,
-        evaluated_count=evaluated,
+        evaluated_count=len(evaluated),
     )
     _MEANREV_SCAN_CACHE[bucket_id] = (key, result)
     return result
