@@ -263,6 +263,9 @@ def run_scan(
                 DailyUniverse.strategy_id == bucket_id,
             )
         )
+        # A once-a-day screen: the bar it is about IS the day (see
+        # ``models._BAR_KEY_DOC``), so the delete above stays day-scoped.
+        day_bar = scan_date.isoformat()
         for entry in evaluated:
             ticker: Ticker = entry["ticker"]  # type: ignore[assignment]
             session.add(
@@ -270,6 +273,7 @@ def run_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=ticker.symbol,
+                    bar_key=day_bar,
                     metrics={
                         "volume_24h": str(ticker.volume_24h),
                         "last_price": str(ticker.last_price),
@@ -292,6 +296,7 @@ def run_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=ticker.symbol,
+                    bar_key=day_bar,
                     rank=rank,
                     target_weight=weight,
                     notes=f"score={entry['score']}",
@@ -436,6 +441,9 @@ def run_equity_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=c.symbol,
+                    # Re-run per tick inside the entry window, but always about
+                    # the same bar: today's 09:15→09:45 gap. Day-scoped.
+                    bar_key=scan_date.isoformat(),
                     rank=rank,
                     target_weight=weight,
                     notes=f"gap={c.gap_pct:.2f}% price={c.price}",
@@ -620,16 +628,24 @@ def run_meanrev_scan(
     weight = Decimal("1") / Decimal(str(len(chosen))) if chosen else Decimal("0")
 
     with session_scope() as session:
+        # Scoped to the BIN, not the day. This cut runs 7× a session, and a
+        # day-scoped delete meant each pass erased the last: only 15:16's rows
+        # ever survived, and the 09:16 pass — the only one that ever reads the
+        # previous session's 15:15→15:30 stub — left nothing behind at all. A
+        # re-run of the SAME bin (bot restart mid-bin) still replaces cleanly,
+        # which is the idempotence this delete exists for.
         session.execute(
             delete(ScannerSnapshot).where(
                 ScannerSnapshot.date == scan_date,
                 ScannerSnapshot.strategy_id == bucket_id,
+                ScannerSnapshot.bar_key == key,
             )
         )
         session.execute(
             delete(DailyUniverse).where(
                 DailyUniverse.date == scan_date,
                 DailyUniverse.strategy_id == bucket_id,
+                DailyUniverse.bar_key == key,
             )
         )
         # One row per EVALUATED symbol, not just the ones that crossed —
@@ -645,6 +661,7 @@ def run_meanrev_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=symbol,
+                    bar_key=key,
                     metrics=outcome.metrics,
                     filter_results=(
                         {"reason": outcome.reason} if outcome.reason else {}
@@ -660,6 +677,7 @@ def run_meanrev_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=sig.symbol,
+                    bar_key=key,
                     rank=rank,
                     target_weight=weight,
                     notes=f"bar={sig.bar_key} dist={sig.dist_pct}% ema20={sig.ema20}",
@@ -847,6 +865,9 @@ def run_gap_reversal_scan(
                 DailyUniverse.strategy_id == bucket_id,
             )
         )
+        # Screened ONCE per session, so the bar it is about IS the day and the
+        # day-scoped deletes above are already exact.
+        day_bar = scan_date.isoformat()
         for symbol, outcome in evaluated:
             cand = outcome.candidate
             session.add(
@@ -854,6 +875,7 @@ def run_gap_reversal_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=symbol,
+                    bar_key=day_bar,
                     # Whatever the screen computed before it stopped — so a
                     # rejected symbol still reports the gap it actually had.
                     metrics=outcome.metrics,
@@ -868,6 +890,7 @@ def run_gap_reversal_scan(
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=c.symbol,
+                    bar_key=day_bar,
                     rank=rank,
                     target_weight=weight,
                     notes=f"gap={c.gap_pct:.2f}% body/atr={c.body_atr_ratio:.2f}",

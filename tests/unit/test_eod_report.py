@@ -115,8 +115,12 @@ class _Scan:
 
 
 class _Audit:
-    def __init__(self, message: str = "Kill switch ENGAGED") -> None:
-        self.event_type = AuditEventType.KILL_SWITCH_FLIPPED
+    def __init__(
+        self,
+        message: str = "Kill switch ENGAGED",
+        event_type: AuditEventType = AuditEventType.KILL_SWITCH_FLIPPED,
+    ) -> None:
+        self.event_type = event_type
         self.strategy_id = None
         self.message = message
         # `ts`, not `created_at` — AuditLog is the one model that does not
@@ -625,3 +629,37 @@ def test_html_round_trips_a_real_report() -> None:
     html = render_markdown_to_html(markdown)
     assert "<table>" in html
     assert "swing-indian" in html
+
+
+# ---------------------------------------------------------------------------
+# Invariant violations reach the journal (Decision 033)
+# ---------------------------------------------------------------------------
+def test_invariant_violations_are_reportable() -> None:
+    """The module docstring has always claimed this report answers "did
+    anything trip — invariants, breakers, kill switch, rejects?". Until
+    INVARIANT_VIOLATED was both written and read, the invariant half was false:
+    a violation only surfaced if it escalated to HALT, because that writes
+    KILL_SWITCH_FLIPPED. Anything that cleared first read as a quiet day."""
+    from src.reporting.eod import _REPORTABLE_EVENTS
+
+    assert AuditEventType.INVARIANT_VIOLATED in _REPORTABLE_EVENTS
+
+
+def test_a_day_with_only_an_invariant_violation_is_not_quiet() -> None:
+    violation = _Audit(
+        event_type=AuditEventType.INVARIANT_VIOLATED,
+        message="stop_coverage: SUZLON has no resting stop",
+    )
+    report = _report(events=[violation])
+    assert not report.quiet
+    assert "stop_coverage" in report.events[0]
+
+
+def test_invariant_violation_renders_in_the_events_section() -> None:
+    violation = _Audit(
+        event_type=AuditEventType.INVARIANT_VIOLATED,
+        message="squareoff: 1 position open past 15:15",
+    )
+    text = render_markdown(_report(events=[violation]))
+    assert "## Events" in text
+    assert "squareoff" in text

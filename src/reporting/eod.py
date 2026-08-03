@@ -780,6 +780,12 @@ def render_markdown(report: Report) -> str:
 _REPORTABLE_EVENTS = (
     AuditEventType.BREAKER_TRIPPED,
     AuditEventType.KILL_SWITCH_FLIPPED,
+    # Decision 033's process watchdog. The module docstring above has always
+    # claimed this report answers "did anything trip — invariants, breakers,
+    # kill switch, rejects?"; until invariants wrote an audit row (and until
+    # this line existed) the invariant half of that sentence was false, and a
+    # violation that cleared before halting anything read as a quiet day.
+    AuditEventType.INVARIANT_VIOLATED,
     AuditEventType.REGIME_CHANGE,
     AuditEventType.DRIFT_ALERT,
     AuditEventType.RECONCILE_DIFF,

@@ -380,6 +380,23 @@ rupee P&L.
       parity, for no P&L; and sitting 0.12% under its EMA20 a corrected bot would
       mean-touch out of it almost immediately anyway. Live book and backtest book are
       therefore knowingly one trade apart until SUZLON closes on the engine's side
+- [x] **Scanner evidence now survives the session** (2026-08-03). Reviewing the
+      first post-fix journal (2026-08-03: 7 passes, all 94 names reaching the
+      cross test, deepest dislocation −2.14% vs the −6.5% band — a genuine
+      no-signal day, and proof the bar-selection fix works) turned up a second
+      recording defect. `scanner_snapshot`/`daily_universe` were keyed
+      `(date, strategy_id, symbol)` and written delete-then-insert scoped to the
+      DAY. Right for a once-a-day screen; destructive here, where the cut runs
+      on all 7 bins: each pass ERASED the previous one, so only 15:16's rows
+      ever survived — prod held exactly 94 rows, all `bar_key 2026-08-03#5`.
+      Worst hit was the 09:16 pass, the only one that reads the previous
+      session's 15:15→15:30 stub (the entry the backtest takes 3 times in 214),
+      which left no per-symbol trace at all. That defeats the whole point of
+      writing a row per evaluated symbol. Migration 0012 adds `bar_key` to both
+      tables and to their unique keys; the meanrev delete is now BIN-scoped
+      (same-bin re-run after a restart still replaces cleanly). Once-a-day
+      scanners stamp the ISO date — for them the bar IS the day. Volume: 94 →
+      658 rows/day for swing-indian, against a 77 MB database.
 - [ ] Confirm `carry_interest` lands on the first closed round-trip (`Trade.extra`)
 - [ ] Re-derive the 94-name universe after each Midcap-150 rebalance
 - [ ] Expect return BELOW the backtest: 5 concurrent slots, not 20
@@ -455,9 +472,25 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
       sessions (28-31 Jul). CAVEAT recorded in config.py: those sessions held
       zero positions, so 4 of the 6 checks were vacuous and act for the first
       time whenever the bot next holds something.
+- [x] **Invariants now leave a DURABLE trace** (2026-08-03). They logged and
+      paged Telegram but wrote NO audit row, and there was no invariant member
+      in `AuditEventType` at all — so a violation reached Postgres only by
+      escalating to HALT (which writes `KILL_SWITCH_FLIPPED` from
+      `kill_switch.engage`). Since the EOD journal is built entirely from audit
+      rows, every violation that cleared before halting anything was reported
+      as "nothing tripped" — while `eod.py`'s own docstring claimed the report
+      answered "did anything trip — invariants, breakers, kill switch,
+      rejects?". New `AuditEventType.INVARIANT_VIOLATED` + `audit_violation()`,
+      written on the SAME condition as the page (first sighting, then only on
+      content change) so the audit log does not reproduce the 2026-07-28
+      Telegram flood, and best-effort so a Postgres hiccup can never break the
+      safety loop it exists to record. Added to `_REPORTABLE_EVENTS`.
 - [ ] Consider: data-feed staleness + Dhan token-health invariants (need hooks
       into `DhanData`), and an Indian daily-drawdown breaker off the trade
       ledger (the existing one is wallet-shaped)
+- [ ] Consider: archive `audit_log` to Drive before the 180-day retention prune
+      deletes it. `core/export.py` archives TRADES only; every other
+      observability table is hard-deleted with no copy behind it.
 
 **Tier 2 — intraday supervisor agent** *(designed, not built)*
 - [ ] `scripts/session_snapshot.py --json` — Postgres-only session state

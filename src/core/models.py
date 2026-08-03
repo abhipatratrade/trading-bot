@@ -113,6 +113,13 @@ class AuditEventType(StrEnum):
     BREAKER_TRIPPED = "breaker_tripped"
     KILL_SWITCH_FLIPPED = "kill_switch_flipped"
     DRIFT_ALERT = "drift_alert"
+    # A session invariant (Decision 033) failed. Written when the violation is
+    # first seen and again whenever what it says changes — NOT every tick, or a
+    # steady-state violation would bury the log the way it once buried Telegram.
+    # Until this existed an invariant left no durable trace unless it escalated
+    # to HALT (which writes KILL_SWITCH_FLIPPED), so the EOD journal reported
+    # "nothing tripped" for violations it simply could not see.
+    INVARIANT_VIOLATED = "invariant_violated"
 
 
 class MarketRegime(StrEnum):
@@ -332,6 +339,27 @@ class StrategyParamChange(Base):
 # ---------------------------------------------------------------------------
 # Scanner output
 # ---------------------------------------------------------------------------
+# Which bar a scanner row is ABOUT, as "<IST date>#<bin>" for an intraday cut
+# and the plain ISO date for a once-a-day screen.
+#
+# Both scanner tables are written delete-then-insert, and the key used to be
+# (date, strategy_id, symbol) — one row per symbol per DAY. That is right for a
+# screen that runs once, and wrong for swing-indian's meanrev cut, which runs on
+# every completed 1h bin: each of the 7 passes wiped the previous one, so six
+# sevenths of the evidence never survived the session. Worst hit was the 09:16
+# pass, which reads the PREVIOUS session's 15:15→15:30 stub — the only path to
+# the entry the backtest takes 3 times in 214 trades, and it left no per-symbol
+# trace at all. Adding the bar to the key is what makes "why wasn't X picked at
+# 11:15?" answerable, which was the whole point of writing a row per evaluated
+# symbol (Decision 033).
+#
+# Not nullable: Postgres treats NULLs as distinct in a UNIQUE constraint, so a
+# nullable column would quietly disable the duplicate guard for every
+# once-a-day scanner. The ISO date is the honest value there — for a daily
+# screen the bar IS the day.
+_BAR_KEY_DOC = "Bar this row is about: '<date>#<bin>' intraday, ISO date daily."
+
+
 class DailyUniverse(Base, TimestampMixin):
     """The lean read-side of the scanner: today's chosen N symbols per strategy.
 
@@ -341,7 +369,7 @@ class DailyUniverse(Base, TimestampMixin):
     __tablename__ = "daily_universe"
     __table_args__ = (
         UniqueConstraint(
-            "date", "strategy_id", "symbol", name="uq_daily_universe_key"
+            "date", "strategy_id", "symbol", "bar_key", name="uq_daily_universe_key"
         ),
         Index("ix_daily_universe_strategy_date", "strategy_id", "date"),
     )
@@ -350,6 +378,9 @@ class DailyUniverse(Base, TimestampMixin):
     date: Mapped[date_] = mapped_column(Date, nullable=False)
     strategy_id: Mapped[str] = mapped_column(String(64), nullable=False)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    bar_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, doc=_BAR_KEY_DOC
+    )
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
     target_weight: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -363,7 +394,7 @@ class ScannerSnapshot(Base):
     __tablename__ = "scanner_snapshot"
     __table_args__ = (
         UniqueConstraint(
-            "date", "strategy_id", "symbol", name="uq_scanner_snapshot_key"
+            "date", "strategy_id", "symbol", "bar_key", name="uq_scanner_snapshot_key"
         ),
         Index("ix_scanner_snapshot_strategy_date", "strategy_id", "date"),
     )
@@ -375,6 +406,9 @@ class ScannerSnapshot(Base):
     date: Mapped[date_] = mapped_column(Date, nullable=False)
     strategy_id: Mapped[str] = mapped_column(String(64), nullable=False)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    bar_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, doc=_BAR_KEY_DOC
+    )
     metrics: Mapped[dict] = mapped_column(JSONB, nullable=False)
     filter_results: Mapped[dict] = mapped_column(JSONB, nullable=False)
     rank_score: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)

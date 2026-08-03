@@ -383,6 +383,7 @@ class _Recorder:
     def __init__(self) -> None:
         self.engaged: list[str] = []
         self.alerts: list[str] = []
+        self.audited: list[tuple[str, bool]] = []
 
     def install(self, monkeypatch, engaged_already: bool = False) -> None:
         monkeypatch.setattr(
@@ -399,6 +400,15 @@ class _Recorder:
             si, "send_alert_dedup", lambda key, msg: self.alerts.append(key)
         )
         monkeypatch.setattr(si, "note_alert_recovery", lambda key, msg: None)
+        # audit_violation opens a real session. Stubbed for the same reason as
+        # the alert sender: a unit test must not reach the live database.
+        monkeypatch.setattr(
+            si,
+            "audit_violation",
+            lambda res, *, streak, would_halt, enforcing: self.audited.append(
+                (res.name, would_halt)
+            ),
+        )
         si.reset_streaks()
 
 
@@ -585,3 +595,86 @@ def test_escalation_to_would_halt_still_pages(monkeypatch) -> None:
     assert len(sent) == 2
     assert not sent[0].startswith("[OBSERVE-ONLY")
     assert sent[1].startswith("[OBSERVE-ONLY")
+
+
+# ---------------------------------------------------------------------------
+# audit_violation — the durable record (Decision 033)
+# ---------------------------------------------------------------------------
+# Before this existed an invariant left no trace in Postgres unless it escalated
+# to HALT (which writes KILL_SWITCH_FLIPPED from kill_switch.engage). The EOD
+# journal is built entirely from audit rows, so every violation that cleared
+# before halting anything was reported as "nothing tripped".
+def test_violation_is_recorded_in_the_audit_log(monkeypatch) -> None:
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    enforce_session_invariants([_violation("stop_coverage", Severity.NOTICE)])
+    assert rec.audited == [("stop_coverage", False)]
+
+
+def test_a_steady_violation_records_once_not_every_tick(monkeypatch) -> None:
+    """The audit log must not reproduce the Telegram flood of 2026-07-28.
+
+    foreign_positions is permanently violated whenever the user holds anything
+    on the shared Dhan account. At one row per 60s tick that is ~500 rows a
+    session about positions the bot is correctly ignoring.
+    """
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    res = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"foreign": ["A"]},
+    )
+    for _ in range(10):
+        enforce_session_invariants([res])
+    assert len(rec.audited) == 1
+
+
+def test_a_changed_violation_records_again(monkeypatch) -> None:
+    """New content is new news — for the record as much as for the page."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    first = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"foreign": ["A"]},
+    )
+    second = si.InvariantResult(
+        "foreign_positions", "dhan", ok=False, severity=Severity.NOTICE,
+        message="x", detail={"foreign": ["A", "B"]},
+    )
+    enforce_session_invariants([first])
+    enforce_session_invariants([first])
+    enforce_session_invariants([second])
+    assert len(rec.audited) == 2
+
+
+def test_escalation_to_would_halt_is_recorded(monkeypatch) -> None:
+    """A warning becoming a halt must reach the journal, not just Telegram."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    res = _violation("squareoff", Severity.HALT, sustain=2)
+    enforce_session_invariants([res], enforcing=False)
+    enforce_session_invariants([res], enforcing=False)
+    assert [halt for _, halt in rec.audited] == [False, True]
+
+
+def test_a_passing_check_records_nothing(monkeypatch) -> None:
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    enforce_session_invariants([si.InvariantResult("squareoff", "dhan", ok=True)])
+    assert rec.audited == []
+
+
+def test_audit_write_failure_never_breaks_the_safety_loop(monkeypatch) -> None:
+    """A monitor that killed the checks it records would be worse than none."""
+    rec = _Recorder()
+    rec.install(monkeypatch)
+
+    def _explode():
+        raise RuntimeError("postgres is down")
+
+    monkeypatch.setattr(si, "session_scope", _explode)
+    monkeypatch.setattr(si, "audit_violation", si.audit_violation)  # real one
+
+    halted = enforce_session_invariants([_violation("squareoff", Severity.HALT)])
+    assert halted  # the halt still happened
+    assert rec.engaged == ["intraday-indian"]

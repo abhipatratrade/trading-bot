@@ -108,6 +108,8 @@ def run_prepare(bucket_id: str, *, data: DhanData | None = None) -> PrepareResul
                     date=scan_date,
                     strategy_id=bucket_id,
                     symbol=s.symbol,
+                    # One heavy daily pass, one bar: the day itself.
+                    bar_key=scan_date.isoformat(),
                     metrics={
                         "prev_close": str(s.prev_close),
                         "rsi": str(s.rsi),

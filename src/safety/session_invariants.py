@@ -50,7 +50,13 @@ from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.heartbeat import last_beat, staleness
 from src.core.logging import get_logger
-from src.core.models import BrokerName, OrderStatus, Trade
+from src.core.models import (
+    AuditEventType,
+    AuditLog,
+    BrokerName,
+    OrderStatus,
+    Trade,
+)
 from src.order_manager.ownership import bot_owned_quantities
 from src.safety import kill_switch
 from src.shared.market_calendar import IST, is_trading_day
@@ -543,6 +549,52 @@ def reset_streaks(key: str | None = None) -> None:
         _last_alerted.pop(key, None)
 
 
+def audit_violation(
+    res: InvariantResult, *, streak: int, would_halt: bool, enforcing: bool
+) -> None:
+    """Record the violation in ``audit_log``. Best-effort, never raises.
+
+    Until this existed an invariant left NO durable trace. It logged to stdout
+    and paged Telegram, and reached Postgres only if it escalated to HALT —
+    which writes ``KILL_SWITCH_FLIPPED`` from ``kill_switch.engage``. Since the
+    EOD journal (``reporting/eod.py``) is built entirely from audit rows, every
+    violation that cleared before halting anything was reported as "nothing
+    tripped": a Telegram ping, and then silence in the permanent record.
+
+    Written on the SAME condition as the alert — first sighting, and again only
+    when what it says changes. A row per tick would reproduce, in the audit log,
+    exactly the steady-state flood that ``foreign_positions`` caused in Telegram
+    on 2026-07-28.
+
+    Swallows its own failures on purpose. This runs inside the safety loop, and
+    a monitor that killed the checks it exists to record would be worse than no
+    monitor — the same reasoning that keeps the EOD report off the broker API.
+    """
+    try:
+        with session_scope() as session:
+            session.add(
+                AuditLog(
+                    strategy_id=res.bucket_id,
+                    event_type=AuditEventType.INVARIANT_VIOLATED,
+                    message=f"{res.name}: {res.message}",
+                    payload={
+                        "invariant": res.name,
+                        "bucket_id": res.bucket_id,
+                        "severity": res.severity.value,
+                        "streak": streak,
+                        "sustain_ticks": res.sustain_ticks,
+                        "would_halt": would_halt,
+                        "enforcing": enforcing,
+                        "detail": json.loads(
+                            json.dumps(res.detail, sort_keys=True, default=str)
+                        ),
+                    },
+                )
+            )
+    except Exception:
+        _log.error("invariant_audit_write_failed", invariant=res.name, exc_info=True)
+
+
 def enforce_session_invariants(
     results: list[InvariantResult],
     *,
@@ -614,6 +666,11 @@ def enforce_session_invariants(
         if _last_alerted.get(key) != digest:
             _last_alerted[key] = digest
             send_alert_dedup(key, f"{prefix}[{res.bucket_id}] {res.message}")
+            # Same condition as the page, so the permanent record and the
+            # Telegram thread agree on what happened and when.
+            audit_violation(
+                res, streak=streak, would_halt=would_halt, enforcing=enforcing
+            )
 
         if not would_halt or not enforcing:
             continue
