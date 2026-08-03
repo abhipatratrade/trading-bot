@@ -215,6 +215,18 @@ class Settings(BaseSettings):
     # Dead-man's switch: the Railway scheduler pages when the bot-worker's
     # heartbeat row is older than this (bot beats every ~60s tick).
     heartbeat_stale_seconds: int = 600
+    # Archive dead-man's switch, checked hourly by the BOT (see run_bot's
+    # _check_archive). The nightly archive runs on Railway, so a Railway-side
+    # watcher could never page about its own container being dead — the check
+    # has to live on independent infrastructure, which is the same reasoning
+    # that put the bot-worker heartbeat watch on Railway (Decision 020/033),
+    # applied in the other direction.
+    #
+    # A healthy lag is 1 day: the job archives YESTERDAY, seven days a week,
+    # and advances the watermark even on a day with no rows. 2 tolerates one
+    # missed night; beyond that the mirror has genuinely stalled — a dead
+    # scheduler, an expired Drive token, or a failing upload.
+    archive_stale_days: int = 2
 
     # -- Session invariants (src/safety/session_invariants.py) ---------------
     # Per-tick assertions that the session is BEHAVING. Breakers watch equity;

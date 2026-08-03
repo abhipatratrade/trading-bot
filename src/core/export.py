@@ -213,6 +213,20 @@ def mark_audit_archived(day: date_, *, force: bool = False) -> bool:
     return True
 
 
+def archive_lag_days(watermark: date_ | None, today: date_) -> int | None:
+    """How many days behind ``today`` the archive is. PURE.
+
+    ``None`` means nothing has ever been archived, which is a different alarm
+    from "it stopped" and is worth saying differently. A HEALTHY lag is 1: the
+    nightly job archives YESTERDAY, every day of the week, and advances the
+    watermark even on a day with no rows. So 2 tolerates one missed night and
+    anything beyond that is a real stall.
+    """
+    if watermark is None:
+        return None
+    return (today - watermark).days
+
+
 def audit_archived_through() -> date_ | None:
     """The last UTC day whose audit rows reached Drive, or None if never.
 

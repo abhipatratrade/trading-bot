@@ -33,6 +33,7 @@ from src.core.alerts import (
 from src.core.clock import RealClock
 from src.core.config import get_settings
 from src.core.db import session_scope
+from src.core.export import archive_lag_days, audit_archived_through
 from src.core.heartbeat import SERVICE_BOT_WORKER, beat
 from src.core.logging import configure_logging, get_logger
 from src.core.models import AuditEventType, AuditLog, BrokerName
@@ -73,6 +74,14 @@ _TOKEN_GRACE_SECONDS = 180.0
 _log = get_logger("entrypoints.run_bot")
 _shutdown = False
 _tick_count = 0
+
+# Dedup key for the archive dead-man's switch (see _check_archive).
+_ARCHIVE_ALERT_KEY = "archive_stale"
+
+# Ticks between archive checks. The watermark moves once a day, so anything
+# faster is pure noise against the DB; hourly still catches a stall the same
+# morning it matters.
+_ARCHIVE_CHECK_EVERY_TICKS = 60
 
 
 def _handle_signal(signum: int, _frame: object) -> None:
@@ -368,6 +377,56 @@ def main() -> None:
         note_sustained_recovery(key, message)
         reset_alert_dedup(key)
 
+    def _check_archive() -> None:
+        """Page when the Drive archive falls behind. Never raises.
+
+        THE ARCHIVE RUNS ON RAILWAY, SO THIS CANNOT. ``_nightly_export`` alerts
+        on a failed upload, but only if the job runs at all — a dead scheduler
+        container stops the archive and every alarm about it in the same
+        stroke. So the watcher lives here, on the VM, exactly mirroring the
+        Railway-side heartbeat watch that exists because a dead VM must not
+        silence its own watchdog (Decision 020/033).
+
+        One alarm covers all three ways the mirror dies: the scheduler stops,
+        the Drive token expires, or the upload fails night after night. Each
+        shows up as the same symptom — a watermark that stops moving — and
+        that watermark is what gates the audit-log prune, so a stall here is
+        also the reason the table starts growing.
+        """
+        settings_ = get_settings()
+        try:
+            watermark = audit_archived_through()
+        except Exception:
+            _log.warning("archive_watch_read_failed", exc_info=True)
+            return
+
+        today = clock.now().date()
+        lag = archive_lag_days(watermark, today)
+        if lag is None:
+            send_alert_dedup(
+                _ARCHIVE_ALERT_KEY,
+                "🗄️ Audit archive has NEVER run — nothing is mirrored to "
+                "Drive, and the audit-log prune is blocked (nothing is being "
+                "deleted, so this is safe but not free). "
+                "See docs/runbook.md → Google Drive archive.",
+            )
+            return
+        if lag > settings_.archive_stale_days:
+            _log.warning("archive_stale", watermark=str(watermark), lag_days=lag)
+            send_alert_dedup(
+                _ARCHIVE_ALERT_KEY,
+                f"🗄️ Audit archive is STALE — last archived day is "
+                f"{watermark} ({lag}d behind). The Railway scheduler may be "
+                f"down, the Drive token expired, or the upload is failing. "
+                f"Nothing is being deleted meanwhile (the prune is gated on "
+                f"this mark), so the audit table will grow until it is fixed.",
+            )
+        else:
+            note_alert_recovery(
+                _ARCHIVE_ALERT_KEY,
+                f"✅ Audit archive healthy again (through {watermark}).",
+            )
+
     def _sweep_stops() -> None:
         for ref, ref_bucket_ids in accounts.items():
             pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
@@ -600,6 +659,10 @@ def main() -> None:
 
         global _tick_count
         _tick_count += 1
+        # Hourly, and once on the first tick so a restart reports immediately
+        # rather than waiting an hour to notice a stalled archive.
+        if _tick_count == 1 or _tick_count % _ARCHIVE_CHECK_EVERY_TICKS == 0:
+            _check_archive()
         if _tick_count % 5 == 0:
             for ref, rec in reconcilers.items():
                 try:
