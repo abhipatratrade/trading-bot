@@ -161,17 +161,44 @@ def test_the_backfill_may_assert_the_watermark_directly(watermark) -> None:
 # ---------------------------------------------------------------------------
 # Configuration — why nothing ever reached Drive
 # ---------------------------------------------------------------------------
-def test_a_folder_alone_is_not_enough_to_be_enabled() -> None:
+def _settings(**overrides):
+    """Settings with EVERY gdrive field pinned, so `.env` cannot leak in.
+
+    These tests originally wrote `Settings(gdrive_folder_id=...)` and passed —
+    but only because the box had no credentials. The moment real GDRIVE_OAUTH_*
+    values landed in `.env` they were inherited, `gdrive_enabled` flipped True,
+    and three assertions inverted. Init kwargs outrank env in pydantic-settings,
+    so naming all four fields makes the case under test the whole input.
+    """
     from src.core.config import Settings
 
-    s = Settings(gdrive_folder_id="abc123")
+    fields = {
+        "gdrive_folder_id": None,
+        "gdrive_oauth_client_id": None,
+        "gdrive_oauth_client_secret": None,
+        "gdrive_oauth_refresh_token": None,
+        "gdrive_service_account_json": None,
+    }
+    fields.update(overrides)
+    return Settings(**fields)
+
+
+def test_a_folder_alone_is_not_enough_to_be_enabled() -> None:
+    assert _settings(gdrive_folder_id="abc123").gdrive_enabled is False
+
+
+def test_credentials_without_a_folder_are_not_enough_either() -> None:
+    s = _settings(
+        gdrive_oauth_client_id="cid",
+        gdrive_oauth_client_secret="secret",  # noqa: S106
+        gdrive_oauth_refresh_token="refresh",  # noqa: S106
+    )
+    assert s.gdrive_oauth_configured is True
     assert s.gdrive_enabled is False
 
 
 def test_oauth_credentials_enable_the_mirror() -> None:
-    from src.core.config import Settings
-
-    s = Settings(
+    s = _settings(
         gdrive_folder_id="abc123",
         gdrive_oauth_client_id="cid",
         gdrive_oauth_client_secret="secret",  # noqa: S106
@@ -181,19 +208,26 @@ def test_oauth_credentials_enable_the_mirror() -> None:
     assert s.gdrive_enabled is True
 
 
+def test_a_partial_oauth_trio_does_not_count_as_configured() -> None:
+    """Two of three is a misconfiguration, not a working mirror."""
+    s = _settings(
+        gdrive_folder_id="abc123",
+        gdrive_oauth_client_id="cid",
+        gdrive_oauth_client_secret="secret",  # noqa: S106
+    )
+    assert s.gdrive_oauth_configured is False
+    assert s.gdrive_enabled is False
+
+
 def test_a_service_account_still_enables_it_for_shared_drives() -> None:
     """Kept working — it is the right mode on Workspace, wrong on @gmail.com."""
-    from src.core.config import Settings
-
-    s = Settings(gdrive_folder_id="abc123", gdrive_service_account_json="{}")
+    s = _settings(gdrive_folder_id="abc123", gdrive_service_account_json="{}")
     assert s.gdrive_enabled is True
     assert s.gdrive_oauth_configured is False
 
 
 def test_upload_refuses_and_says_so_when_unconfigured(monkeypatch, tmp_path) -> None:
-    from src.core.config import Settings
-
-    monkeypatch.setattr(export, "get_settings", lambda: Settings())
+    monkeypatch.setattr(export, "get_settings", _settings)
     target = tmp_path / "audit_20260803.parquet"
     target.write_bytes(b"x")
     assert export.upload_to_gdrive(target) is False

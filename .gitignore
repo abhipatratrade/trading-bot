@@ -59,3 +59,9 @@ Thumbs.db
 
 # Runtime state (Dhan token cache — a live 24h secret; never commit)
 /state/
+
+# Nightly archive output (core/export.py) — audit rows and the trade ledger.
+# Operational data, not source: it belongs in Drive, and the Railway container
+# that normally writes it has an ephemeral disk anyway. Committing it would put
+# the audit log in git history and grow the repo without bound.
+data/exports/

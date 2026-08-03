@@ -19,13 +19,13 @@ the files are owned by you and count against your own 15 GB.
 
 GETTING THE CLIENT ID/SECRET (five minutes, once):
 
-  1. https://console.cloud.google.com/ → create or pick a project.
-  2. APIs & Services → Library → enable **Google Drive API**.
-  3. APIs & Services → OAuth consent screen → External → fill the required
-     fields → add YOUR OWN email under Test users. Publishing is unnecessary;
+  1. https://console.cloud.google.com/ -> create or pick a project.
+  2. APIs & Services -> Library -> enable **Google Drive API**.
+  3. APIs & Services -> OAuth consent screen -> External -> fill the required
+     fields -> add YOUR OWN email under Test users. Publishing is unnecessary;
      a test user's refresh token is enough. (On an unpublished app the token
      expires after 7 days — see the note at the bottom.)
-  4. Credentials → Create credentials → **OAuth client ID** → Desktop app.
+  4. Credentials -> Create credentials -> **OAuth client ID** -> Desktop app.
   5. Copy the client id and client secret into the command above.
 
 Then make a folder in your Drive for the archive, open it, and copy the id
@@ -35,11 +35,17 @@ out of the URL (``.../folders/<THIS>``) into ``GDRIVE_FOLDER_ID``.
 from __future__ import annotations
 
 import argparse
+import sys
 
 from src.core.export import GDRIVE_SCOPES
 
 
 def main() -> int:
+    # cp1252 consoles cannot encode this module's help text (see
+    # scripts/archive_backfill.py for the same guard).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--client-secret", required=True)

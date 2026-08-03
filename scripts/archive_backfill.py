@@ -18,6 +18,7 @@ upload, so the watermark can never claim more than is true.
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -62,6 +63,12 @@ def _check() -> int:
 
 
 def main() -> int:
+    # A Windows console defaults to cp1252, which cannot encode the em-dashes
+    # and arrows in this module's own help text — the traceback then looks like
+    # an archive failure rather than a console one.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Config report only.")
     parser.add_argument("--dry-run", action="store_true")
@@ -84,12 +91,19 @@ def main() -> int:
         return 1
 
     watermark = audit_archived_through()
-    start = args.from_date or (
+    # The first day that would leave NO gap below it. Anything later than this
+    # is a partial run, and a partial run must not move the watermark: the
+    # watermark asserts "everything up to here is archived", so advancing it
+    # past un-archived days is precisely the data-loss bug the guard exists to
+    # prevent — retention would immediately consider that history deletable.
+    natural_start = (
         watermark + timedelta(days=1) if watermark else _oldest_audit_day()
     )
+    start = args.from_date or natural_start
     if start is None:
         print("No audit rows to archive.")
         return 0
+    leaves_gap = natural_start is not None and start > natural_start
 
     # Yesterday is the last COMPLETE UTC day; today is still being written.
     end = (datetime.now(UTC) - timedelta(days=1)).date()
@@ -97,7 +111,7 @@ def main() -> int:
         print(f"Nothing to do — archived through {watermark}.")
         return 0
 
-    print(f"Archiving audit_log {start} → {end} ...")
+    print(f"Archiving audit_log {start} -> {end} ...")
     day = start
     last_ok: date | None = None
     while day <= end:
@@ -121,11 +135,20 @@ def main() -> int:
             break
         day += timedelta(days=1)
 
-    if last_ok is not None and not args.dry_run:
+    if args.dry_run:
+        print(f"\nDry run — watermark unchanged at {watermark or 'never archived'}.")
+    elif last_ok is None:
+        print("\nNothing archived — watermark unchanged.")
+    elif leaves_gap:
+        print(
+            f"\nWatermark NOT moved (still {watermark or 'never archived'}).\n"
+            f"--from {start} skipped everything from {natural_start}, so days "
+            f"below it are still un-archived and must not be marked safe.\n"
+            f"Re-run without --from to close the gap."
+        )
+    else:
         mark_audit_archived(last_ok, force=True)
         print(f"\nWatermark set to {last_ok}. Retention may now prune below it.")
-    elif args.dry_run:
-        print(f"\nDry run — watermark unchanged at {watermark or 'never archived'}.")
     return 0
 
 
