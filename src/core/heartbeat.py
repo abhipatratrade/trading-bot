@@ -44,6 +44,30 @@ def beat(service: str, clock: Clock | None = None) -> None:
         _log.warning("heartbeat_write_failed", service=service, exc_info=True)
 
 
+def beat_with(service: str, extra: dict, clock: Clock | None = None) -> None:
+    """:func:`beat` plus a payload. Never raises.
+
+    Used by the nightly archive to record HOW FAR it has got, not merely that
+    it ran: ``core/retention.py`` refuses to prune audit rows past that mark,
+    so the number has to survive alongside the timestamp.
+    """
+    now = (clock or RealClock()).now()
+    try:
+        with session_scope() as session:
+            row = session.execute(
+                select(Heartbeat).where(Heartbeat.service == service)
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(Heartbeat(service=service, beat_at=now, extra=extra))
+            else:
+                row.beat_at = now
+                row.extra = extra
+    except IntegrityError:
+        pass  # unique-constraint race on first beat — the other writer won
+    except Exception:
+        _log.warning("heartbeat_write_failed", service=service, exc_info=True)
+
+
 def last_beat(service: str) -> datetime | None:
     """The service's last heartbeat timestamp, or None if it never beat."""
     with session_scope() as session:
@@ -51,6 +75,24 @@ def last_beat(service: str) -> datetime | None:
             select(Heartbeat).where(Heartbeat.service == service)
         ).scalar_one_or_none()
         return row.beat_at if row is not None else None
+
+
+def last_extra(service: str) -> dict | None:
+    """The service's last heartbeat payload, or None. Never raises.
+
+    Read by retention, which runs whether or not the archive ever has. A DB
+    error here must read as "nothing archived" (delete nothing), never as an
+    exception that skips the whole prune.
+    """
+    try:
+        with session_scope() as session:
+            row = session.execute(
+                select(Heartbeat).where(Heartbeat.service == service)
+            ).scalar_one_or_none()
+            return row.extra if row is not None else None
+    except Exception:
+        _log.warning("heartbeat_read_failed", service=service, exc_info=True)
+        return None
 
 
 def staleness(

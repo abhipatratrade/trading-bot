@@ -2,7 +2,10 @@
 APScheduler-based background job runner (Railway service).
 
 Jobs:
-    - Nightly trade export (Parquet + CSV, optional GDrive upload)
+    - Nightly archive: trades AND audit_log (Parquet + CSV, mirrored to
+      Google Drive). The audit half is not optional garnish — retention
+      hard-deletes audit rows at 180 days, and the prune below will not pass
+      the watermark this job writes.
     - Heartbeat watch (dead-man's switch): pages when the bot-worker's
       heartbeat row goes stale. Runs on Railway — infrastructure
       independent of the GCP VM, so a dead VM cannot silence its own
@@ -21,13 +24,19 @@ from __future__ import annotations
 
 import signal
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+from src.core import retention
 from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
 from src.core.config import get_settings
-from src.core.export import export_trades, upload_to_gdrive
+from src.core.export import (
+    export_audit_log,
+    export_trades,
+    mark_audit_archived,
+    upload_to_gdrive,
+)
 from src.core.heartbeat import SERVICE_BOT_WORKER, last_beat, staleness
 from src.core.logging import configure_logging, get_logger
 from src.core.retention import prune_old_rows
@@ -72,24 +81,55 @@ def _heartbeat_watch() -> None:
 
 
 def _nightly_export() -> None:
-    """Export yesterday's trades and optionally upload to GDrive."""
+    """Archive yesterday's trades and audit rows, and mirror them to Drive.
+
+    The audit half gates retention: ``mark_audit_archived`` is called ONLY on a
+    confirmed upload, and ``prune_old_rows`` refuses to delete past that mark.
+    A day with no audit rows still advances the watermark — there is nothing to
+    lose, and letting an idle day block the prune forever would be a slow leak.
+
+    LOCAL ONLY is an ALERT, not a footnote. It read as a mild caveat for
+    months while the mirror had in fact never run once: the container's disk is
+    ephemeral, so local-only means the file is gone at the next deploy.
+    """
     _log.info("nightly_export_start")
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
     try:
-        path = export_trades()
-        if path:
-            uploaded = upload_to_gdrive(path)
-            if uploaded:
-                send_alert(f"Nightly export done + uploaded to GDrive: {path.name}")
-            else:
-                send_alert(
-                    f"Nightly export done LOCAL ONLY (GDrive upload skipped/failed): "
-                    f"{path.name}"
-                )
+        done: list[str] = []
+        local_only: list[str] = []
+
+        trade_path = export_trades()
+        if trade_path:
+            target = done if upload_to_gdrive(trade_path) else local_only
+            target.append(trade_path.name)
+
+        audit_path = export_audit_log()
+        audit_safe = False
+        if audit_path is None:
+            audit_safe = True  # nothing written that day — nothing to lose
+        elif upload_to_gdrive(audit_path):
+            done.append(audit_path.name)
+            audit_safe = True
         else:
-            _log.info("nightly_export_no_trades")
+            local_only.append(audit_path.name)
+
+        if audit_safe:
+            mark_audit_archived(yesterday)
+
+        if local_only:
+            send_alert(
+                f"🚨 Nightly archive LOCAL ONLY — NOT in Drive: "
+                f"{', '.join(local_only)}. This container's disk is ephemeral, "
+                f"so these are lost on the next deploy, and the audit-log prune "
+                f"is now BLOCKED until the mirror works. See docs/runbook.md."
+            )
+        elif done:
+            send_alert(f"Nightly archive uploaded to Drive: {', '.join(done)}")
+        else:
+            _log.info("nightly_export_nothing_to_archive", date=str(yesterday))
     except Exception:
         _log.exception("nightly_export_failed")
-        send_alert("Nightly export FAILED — check logs")
+        send_alert("Nightly archive FAILED — check logs")
 
 
 def _eod_report() -> None:
@@ -114,9 +154,13 @@ def _eod_report() -> None:
 
 
 def _nightly_prune() -> None:
-    """Prune expired snapshot/audit rows; page only when a table fails."""
+    """Prune expired snapshot/audit rows; page only when a table fails.
+
+    BLOCKED is not a failure and does not page here — the archive job already
+    alerted, and two messages about one cause is how alert fatigue starts.
+    """
     counts = prune_old_rows()
-    failed = [t for t, n in counts.items() if n < 0]
+    failed = [t for t, n in counts.items() if n == retention.FAILED]
     if failed:
         send_alert(f"Retention prune FAILED for: {', '.join(failed)} — check logs")
 

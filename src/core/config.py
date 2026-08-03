@@ -169,8 +169,29 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
 
     # -- Google Drive (optional, used by scheduler) -------------------------
-    gdrive_service_account_json: str | None = None
+    # Destination folder id, shared by both auth modes below.
     gdrive_folder_id: str | None = None
+
+    # Mode 1 — OAUTH USER CREDENTIALS. The only mode that works on a personal
+    # @gmail.com account, and therefore the one to use here. Uploaded files are
+    # owned by YOU and count against your own 15 GB.
+    #
+    # Mode 2 (below) does not work on a personal account and the reason is not
+    # obvious: a service account has NO Drive storage quota of its own. Sharing
+    # a My Drive folder with it is not enough, because the file it creates
+    # would be owned by the service account, so the upload fails with
+    # ``storageQuotaExceeded``. Service accounts can only own files inside a
+    # Shared Drive, which needs Google Workspace.
+    #
+    # Mint the refresh token once with ``python -m scripts.gdrive_authorize``.
+    gdrive_oauth_client_id: str | None = None
+    gdrive_oauth_client_secret: SecretStr | None = None
+    gdrive_oauth_refresh_token: SecretStr | None = None
+
+    # Mode 2 — SERVICE ACCOUNT. Kept for a Workspace Shared Drive, where it is
+    # the better option (no token to refresh, no user in the loop). Accepts a
+    # path to the JSON key file or the key contents inline.
+    gdrive_service_account_json: str | None = None
 
     # -- Logging ------------------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -384,8 +405,25 @@ class Settings(BaseSettings):
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
     @property
+    def gdrive_oauth_configured(self) -> bool:
+        return bool(
+            self.gdrive_oauth_client_id
+            and self.gdrive_oauth_client_secret
+            and self.gdrive_oauth_refresh_token
+        )
+
+    @property
     def gdrive_enabled(self) -> bool:
-        return bool(self.gdrive_service_account_json and self.gdrive_folder_id)
+        """Is there a destination AND some way to authenticate to it?
+
+        Both halves matter and neither is the default. Until 2026-08-03 this
+        was silently False in production — no credentials were ever set — so
+        every nightly export logged ``gdrive_disabled`` at INFO and stopped.
+        Nothing was ever mirrored off the box, and nothing said so out loud.
+        """
+        return bool(self.gdrive_folder_id) and (
+            self.gdrive_oauth_configured or bool(self.gdrive_service_account_json)
+        )
 
 
 @lru_cache(maxsize=1)

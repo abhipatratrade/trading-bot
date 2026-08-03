@@ -194,6 +194,89 @@ flip / 30-day cap. The reconciler should agree with the sandbox each sweep.
 
 ---
 
+## Google Drive archive (audit log + trades)
+
+The scheduler writes `data/exports/{trades,audit}_YYYYMMDD.{parquet,csv}` at
+00:30 UTC and mirrors them to Drive. **The container's disk is ephemeral** — a
+local-only file is gone at the next deploy, so "LOCAL ONLY" in the nightly
+Telegram message means *not archived*, not *archived somewhere else*.
+
+The audit half gates retention. `core/retention.py` will not delete audit rows
+past the archive watermark, so a broken mirror stops the deletion instead of
+letting it run ahead of the backup. The table grows and you get paged; nothing
+is destroyed.
+
+### Why it never worked before 2026-08-03
+
+Three independent faults, each enough on its own, all silent:
+
+1. No credentials were ever set, so `gdrive_enabled` was `False` and the upload
+   returned early — at INFO level, so nothing surfaced.
+2. `google-api-python-client`, `google-auth` and `google-auth-oauthlib` were in
+   `pyproject.toml` but **not** in `requirements.txt`, which is what
+   `ops/deploy.sh` installs on the VM. The import would have failed anyway.
+3. The code only supported a **service account**, which cannot work on a
+   personal `@gmail.com`. A service account has no Drive storage quota; sharing
+   a My Drive folder with it is not enough, because the file it creates would be
+   *owned* by it, and Drive rejects that with `storageQuotaExceeded`. Only a
+   Workspace Shared Drive can hold service-account-owned files.
+
+### Setup (one-off, ~5 minutes — you must do this yourself)
+
+1. <https://console.cloud.google.com/> → create or pick a project.
+2. **APIs & Services → Library** → enable **Google Drive API**.
+3. **OAuth consent screen** → External → fill the required fields → add your own
+   email under **Test users**.
+4. **Credentials → Create credentials → OAuth client ID → Desktop app.** Copy the
+   client id and secret.
+5. Make a folder in your Drive for the archive. Open it and copy the id out of
+   the URL: `.../folders/<THIS PART>`.
+6. Mint the refresh token on your own machine:
+
+```bash
+python -m scripts.gdrive_authorize --client-id YOUR_ID --client-secret YOUR_SECRET
+```
+
+It prints the three env vars. Set those plus `GDRIVE_FOLDER_ID` on the VM
+(and in your local `.env`), then verify:
+
+```bash
+python -m scripts.archive_backfill --check
+```
+
+> While the consent screen is in **Testing**, Google expires refresh tokens
+> after 7 days. Publish the app — no review is needed for the `drive.file`
+> scope — or re-run `gdrive_authorize` weekly.
+
+### Backfill the existing history
+
+The nightly job only handles yesterday. Everything older (audit rows go back to
+2026-05-01) has never left the box, and the prune stays blocked until a
+*contiguous* archive reaches it:
+
+```bash
+python -m scripts.archive_backfill --dry-run
+```
+
+```bash
+python -m scripts.archive_backfill
+```
+
+It stops at the first failed upload rather than leaving a hole, so re-running
+after a fix resumes where it stopped.
+
+### Checks
+
+```bash
+python -m scripts.archive_backfill --check
+```
+
+`watermark` is the last UTC day proven to be in Drive. If it says
+`never archived`, retention is deleting no audit rows at all — which is safe,
+but the table will grow until you fix the mirror.
+
+---
+
 ## Common checks
 
 ```bash

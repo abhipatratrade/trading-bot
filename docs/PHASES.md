@@ -488,9 +488,33 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
 - [ ] Consider: data-feed staleness + Dhan token-health invariants (need hooks
       into `DhanData`), and an Indian daily-drawdown breaker off the trade
       ledger (the existing one is wallet-shaped)
-- [ ] Consider: archive `audit_log` to Drive before the 180-day retention prune
-      deletes it. `core/export.py` archives TRADES only; every other
-      observability table is hard-deleted with no copy behind it.
+- [x] **`audit_log` is archived, and never deleted ahead of its archive**
+      (2026-08-03). The 180-day prune was hard-deleting the forensic record
+      (House Rule #8) with NO copy behind it — `core/export.py` covered `trade`
+      alone. Worse, the Drive mirror had never run ONCE, for three independent
+      silent reasons: (1) no credentials were ever set, so `gdrive_enabled` was
+      False and the upload returned early at INFO; (2) the three `google-*`
+      packages were in pyproject.toml but NOT requirements.txt, which is what
+      `ops/deploy.sh` installs on the VM, so the import would have failed
+      anyway; (3) the code only did SERVICE-ACCOUNT auth, which cannot work on
+      a personal @gmail.com — a service account has no Drive storage quota, so
+      a file it creates in a shared My Drive folder is rejected with
+      `storageQuotaExceeded`, and only a Workspace Shared Drive can hold
+      service-account-owned files. Now: `export_audit_log`, OAuth user-credential
+      support (preferred; files owned by the user), the packages in
+      requirements.txt, uploads that REPLACE rather than duplicate, and
+      LOCAL ONLY promoted from footnote to alert. THE GUARD: retention's audit
+      cutoff is the EARLIER of the 180-day age and an archive watermark, and
+      the watermark only advances CONTIGUOUSLY — one good night cannot bless
+      three months of backlog. Nothing archived ⇒ nothing deleted. Setup is the
+      user's (credentials); `scripts/gdrive_authorize.py` mints the token and
+      `scripts/archive_backfill.py --check/--dry-run` closes the history.
+- [ ] **USER ACTION: configure Drive** (runbook → "Google Drive archive"), then
+      run `scripts/archive_backfill.py`. Until then the audit prune is BLOCKED
+      by design and `audit_log` grows unbounded — safe, but not free forever.
+- [ ] Consider: the other three pruned tables (`scanner_snapshot`,
+      `sizing_snapshot`, `regime_snapshot`, 60-day) are still deleted with no
+      archive. Lower stakes than the audit log, same shape of problem.
 
 **Tier 2 — intraday supervisor agent** *(designed, not built)*
 - [ ] `scripts/session_snapshot.py --json` — Postgres-only session state
@@ -602,3 +626,5 @@ Append a one-liner per session for traceability.
 - 2026-07-06 (later) — Phase 1c backlog section added: review leftovers + two new user asks (cumulative bucket P&L on dashboard; per-trade traded amt + P&L amt/% refreshed ≤5 min, with fills-ingestion prerequisite). `continue` resumes from Phase 1c top item. Deployed c36b038 to VM + Railway; DASHBOARD_PASSWORD set on Railway dashboard service.
 - 2026-07-06 — Critical-review session → Decision 021 shipped: exit engine wired into BucketRunner (step 0: `select_exits` per strategy incl. gated ones; top5_volume exits on BEAR flip, ema_9_15 on EMA state-down), breakers enforced per tick (trip → per-bucket kill switch + reduce-only flatten via `safety/enforcement.py`), reconciler now mirrors sub-account wallet into bucket_state (available/locked × allocator fx), dashboard HTTP basic auth (DASHBOARD_USER/PASSWORD) + traceback leak removed, OrderManager transport-error recovery via client_order_id lookup (no double-fire), set_leverage failure aborts placement, EntryCandidate.side honored (shorts plumbing), regime inference+retrain drop the in-progress candle, status maps gained partial/rejected. 117 unit tests green (was 73).
 - 2026-06-15 — Bot-worker VM migrated us-central1-f → asia-south1-a (Mumbai). Binance HTTP 451 geoblock cleared (no more Delta-only fallback for OHLCV). New VM `trading-bot-worker-mumbai`, static IP 34.14.200.220, whitelisted on Delta India. Old VM `trading-bot-worker` (35.184.66.247) systemd service stopped + disabled; VM kept for 24h soak, to be deleted ~2026-06-22. Per-coin HMM Brain (migration 0005 + symbol-keyed model+snapshot) shipped same day: tiered training (3-state-full / 3-state-diag / 2-state-diag / skip), `_market_` fallback under MARKET_SENTINEL, per-symbol regime dict in BucketRunner→sizer, dashboard regime grid per symbol. `/params` route split into index + allocation + trading + scanner sub-pages. Retrain flipped back to Binance (richer history via symbol_mapping Delta↔Binance crosswalk). 73 unit tests green.
+
+- 2026-08-03 (later) — Drive archive made real, and 0012's own backfill bug fixed. VERIFIED IN PROD after the 0012 deploy: `bar_key` on both scanner tables, `INVARIANT_VIOLATED` in the enum, and the new invariant row fired within minutes — `foreign_positions` recording the user's four open NIFTY-Aug2026 option legs as NOT the bot's (NOTICE, never acted on, exactly per Decision 027). That is the first invariant ever to leave a durable trace. BUG FOUND IN MY OWN 0012: `ADD COLUMN ... DEFAULT ''` populates every existing row on the spot, so the `WHERE bar_key IS NULL` backfill matched nothing and all 2,342 scanner_snapshot + 168 daily_universe legacy rows got `''` rather than their ISO date. Nothing lost (`date` still carries the day) but it wasted the `''` sentinel, which 0012 documents as "written inside a deploy window" — migration 0013 backfills `WHERE bar_key = ''`. The server_default STAYS: deploy.sh migrates before it restarts, so old code briefly inserts against the new schema, and without the default that raises inside a scan on a live process.

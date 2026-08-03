@@ -63,6 +63,13 @@ def upgrade() -> None:
         # Added nullable, backfilled, then made NOT NULL — the three-step dance
         # that lets this run against a table that already holds rows.
         #
+        # BUG, fixed in 0013 rather than edited here because this already ran
+        # in production: ADD COLUMN with a server_default populates every
+        # existing row on the spot, so `WHERE bar_key IS NULL` below matched
+        # nothing and the ISO-date backfill silently did not happen. Every
+        # legacy row got '' instead. Harmless (the `date` column still carries
+        # the day) but it wasted the '' sentinel, so 0013 backfills properly.
+        #
         # The server_default is deliberate and PERMANENT. ops/deploy.sh applies
         # migrations BEFORE restarting the bot, so for a few seconds the OLD
         # code is still live against the NEW schema, inserting scanner rows with
