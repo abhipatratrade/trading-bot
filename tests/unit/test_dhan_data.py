@@ -51,7 +51,12 @@ class _FakeHttp:
 
 def _data(http: _FakeHttp) -> DhanData:
     token = DhanTokenManager(static_token="TOK")  # static → no refresh calls
-    return DhanData(token_manager=token, universe=_UNIVERSE, http=http)
+    # A real DhanData always carries a client id (from_settings supplies it);
+    # /v2/marketfeed/* authenticates on it as well as the token.
+    return DhanData(
+        token_manager=token, universe=_UNIVERSE, http=http,
+        client_id="1000000001",
+    )
 
 
 def test_get_ohlcv_daily_parses_and_sorts() -> None:
@@ -142,3 +147,51 @@ def test_get_ticker_parses_quote() -> None:
 def test_get_funding_rate_not_supported() -> None:
     with pytest.raises(NotImplementedError):
         _data(_FakeHttp({})).get_funding_rate("SWIGGY")
+
+
+# ── /v2/marketfeed/quote: the empty client-id that ate every mark price ──
+# Dhan authenticates this endpoint on access-token AND client-id, and the
+# header was hardcoded to "". Every call 401'd -- 76 of 76 in production,
+# never one success -- with the body literally saying {"810":"ClientId is
+# invalid"}. Verified against the live API 2026-08-07: empty -> 401, real
+# client id -> 200 with quote data.
+#
+# It read as a token fault and was not: charts need no client-id, so the SAME
+# token returned 200 right next to it all day. Because get_ticker treats 401 as
+# "token expired", a permanently-401ing endpoint re-minted on a loop, and Dhan
+# being single-session, each mint invalidated the session everything else was
+# using. And with no mark price, no entry can be sized -- which is why
+# swing-indian had never opened a position since going live 2026-07-27.
+_QUOTE_OK = {"data": {"NSE_EQ": {"1001": {"last_price": 413.36, "volume": 10,
+                                          "ohlc": {"close": 400.0}}}}}
+
+
+def test_quote_sends_the_real_client_id() -> None:
+    http = _FakeHttp({"/v2/marketfeed/quote": [_Resp(_QUOTE_OK)]})
+    d = DhanData(token_manager=DhanTokenManager(static_token="T"),
+                 universe=_UNIVERSE, http=http, client_id="1000000001")
+    d.get_ticker("SWIGGY")
+    assert http.calls[0]["headers"]["client-id"] == "1000000001"
+
+
+def test_quote_refuses_to_run_without_a_client_id() -> None:
+    """Fail by name rather than emit a 401 the caller will misread as an
+    expired token and answer by re-minting forever."""
+    http = _FakeHttp({"/v2/marketfeed/quote": [_Resp(_QUOTE_OK)]})
+    d = DhanData(token_manager=DhanTokenManager(static_token="T"),
+                 universe=_UNIVERSE, http=http)  # no client_id
+    with pytest.raises(RuntimeError, match="client_id is not configured"):
+        d.get_ticker("SWIGGY")
+    assert http.calls == []  # never even asked
+
+
+def test_quote_retry_after_401_keeps_the_client_id() -> None:
+    """The retry path had its own copy of the headers; both were empty."""
+    http = _FakeHttp({"/v2/marketfeed/quote": [_Resp({}, status=401),
+                                               _Resp(_QUOTE_OK)]})
+    d = DhanData(token_manager=DhanTokenManager(static_token="T"),
+                 universe=_UNIVERSE, http=http, client_id="1000000001")
+    d.get_ticker("SWIGGY")
+    assert [c["headers"]["client-id"] for c in http.calls] == [
+        "1000000001", "1000000001"
+    ]

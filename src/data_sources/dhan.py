@@ -91,8 +91,13 @@ class DhanData(MarketData):
         http: httpx.Client | None = None,
         universe_cache_path: Path | None = None,
         request_delay_seconds: float = 0.0,
+        client_id: str | None = None,
     ) -> None:
         self._token = token_manager
+        # Required by /v2/marketfeed/*, which authenticates on access-token AND
+        # client-id. The charts endpoints do not ask for it, which is why this
+        # being absent broke ONE endpoint and left the rest looking healthy.
+        self._client_id = client_id
         self._base = data_base_url.rstrip("/")
         self._http = http or httpx.Client(timeout=30.0)
         self._owns_http = http is None
@@ -141,6 +146,7 @@ class DhanData(MarketData):
             token_manager=token,
             data_base_url=acct.data_base_url,
             request_delay_seconds=request_delay_seconds,
+            client_id=acct.data_client_id,
         )
 
     @property
@@ -493,21 +499,49 @@ class DhanData(MarketData):
                         out.append(self._parse_quote(sym, raw))
         return out
 
+    def _quote_headers(self) -> dict[str, str]:
+        """Auth headers for /v2/marketfeed/*.
+
+        This endpoint authenticates on access-token AND client-id. The
+        client-id was hardcoded to the empty string, so Dhan rejected every
+        call with 401 — **76 of 76 attempts, every one since the code was
+        written; the endpoint had never once succeeded.**
+
+        It looked like a token fault and was not. The charts endpoints do not
+        require client-id, so the SAME token returned 200 thousands of times a
+        day right next to it, which is what made this survive so long: every
+        obvious check on the token said it was fine, because it was.
+
+        The damage: every mark price the bot reads comes through here, and no
+        entry can be sized without one. swing-indian went live 2026-07-27 and
+        was structurally incapable of opening a position from that day —
+        which is the real reason no Dhan order has ever filled. The 401 also
+        drove the token churn: ``get_ticker`` reads a 401 as "token expired",
+        invalidates, and re-mints, so a permanently-401ing endpoint re-minted
+        on a loop (139 successful mints on 2026-08-07 alone) and, Dhan being
+        single-session, each mint invalidated the session the other endpoints
+        were using.
+        """
+        return {
+            "access-token": self._token.token(),
+            "client-id": self._client_id or "",
+            "Content-Type": "application/json",
+        }
+
     def _quote(self, body: dict[str, list[int]]) -> dict[str, Any]:
-        r = self._http.post(
-            f"{self._base}/v2/marketfeed/quote",
-            json=body,
-            headers={"access-token": self._token.token(),
-                     "client-id": "", "Content-Type": "application/json"},
-        )
+        if not self._client_id:
+            # Better a named failure than a 401 the caller will misread as an
+            # expired token and answer by re-minting forever.
+            raise RuntimeError(
+                "Dhan client_id is not configured; /v2/marketfeed/quote "
+                "requires it and will 401 without it. Build DhanData via "
+                "from_settings(), or pass client_id= explicitly."
+            )
+        url = f"{self._base}/v2/marketfeed/quote"
+        r = self._http.post(url, json=body, headers=self._quote_headers())
         if r.status_code == 401:
             self._token.invalidate()
-            r = self._http.post(
-                f"{self._base}/v2/marketfeed/quote",
-                json=body,
-                headers={"access-token": self._token.token(),
-                         "client-id": "", "Content-Type": "application/json"},
-            )
+            r = self._http.post(url, json=body, headers=self._quote_headers())
         r.raise_for_status()
         return r.json().get("data", {})
 
