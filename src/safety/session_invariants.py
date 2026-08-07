@@ -55,6 +55,7 @@ from src.core.models import (
     AuditLog,
     BrokerName,
     OrderStatus,
+    SizingSnapshot,
     Trade,
 )
 from src.order_manager.ownership import bot_owned_quantities
@@ -378,17 +379,28 @@ def check_scan_coverage(
     from a market that simply did not qualify — unless something asserts the
     difference. That is this check.
 
-    Two of the three narrowings are unambiguous and HALT:
-      * ``attempted == 0`` of a non-empty configured list — the universe
-        resolution broke (a bad scrip master empties the F&O filter).
-      * ``evaluated == 0`` of a non-empty attempted list — every fetch failed.
-    There is no benign reading of either. A pinned, git-versioned universe does
-    not legitimately shrink to nothing, so a false positive is close to
-    impossible, which is what earns them the right to halt.
+    Every outcome here is a NOTICE. That is deliberate, and it is the second
+    design this check had — the first one halted, which was wrong:
 
-    The third — nearly everything fetched but unusable — is a NOTICE. It has
-    honest causes (a scan of the previous session's stub bin after a restart
-    genuinely finds no bars) and halting on it would eventually be wrong.
+    **A blind scanner cannot place a bad trade.** It evaluates nothing, so it
+    produces no signals, so it enters nothing. The kill switch blocks
+    risk-INCREASING actions (Decision 024), and a scanner that has gone blind
+    has already stopped increasing risk all by itself. Halting it prevents
+    nothing that is not already prevented. This is precisely the reasoning
+    ``check_bucket_liveness`` states for its own NOTICE, and it applies here
+    for the same reason: the danger of a blind scanner is not that it acts
+    wrongly, it is that it stays SILENT while you believe it is working. The
+    cure for silence is an alert, not a halt.
+
+    And the halt had a real cost. The kill switch only ever clears by hand
+    (``kill_switch.disengage`` has exactly one caller, the dashboard button),
+    so a six-second token blip during the 15:15 bin — which happened on
+    2026-08-07 — would have halted the bucket overnight and skipped the next
+    morning's session until someone noticed and clicked. Trading a two-day
+    silent outage for an unattended overnight stop is not an improvement.
+
+    So: say it loudly, say it repeatedly while it lasts, and leave the bucket
+    running so it resumes the moment the data comes back.
 
     ``coverage is None`` means no scan has been recorded yet in the window;
     that is silence, not blindness, and ``check_bucket_liveness`` already owns
@@ -411,15 +423,15 @@ def check_scan_coverage(
             name,
             bucket_id,
             ok=False,
-            severity=Severity.HALT,
+            severity=Severity.NOTICE,
             message=(
                 f"SCANNER BLIND: {coverage.scanner_id} attempted 0 of "
                 f"{coverage.configured} configured symbols. The universe "
                 f"collapsed before the scan ran — check the Dhan scrip master "
-                f"and the F&O/circuit filters. Entries are halted."
+                f"and the F&O/circuit filters. The bucket is still running, "
+                f"but it is looking at nothing."
             ),
             detail=detail,
-            sustain_ticks=2,
             alert_signature="blind:universe",
         )
 
@@ -428,20 +440,14 @@ def check_scan_coverage(
             name,
             bucket_id,
             ok=False,
-            severity=Severity.HALT,
+            severity=Severity.NOTICE,
             message=(
                 f"SCANNER BLIND: {coverage.scanner_id} evaluated 0 of "
                 f"{coverage.attempted} symbols — every fetch failed. This is "
                 f"NOT a quiet market. Check the Dhan token (a dead token 401s "
-                f"every call). Entries are halted."
+                f"every call). No signal can be found until this clears."
             ),
             detail=detail,
-            # Two ticks, not one. This buys less than it looks like — the sweep
-            # re-reads the SAME audit row every 60s, so the streak climbs
-            # whether or not a second scan has happened. It is a guard against
-            # a torn read, not against a genuinely blind scan, and is honest
-            # about being only that.
-            sustain_ticks=2,
             alert_signature="blind:fetch",
         )
 
@@ -465,6 +471,56 @@ def check_scan_coverage(
         )
 
     return InvariantResult(name, bucket_id, ok=True)
+
+
+def check_signal_delivery(
+    *,
+    bucket_id: str,
+    lost: list[str],
+    window_minutes: int,
+) -> InvariantResult:
+    """A signal the strategy DID produce reached the broker, or you hear why.
+
+    ``scan_coverage`` asserts the bot looked. This asserts that what it saw
+    survived the trip to an order — the gap between them is where 2026-08-07's
+    real trade died. That scan was perfectly healthy: 94 symbols evaluated,
+    BLUESTARCO found at -6.58% dislocation, Kelly approved at Rs 40,000. Then
+    ``/v2/marketfeed/quote`` returned 401 on a dead token, the sizer had no
+    price to turn rupees into shares, and it filed the miss as
+    ``skipped_other`` — the same code it uses for "I decided not to". The
+    signal was retried 38 times over an hour, aged out of its bin, and the
+    only durable trace was a sizing_snapshot row nobody reads.
+
+    NOTICE, for the same reason ``scan_coverage`` is: nothing here is a bad
+    trade to prevent, it is a good trade already lost. A halt cannot recover
+    it and would only stop the NEXT one, which is the opposite of what you
+    want. The alert is the whole product.
+
+    Only counts skips whose reason is the broker-fetch failure. An allocator
+    that declines on dedup, regime or budget is working exactly as designed
+    and must never page anyone.
+    """
+    name = "signal_delivery"
+    if not lost:
+        return InvariantResult(name, bucket_id, ok=True)
+
+    return InvariantResult(
+        name,
+        bucket_id,
+        ok=False,
+        severity=Severity.NOTICE,
+        message=(
+            f"SIGNAL LOST TO DATA: {bucket_id} produced entry signal(s) for "
+            f"{', '.join(sorted(set(lost)))} in the last {window_minutes}m "
+            f"that could NOT be sized — the broker price fetch failed, so "
+            f"there was no way to convert the Kelly notional into a quantity. "
+            f"These are missed trades, not declined ones. Check the Dhan token."
+        ),
+        detail={"lost": sorted(set(lost))},
+        # Keyed on WHICH symbols, so a new lost signal pages even while an
+        # earlier one is still unresolved.
+        alert_signature=",".join(sorted(set(lost))),
+    )
 
 
 def check_foreign_positions(
@@ -524,6 +580,10 @@ class InvariantThresholds:
     scan_lookback_minutes: int = 90
     # Fraction of evaluated symbols that may be unusable before it's a NOTICE.
     scan_unevaluable_ratio: float = 0.9
+    # How far back check_signal_delivery looks for signals lost to a data
+    # failure. Comfortably wider than one swing-indian 1h bin, so a miss stays
+    # visible for the rest of the bin it happened in rather than for one tick.
+    signal_lost_window_minutes: int = 90
 
 
 def count_recent_rejects(
@@ -620,6 +680,30 @@ def coverage_from_payload(
             payload=payload,
         )
         return None
+
+
+def signals_lost_to_data(*, bucket_id: str, since: datetime) -> list[str]:
+    """Symbols this bucket sized-and-dropped on a broker price failure.
+
+    Matches the sizer's canonical reason constant rather than a substring, so
+    the two cannot drift apart silently.
+    """
+    from src.shared.allocator.sizer import PRICE_FETCH_FAILED_REASON
+
+    with session_scope() as session:
+        return list(
+            session.execute(
+                select(SizingSnapshot.symbol)
+                .where(
+                    SizingSnapshot.bucket_id == bucket_id,
+                    SizingSnapshot.ts >= since,
+                    SizingSnapshot.reason == PRICE_FETCH_FAILED_REASON,
+                )
+                .distinct()
+            )
+            .scalars()
+            .all()
+        )
 
 
 def bucket_service(bucket_id: str) -> str:
@@ -744,6 +828,17 @@ def run_session_invariants(
                     ),
                     bucket_id=watch.bucket_id,
                     unevaluable_ratio=thresholds.scan_unevaluable_ratio,
+                )
+            )
+            results.append(
+                check_signal_delivery(
+                    bucket_id=watch.bucket_id,
+                    lost=signals_lost_to_data(
+                        bucket_id=watch.bucket_id,
+                        since=now
+                        - timedelta(minutes=thresholds.signal_lost_window_minutes),
+                    ),
+                    window_minutes=thresholds.signal_lost_window_minutes,
                 )
             )
 

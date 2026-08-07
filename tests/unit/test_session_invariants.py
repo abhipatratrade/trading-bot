@@ -15,6 +15,7 @@ from src.safety.session_invariants import (
     check_notional_ceiling,
     check_reject_rate,
     check_scan_coverage,
+    check_signal_delivery,
     check_squareoff,
     check_stop_coverage,
     effective_holdings,
@@ -706,21 +707,30 @@ def test_scan_coverage_passes_on_a_healthy_scan() -> None:
     assert _scan(_coverage()).ok is True
 
 
-def test_scan_coverage_halts_when_every_fetch_failed() -> None:
+def test_scan_coverage_reports_when_every_fetch_failed() -> None:
     """The outage itself: 94 symbols attempted, 0 evaluated, for two days."""
     res = _scan(_coverage(evaluated=0))
     assert res.ok is False
-    assert res.severity is Severity.HALT
     assert "SCANNER BLIND" in res.message
     assert "not a quiet market" in res.message.lower()
 
 
-def test_scan_coverage_halts_when_the_universe_collapsed() -> None:
+def test_scan_coverage_reports_when_the_universe_collapsed() -> None:
     """A bad scrip master empties the F&O filter before any fetch is tried."""
     res = _scan(_coverage(attempted=0, evaluated=0))
     assert res.ok is False
-    assert res.severity is Severity.HALT
     assert "universe collapsed" in res.message
+
+
+def test_a_blind_scanner_is_never_halted() -> None:
+    """It evaluates nothing, so it enters nothing — halting prevents nothing
+    already prevented, and the kill switch only clears by hand, so a six-second
+    token blip in the 15:15 bin would skip the NEXT morning too."""
+    for cov in (_coverage(evaluated=0), _coverage(attempted=0, evaluated=0)):
+        res = _scan(cov)
+        assert res.ok is False
+        assert res.severity is Severity.NOTICE
+        assert "halt" not in res.message.lower()
 
 
 def test_scan_coverage_only_notices_degraded_data() -> None:
@@ -761,6 +771,46 @@ def test_payload_without_counts_cannot_halt_a_bucket() -> None:
     assert _scan(_from_payload({"universe": []})).ok is True
 
 
+# ── signal_delivery: the 2026-08-07 BLUESTARCO miss ──────────────────────
+def _delivery(lost):
+    return check_signal_delivery(
+        bucket_id="swing-indian", lost=lost, window_minutes=90
+    )
+
+
+def test_signal_delivery_passes_when_nothing_was_lost() -> None:
+    assert _delivery([]).ok is True
+
+
+def test_signal_delivery_reports_a_signal_lost_to_a_data_failure() -> None:
+    """A healthy scan found BLUESTARCO; the quote endpoint 401'd; the sizer had
+    no price to turn Rs 40,000 into shares. scan_coverage cannot see this —
+    the scan was fine. This is the check that can."""
+    res = _delivery(["BLUESTARCO"])
+    assert res.ok is False
+    assert "SIGNAL LOST TO DATA" in res.message
+    assert "BLUESTARCO" in res.message
+    assert res.detail["lost"] == ["BLUESTARCO"]
+
+
+def test_signal_delivery_never_halts() -> None:
+    """The trade is already lost; halting only stops the NEXT one."""
+    assert _delivery(["BLUESTARCO"]).severity is Severity.NOTICE
+
+
+def test_signal_delivery_dedups_repeated_misses_of_one_symbol() -> None:
+    """38 retries of the same signal is one problem, not 38."""
+    res = _delivery(["BLUESTARCO"] * 38)
+    assert res.detail["lost"] == ["BLUESTARCO"]
+    assert res.alert_signature == "BLUESTARCO"
+
+
+def test_signal_delivery_pages_again_when_a_new_symbol_is_lost() -> None:
+    first = _delivery(["BLUESTARCO"])
+    second = _delivery(["BLUESTARCO", "SUZLON"])
+    assert first.alert_signature != second.alert_signature
+
+
 def test_malformed_counts_are_unknown_not_zero() -> None:
     assert _from_payload({"attempted": "lots"}) is None
 
@@ -771,9 +821,36 @@ def test_payload_with_counts_is_read_through() -> None:
     )
     assert cov is not None
     assert cov.evaluated == 0
-    assert _scan(cov).severity is Severity.HALT
+    assert _scan(cov).ok is False
 
 
-def test_blind_scan_halt_requires_more_than_one_tick() -> None:
-    """Cheap insurance against a torn read; see the comment on the check."""
-    assert _scan(_coverage(evaluated=0)).sustain_ticks == 2
+def test_no_scan_coverage_outcome_can_touch_the_kill_switch() -> None:
+    for cov in (
+        _coverage(evaluated=0),
+        _coverage(attempted=0, evaluated=0),
+        _coverage(evaluated=94, unevaluable=93),
+    ):
+        assert _scan(cov).severity is Severity.NOTICE
+
+
+def test_the_two_no_price_reasons_are_distinct() -> None:
+    """The whole check rests on telling a failed fetch from a declined trade.
+
+    If these two ever collapsed to one string, signal_delivery would either
+    page on every ordinary skip or on none of them.
+    """
+    from src.shared.allocator import sizer
+
+    assert sizer.PRICE_FETCH_FAILED_REASON != sizer.NO_MARK_PRICE_REASON
+
+
+def test_signal_delivery_matches_the_sizer_constant_exactly() -> None:
+    """Matched by constant, not substring, so a reword cannot silently disarm
+    the alarm — and an alarm's job is to work when other things have broken."""
+    import inspect
+
+    from src.shared.allocator import sizer
+
+    src = inspect.getsource(si.signals_lost_to_data)
+    assert "PRICE_FETCH_FAILED_REASON" in src
+    assert sizer.NO_MARK_PRICE_REASON not in src

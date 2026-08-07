@@ -69,6 +69,14 @@ _log = get_logger("shared.allocator.sizer")
 # rebalance cadence (one trade per day per symbol).
 _DEDUP_TRADE_WINDOW_HOURS: float = 23.0
 
+# Canonical skip reasons for "we had no price". Constants, not inline strings,
+# because ``safety/session_invariants.py`` MATCHES on the first one to tell a
+# lost trade from a declined one — a reworded literal would silently disarm
+# that alarm, and the alarm's whole purpose is to be the thing that still
+# works when something else has broken.
+PRICE_FETCH_FAILED_REASON = "mark price unavailable - broker fetch failed"
+NO_MARK_PRICE_REASON = "missing or non-positive mark price"
+
 
 def dedup_window_hours_for_tf(tf: str) -> float:
     """Dedup window ≈ one strategy bar, with a 1/24 early-rebalance buffer.
@@ -259,6 +267,7 @@ def size_positions(
     contract_sizes_override: dict[str, Decimal] | None = None,
     fx_inr_per_usd_override: Decimal | None = None,
     committed_margin_inr: Decimal = Decimal("0"),
+    price_fetch_failed: set[str] | None = None,
 ) -> dict[str, SizingResult]:
     """Compute per-symbol sizing for one strategy in one bucket.
 
@@ -472,11 +481,26 @@ def size_positions(
 
         price = mark_prices_inr.get(sym)
         if price is None or price <= 0:
+            # WHY there is no price decides whether a human needs to know.
+            #
+            # A broker call that FAILED is an infrastructure fault: the trade
+            # was valid, the bot simply could not find out what it costs. That
+            # is a lost trade, and it must read differently from every other
+            # skip on this page, all of which are the allocator DECIDING not to
+            # act. Recording both as a bare "missing mark price" is the same
+            # mistake the scanner made before Decision 033 — "could not
+            # evaluate" filed under "did not qualify".
+            #
+            # It is not hypothetical: on 2026-08-07 a live BLUESTARCO signal
+            # (-6.58% dislocation, Kelly approved at Rs 40,000) was dropped 38
+            # times in an hour because /v2/marketfeed/quote was 401ing on a
+            # dead token, and the only trace was `skipped_other`.
+            failed = price_fetch_failed is not None and sym in price_fetch_failed
             results[sym] = SizingResult(
                 symbol=sym,
                 decision=SizingDecision.SKIPPED_OTHER,
                 suggested_notional_inr=suggested_notional,
-                reason="missing or non-positive mark price",
+                reason=PRICE_FETCH_FAILED_REASON if failed else NO_MARK_PRICE_REASON,
             )
             continue
 

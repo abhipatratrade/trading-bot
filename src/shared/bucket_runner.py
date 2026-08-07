@@ -342,7 +342,8 @@ class BucketRunner:
             # strategies are long-only, others long/short).
             sides = {ec.symbol: ec.side for ec in entry_candidates}
             hints = {ec.symbol: ec.hint for ec in entry_candidates}
-            mark_prices = self._collect_mark_prices(symbols)
+            price_fetch_failed: set[str] = set()
+            mark_prices = self._collect_mark_prices(symbols, price_fetch_failed)
 
             # Per-symbol regimes for the sizer (one HMM call per
             # candidate; the brain caches per inference window so
@@ -389,6 +390,9 @@ class BucketRunner:
                 # go first-come-first-served instead of every scanner set
                 # independently claiming the whole bucket.
                 committed_margin_inr=committed_margin,
+                # So a lost trade is recorded as a lost trade, not as a
+                # decision the allocator made.
+                price_fetch_failed=price_fetch_failed,
             )
 
             for sym, res in results.items():
@@ -649,13 +653,24 @@ class BucketRunner:
             )
         return True
 
-    def _collect_mark_prices(self, symbols: list[str]) -> dict[str, Decimal]:
+    def _collect_mark_prices(
+        self, symbols: list[str], failed: set[str] | None = None
+    ) -> dict[str, Decimal]:
+        """Mark price per symbol. Symbols whose FETCH raised land in ``failed``.
+
+        The distinction matters downstream: an absent price and a failed call
+        both leave the symbol out of the dict, but only the second is an
+        infrastructure fault that cost a trade. See the sizer's missing-price
+        branch.
+        """
         out: dict[str, Decimal] = {}
         for s in symbols:
             try:
                 t = self._data.get_ticker(s)
             except Exception:
                 _log.warning("mark_price_fetch_failed", symbol=s, exc_info=True)
+                if failed is not None:
+                    failed.add(s)
                 continue
             price = t.mark_price or t.last_price
             if price and price > 0:
