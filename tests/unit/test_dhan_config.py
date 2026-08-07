@@ -14,10 +14,12 @@ def _settings(**overrides: object) -> Settings:
         # Delta creds required by the model validator even for Dhan tests.
         "delta_testnet_api_key": "k",
         "delta_testnet_api_secret": "s",
-        # Dhan refresh trio + sandbox order creds.
-        "dhan_client_id": "1103267589",
-        "dhan_pin": "990350",
-        "dhan_totp_secret": "JBSWY3DPEHPK3PXP",
+        # Dhan refresh trio + sandbox order creds. NEVER put a real client id,
+        # PIN or TOTP secret here: this repo is PUBLIC. The live pair sat in
+        # this fixture from f03962d until 2026-08-07 and had to be rotated.
+        "dhan_client_id": "1000000001",
+        "dhan_pin": "0000",
+        "dhan_totp_secret": "JBSWY3DPEHPK3PXP",  # RFC-4226 example secret
         "dhan_sandbox_client_id": "SBX123",
         "dhan_sandbox_access_token": "sbx-token",
     }
@@ -32,8 +34,8 @@ def test_testnet_orders_go_to_sandbox() -> None:
     assert acct.order_token == "sbx-token"
     # Data always live, with the TOTP refresh trio.
     assert acct.data_base_url == "https://api.dhan.co"
-    assert acct.data_client_id == "1103267589"
-    assert acct.pin == "990350"
+    assert acct.data_client_id == "1000000001"
+    assert acct.pin == "0000"
     assert acct.totp_secret == "JBSWY3DPEHPK3PXP"
 
 
@@ -44,7 +46,7 @@ def test_live_orders_reuse_live_data_token() -> None:
         delta_live_api_secret="s",
     ).dhan_account()
     assert acct.order_base_url == "https://api.dhan.co"
-    assert acct.order_client_id == "1103267589"
+    assert acct.order_client_id == "1000000001"
     assert acct.order_token is None  # signals "reuse the refreshed data token"
 
 

@@ -697,6 +697,14 @@ def run_meanrev_scan(
                     "date": str(scan_date),
                     "bar_key": key,
                     "universe": chosen_symbols,
+                    # configured → attempted → evaluated, so the scan_coverage
+                    # invariant can tell the three failure modes apart:
+                    # the universe collapsed (attempted 0 of a non-empty
+                    # configured list), every fetch failed (evaluated 0 of a
+                    # non-empty attempted list), or the data was there but
+                    # unusable (unevaluable ≈ evaluated).
+                    "configured": len(cfg.symbols),
+                    "attempted": len(symbols),
                     "evaluated": len(evaluated),
                     "passed": len(signals),
                     "outcomes": dict(by_reason),
@@ -908,8 +916,13 @@ def run_gap_reversal_scan(
                     "bucket_id": bucket_id,
                     "date": str(scan_date),
                     "universe": chosen_symbols,
+                    # See the meanrev payload — same three-stage funnel, read
+                    # by the scan_coverage invariant.
+                    "configured": len(gcfg.symbols),
+                    "attempted": len(symbols),
                     "evaluated": len(evaluated),
                     "passed": len(candidates),
+                    "unevaluable": len(unevaluable),
                 },
             )
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import pytest
@@ -19,6 +20,11 @@ class _Resp:
     def __init__(self, payload: dict, status: int = 200) -> None:
         self._payload = payload
         self.status_code = status
+        # Part of the real httpx.Response contract. The token manager reads it
+        # to recognise Dhan's rate-limit refusal, which arrives as a 200 with
+        # the error in the BODY — so a fake without `text` cannot model the
+        # single most important failure mode this manager handles.
+        self.text = json.dumps(payload)
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -113,7 +119,12 @@ def test_401_triggers_token_invalidate_and_retry() -> None:
     bars = d.get_ohlcv("SWIGGY", "1d")
     assert len(bars) == 1
     assert len(http.calls) == 2       # first 401, then retried
-    assert calls["n"] == 2            # token minted twice (initial + after invalidate)
+    # Still ONE mint. The 401 lands seconds after the initial mint, so Dhan's
+    # 2-minute lockout is running and a re-mint would be refused; the manager
+    # serves the cached token and the retry succeeds on it. That is the
+    # spurious-401 case (a real one would keep 401ing and, after
+    # _MAX_REJECTED_SERVES, raise — see test_dhan_auth.py).
+    assert calls["n"] == 1
 
 
 def test_get_ticker_parses_quote() -> None:

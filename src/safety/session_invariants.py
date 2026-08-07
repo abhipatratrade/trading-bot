@@ -342,6 +342,131 @@ def check_bucket_liveness(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ScanCoverage:
+    """The funnel of one scanner pass, lifted from its SCANNER_RUN payload.
+
+    ``configured`` is the symbol list in git, ``attempted`` what survived the
+    pre-filters (F&O flag, circuit band), ``evaluated`` how many actually got
+    fetched and screened, ``unevaluable`` how many of those produced no usable
+    data. Each narrowing is a distinct failure mode; see ``check_scan_coverage``.
+    """
+
+    bucket_id: str
+    scanner_id: str
+    configured: int
+    attempted: int
+    evaluated: int
+    unevaluable: int
+    ts: datetime
+
+
+def check_scan_coverage(
+    *,
+    coverage: ScanCoverage | None,
+    bucket_id: str,
+    unevaluable_ratio: float,
+) -> InvariantResult:
+    """The scanner actually LOOKED at the symbols it was configured to look at.
+
+    Every other invariant here watches positions. This one watches perception,
+    because on 2026-08-04/05 a dead Dhan token made both Indian buckets fetch
+    nothing for two full trading days while every layer reported a quiet
+    market: the audit log said ``0/0 crossed of 0 evaluated`` and the EOD
+    journal said "Scanners ran 11 pass(es); nothing qualified." A scanner that
+    is structurally incapable of firing is indistinguishable, from the outside,
+    from a market that simply did not qualify — unless something asserts the
+    difference. That is this check.
+
+    Two of the three narrowings are unambiguous and HALT:
+      * ``attempted == 0`` of a non-empty configured list — the universe
+        resolution broke (a bad scrip master empties the F&O filter).
+      * ``evaluated == 0`` of a non-empty attempted list — every fetch failed.
+    There is no benign reading of either. A pinned, git-versioned universe does
+    not legitimately shrink to nothing, so a false positive is close to
+    impossible, which is what earns them the right to halt.
+
+    The third — nearly everything fetched but unusable — is a NOTICE. It has
+    honest causes (a scan of the previous session's stub bin after a restart
+    genuinely finds no bars) and halting on it would eventually be wrong.
+
+    ``coverage is None`` means no scan has been recorded yet in the window;
+    that is silence, not blindness, and ``check_bucket_liveness`` already owns
+    it. Returning OK here keeps the two checks from double-reporting one fault.
+    """
+    name = "scan_coverage"
+    if coverage is None:
+        return InvariantResult(name, bucket_id, ok=True)
+
+    detail = {
+        "scanner": coverage.scanner_id,
+        "configured": coverage.configured,
+        "attempted": coverage.attempted,
+        "evaluated": coverage.evaluated,
+        "unevaluable": coverage.unevaluable,
+    }
+
+    if coverage.configured > 0 and coverage.attempted == 0:
+        return InvariantResult(
+            name,
+            bucket_id,
+            ok=False,
+            severity=Severity.HALT,
+            message=(
+                f"SCANNER BLIND: {coverage.scanner_id} attempted 0 of "
+                f"{coverage.configured} configured symbols. The universe "
+                f"collapsed before the scan ran — check the Dhan scrip master "
+                f"and the F&O/circuit filters. Entries are halted."
+            ),
+            detail=detail,
+            sustain_ticks=2,
+            alert_signature="blind:universe",
+        )
+
+    if coverage.attempted > 0 and coverage.evaluated == 0:
+        return InvariantResult(
+            name,
+            bucket_id,
+            ok=False,
+            severity=Severity.HALT,
+            message=(
+                f"SCANNER BLIND: {coverage.scanner_id} evaluated 0 of "
+                f"{coverage.attempted} symbols — every fetch failed. This is "
+                f"NOT a quiet market. Check the Dhan token (a dead token 401s "
+                f"every call). Entries are halted."
+            ),
+            detail=detail,
+            # Two ticks, not one. This buys less than it looks like — the sweep
+            # re-reads the SAME audit row every 60s, so the streak climbs
+            # whether or not a second scan has happened. It is a guard against
+            # a torn read, not against a genuinely blind scan, and is honest
+            # about being only that.
+            sustain_ticks=2,
+            alert_signature="blind:fetch",
+        )
+
+    if (
+        coverage.evaluated > 0
+        and coverage.unevaluable / coverage.evaluated >= unevaluable_ratio
+    ):
+        pct = 100.0 * coverage.unevaluable / coverage.evaluated
+        return InvariantResult(
+            name,
+            bucket_id,
+            ok=False,
+            severity=Severity.NOTICE,
+            message=(
+                f"SCANNER DEGRADED: {coverage.scanner_id} could not use data "
+                f"for {coverage.unevaluable}/{coverage.evaluated} symbols "
+                f"({pct:.0f}%). Signals from this pass are not trustworthy."
+            ),
+            detail=detail,
+            alert_signature="degraded",
+        )
+
+    return InvariantResult(name, bucket_id, ok=True)
+
+
 def check_foreign_positions(
     *,
     account_ref: str,
@@ -393,6 +518,12 @@ class InvariantThresholds:
     reject_window_minutes: int = 15
     reject_max: int = 3
     bucket_stale_multiple: float = 3.0
+    # How far back to look for the scan being asserted on. Wide enough to span
+    # swing-indian's hourly bins, so the check keeps holding between them
+    # rather than going quiet for 55 minutes of every hour.
+    scan_lookback_minutes: int = 90
+    # Fraction of evaluated symbols that may be unusable before it's a NOTICE.
+    scan_unevaluable_ratio: float = 0.9
 
 
 def count_recent_rejects(
@@ -415,6 +546,80 @@ def count_recent_rejects(
             .scalars()
             .all()
         )
+
+
+def last_scan_coverage(*, bucket_id: str, since: datetime) -> ScanCoverage | None:
+    """Funnel of the most recent SCANNER_RUN for one bucket, or None.
+
+    A bucket can own several named scanner sets (Decision 026), whose audit
+    rows are namespaced ``<bucket>:<name>`` — intraday-indian runs both
+    ``intraday-indian`` and ``intraday-indian:broad``. Matching the bare id
+    alone would silently exempt every named set from the check, so the prefix
+    is matched too.
+
+    Rows written before this payload existed carry no ``attempted``; they are
+    reported as None rather than guessed at, so an old row cannot manufacture a
+    halt from data it never recorded.
+    """
+    with session_scope() as session:
+        row = session.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.event_type == AuditEventType.SCANNER_RUN,
+                AuditLog.ts >= since,
+                (AuditLog.strategy_id == bucket_id)
+                | (AuditLog.strategy_id.startswith(f"{bucket_id}:")),
+            )
+            .order_by(AuditLog.ts.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return coverage_from_payload(
+            bucket_id=bucket_id,
+            scanner_id=row.strategy_id or bucket_id,
+            payload=row.payload,
+            ts=row.ts,
+        )
+
+
+def coverage_from_payload(
+    *,
+    bucket_id: str,
+    scanner_id: str,
+    payload: dict | None,
+    ts: datetime,
+) -> ScanCoverage | None:
+    """SCANNER_RUN payload → ScanCoverage, or None if it cannot be judged. PURE.
+
+    Returning None for a payload without ``attempted`` is a SAFETY property,
+    not a convenience: this check can halt a live bucket, and the only evidence
+    it halts on is these counts. Scanner paths that never record them — the
+    crypto ``run_scan`` engine, and every row written before 2026-08-07 —
+    would otherwise default to zero and read as "looked at nothing", halting
+    buckets that are working perfectly. Absent must mean unknown.
+    """
+    payload = payload or {}
+    if "attempted" not in payload:
+        return None
+    try:
+        return ScanCoverage(
+            bucket_id=bucket_id,
+            scanner_id=scanner_id,
+            configured=int(payload.get("configured", 0)),
+            attempted=int(payload["attempted"]),
+            evaluated=int(payload.get("evaluated", 0)),
+            unevaluable=int(payload.get("unevaluable", 0)),
+            ts=ts,
+        )
+    except (TypeError, ValueError):
+        # A malformed count is unknown, not zero — same reasoning as above.
+        _log.warning(
+            "scan_coverage_payload_unparseable",
+            scanner_id=scanner_id,
+            payload=payload,
+        )
+        return None
 
 
 def bucket_service(bucket_id: str) -> str:
@@ -524,6 +729,21 @@ def run_session_invariants(
                     beat_at=last_beat(bucket_service(watch.bucket_id)),
                     now=now,
                     stale_multiple=thresholds.bucket_stale_multiple,
+                )
+            )
+            # Gated on check_liveness for the same reason: outside an open
+            # session a bucket is correctly not scanning, and asserting on
+            # perception when nothing is meant to be perceived would halt every
+            # bucket overnight.
+            results.append(
+                check_scan_coverage(
+                    coverage=last_scan_coverage(
+                        bucket_id=watch.bucket_id,
+                        since=now
+                        - timedelta(minutes=thresholds.scan_lookback_minutes),
+                    ),
+                    bucket_id=watch.bucket_id,
+                    unevaluable_ratio=thresholds.scan_unevaluable_ratio,
                 )
             )
 

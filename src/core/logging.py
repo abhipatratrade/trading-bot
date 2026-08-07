@@ -33,14 +33,47 @@ from structlog.types import EventDict, Processor
 
 from src.core.config import LogFormat, get_settings
 
-# Patterns that should never appear in logs. Order matters — most-specific first.
-_REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+# Query-string parameters whose VALUE is a credential. Matched by NAME, because
+# these secrets have no distinguishing shape: the Dhan login PIN and a TOTP code
+# are both six digits, and any value-shaped rule wide enough to catch them would
+# also redact quantities, prices and security ids.
+#
+# This is the gap that leaked the live Dhan PIN. Every rule below this comment
+# block is shape-based, so
+#   POST https://auth.dhan.co/app/generateAccessToken?dhanClientId=…&pin=…&totp=…
+# passed all of them untouched and httpx wrote it to the journal at INFO on
+# EVERY mint attempt — ~3,800 times a day during the 2026-08-04/05 token
+# outage. Found 2026-08-07; the PIN was rotated.
+_SECRET_QUERY_KEYS = (
+    "pin",
+    "totp",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "access_token",
+    "accesstoken",
+    "api_key",
+    "apikey",
+    "auth",
+)
+
+# (pattern, replacement) — a per-pattern replacement so a named rule can keep
+# the key and scrub only the value, which leaves the log line readable.
+_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Sensitive query params, in a URL or a stringified dict/params mapping.
+    (
+        re.compile(
+            r"(?i)\b(" + "|".join(_SECRET_QUERY_KEYS) + r")=[^&\s\"'>)}\],]+"
+        ),
+        r"\1=***REDACTED***",
+    ),
     # Pydantic SecretStr repr — defence in depth
-    re.compile(r"SecretStr\('?\*+'?\)"),
+    (re.compile(r"SecretStr\('?\*+'?\)"), "***REDACTED***"),
     # Hex strings ≥ 32 chars (HMAC, hashes)
-    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
+    (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "***REDACTED***"),
     # Base64-looking blobs ≥ 40 chars (API tokens, JWTs)
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), "***REDACTED***"),
     # Telegram bot tokens look like "<digits>:<35+ chars>".
     # NO leading \b on purpose: these appear in URLs as ".../bot<token>", and
     # "bot1234..." has no word boundary between the 't' and the digits, so an
@@ -48,7 +81,7 @@ _REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 2026-07-21 — the token only got scrubbed by luck, because the base64 rule
     # below caught "<secret>/sendMessage" once the path pushed it past 40
     # chars; a short path like /getMe, or no path, leaked in full.
-    re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}"),
+    (re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}"), "***REDACTED***"),
 )
 
 # Field names whose values are always redacted regardless of content.
@@ -63,14 +96,17 @@ _REDACT_KEYS: frozenset[str] = frozenset(
         "token",
         "access_token",
         "bot_token",
+        "pin",
+        "totp",
+        "totp_secret",
     }
 )
 
 
 def _redact_text(text: str) -> str:
     redacted = text
-    for pattern in _REDACT_PATTERNS:
-        redacted = pattern.sub("***REDACTED***", redacted)
+    for pattern, replacement in _REDACT_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
     return redacted
 
 

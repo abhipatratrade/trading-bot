@@ -151,11 +151,35 @@ class EdgeStats:
 
 @dataclass(frozen=True, slots=True)
 class ScanLine:
-    """One scanner pass — proof the bot looked, and what it saw."""
+    """One scanner pass — proof the bot looked, and what it saw.
+
+    The funnel counts matter as much as the message. Counting PASSES alone is
+    what let 2026-08-04/05 render as "Scanners ran 11 pass(es); nothing
+    qualified" while a dead Dhan token meant every one of those passes fetched
+    nothing at all. A pass is evidence the loop ran; only ``evaluated`` is
+    evidence the bot actually looked at a market.
+
+    ``configured``/``attempted`` are absent on rows written before the scanners
+    recorded them, and are None there rather than 0 — "not recorded" must not
+    render as "looked at nothing".
+    """
 
     at: datetime
     strategy_id: str
     message: str
+    configured: int | None = None
+    attempted: int | None = None
+    evaluated: int | None = None
+    unevaluable: int | None = None
+
+    @property
+    def blind(self) -> bool:
+        """This pass looked at nothing, with a non-empty list to look at."""
+        if self.attempted is None:
+            return False
+        if self.configured and self.attempted == 0:
+            return True
+        return self.attempted > 0 and self.evaluated == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +206,25 @@ class Report:
     @property
     def fees(self) -> Decimal:
         return sum((b.fees for b in self.buckets), _ZERO)
+
+    @property
+    def symbols_evaluated(self) -> int:
+        """Symbols actually fetched and screened across every pass today."""
+        return sum(s.evaluated or 0 for s in self.scans)
+
+    @property
+    def blind_scans(self) -> list[ScanLine]:
+        """Passes that looked at nothing despite having a universe to look at."""
+        return [s for s in self.scans if s.blind]
+
+    @property
+    def saw_a_market(self) -> bool:
+        """Did the bot look at ANY symbol today?
+
+        The precondition for calling a day "quiet". False both when no pass ran
+        and when passes ran but every one of them was blind.
+        """
+        return bool(self.scans) and self.symbols_evaluated > 0
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +396,16 @@ def build_edge(
     )
 
 
+def _scan_count(payload: dict | None, key: str) -> int | None:
+    """One funnel count from a SCANNER_RUN payload, or None if not recorded."""
+    if not payload or key not in payload:
+        return None
+    try:
+        return int(payload[key])
+    except (TypeError, ValueError):
+        return None
+
+
 def build_scans(rows: list[AuditLog]) -> list[ScanLine]:
     """SCANNER_RUN rows → display lines, oldest first. PURE."""
     return [
@@ -360,6 +413,10 @@ def build_scans(rows: list[AuditLog]) -> list[ScanLine]:
             at=r.ts,
             strategy_id=r.strategy_id or "—",
             message=r.message,
+            configured=_scan_count(r.payload, "configured"),
+            attempted=_scan_count(r.payload, "attempted"),
+            evaluated=_scan_count(r.payload, "evaluated"),
+            unevaluable=_scan_count(r.payload, "unevaluable"),
         )
         for r in rows
     ]
@@ -434,19 +491,31 @@ def render_digest(report: Report) -> str:
         if report.foreign
         else None
     )
-    scan_note = (
-        f"Scanners ran {len(report.scans)} pass(es); nothing qualified."
-        if report.scans
-        else "NO SCANNER PASS RECORDED — check the bot is alive."
-    )
+    if not report.scans:
+        scan_note = "NO SCANNER PASS RECORDED — check the bot is alive."
+    elif report.blind_scans:
+        # The 2026-08-04/05 line. Say the passes ran AND that they saw nothing,
+        # because the two together are the alarm; either alone reads as normal.
+        scan_note = (
+            f"SCANNERS BLIND: {len(report.blind_scans)} of {len(report.scans)} "
+            f"pass(es) evaluated NO symbols — this is a data/token failure, "
+            f"not a quiet market. Check the Dhan token."
+        )
+    else:
+        evaluated = report.symbols_evaluated
+        seen = f"{evaluated:,} symbol-checks" if evaluated else "no symbols"
+        scan_note = (
+            f"Scanners ran {len(report.scans)} pass(es) over {seen}; "
+            f"nothing qualified."
+        )
     if report.quiet:
         # "Quiet" is a statement about the BOT, and it is only earned when the
-        # scanners actually ran: a genuinely quiet day and a dead bot both
-        # trade nothing. With no scan on record we report the facts and drop
-        # the reassuring label rather than assert something unevidenced.
+        # scanners actually LOOKED — not merely when the loop ticked. A
+        # genuinely quiet day, a dead bot, and a live bot with a dead data
+        # token all trade nothing; only the first deserves the reassuring word.
         verdict = (
             "No trades, nothing tripped — quiet day."
-            if report.scans
+            if report.saw_a_market
             else "No trades, nothing tripped."
         )
         lines = [head, verdict, scan_note]
@@ -543,6 +612,16 @@ def _ratio(value: Decimal | None) -> str:
     return "—" if value is None else f"{value:.2f}"
 
 
+def _count(value: int | None) -> str:
+    """A funnel count, or an em-dash when the scan predates recording it.
+
+    Deliberately not "0": a pass that never recorded how many symbols it
+    attempted is not a pass that attempted none, and rendering the two the same
+    way is the confusion this whole section exists to remove.
+    """
+    return "—" if value is None else f"{value:,}"
+
+
 def _edge_block(report: Report) -> list[str]:
     """Live edge vs the backtest that justified running the strategy.
 
@@ -611,16 +690,31 @@ def _scan_block(report: Report) -> list[str]:
     out = [
         "## What the scanners saw",
         "",
-        f"{len(report.scans)} scanner pass(es) completed. Each line is the "
+        f"{len(report.scans)} scanner pass(es) completed over "
+        f"{report.symbols_evaluated:,} symbol-check(s). Each line is the "
         f"universe the bot actually evaluated and what came back — the "
         f"evidence behind a no-signal day.",
         "",
-        "| time | strategy | result |",
-        "|---|---|---|",
+    ]
+    if report.blind_scans:
+        out += [
+            f"> **{len(report.blind_scans)} of these passes evaluated NO "
+            f"symbols.** A pass that fetched nothing cannot have found "
+            f"anything, so those rows are not evidence of a quiet market — "
+            f"they are evidence of a data or token failure. This is the "
+            f"2026-08-04/05 failure mode.",
+            "",
+        ]
+    out += [
+        "| time | strategy | attempted | evaluated | unusable | result |",
+        "|---|---|---|---|---|---|",
     ]
     for s in report.scans:
+        flag = " ⚠" if s.blind else ""
         out.append(
-            f"| {s.at.astimezone(IST):%H:%M} | {s.strategy_id} | {s.message} |"
+            f"| {s.at.astimezone(IST):%H:%M} | {s.strategy_id} | "
+            f"{_count(s.attempted)} | {_count(s.evaluated)}{flag} | "
+            f"{_count(s.unevaluable)} | {s.message} |"
         )
     out.append("")
     return out

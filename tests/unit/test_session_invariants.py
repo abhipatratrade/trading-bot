@@ -14,6 +14,7 @@ from src.safety.session_invariants import (
     check_foreign_positions,
     check_notional_ceiling,
     check_reject_rate,
+    check_scan_coverage,
     check_squareoff,
     check_stop_coverage,
     effective_holdings,
@@ -678,3 +679,101 @@ def test_audit_write_failure_never_breaks_the_safety_loop(monkeypatch) -> None:
     halted = enforce_session_invariants([_violation("squareoff", Severity.HALT)])
     assert halted  # the halt still happened
     assert rec.engaged == ["intraday-indian"]
+
+
+# ── scan_coverage: the 2026-08-04/05 blind-scanner invariant ─────────────
+def _coverage(**kw) -> si.ScanCoverage:
+    base = {
+        "bucket_id": "swing-indian",
+        "scanner_id": "swing-indian",
+        "configured": 94,
+        "attempted": 94,
+        "evaluated": 94,
+        "unevaluable": 0,
+        "ts": datetime(2026, 8, 6, 14, 46, tzinfo=IST),
+    }
+    base.update(kw)
+    return si.ScanCoverage(**base)  # type: ignore[arg-type]
+
+
+def _scan(coverage, ratio: float = 0.9):
+    return check_scan_coverage(
+        coverage=coverage, bucket_id="swing-indian", unevaluable_ratio=ratio
+    )
+
+
+def test_scan_coverage_passes_on_a_healthy_scan() -> None:
+    assert _scan(_coverage()).ok is True
+
+
+def test_scan_coverage_halts_when_every_fetch_failed() -> None:
+    """The outage itself: 94 symbols attempted, 0 evaluated, for two days."""
+    res = _scan(_coverage(evaluated=0))
+    assert res.ok is False
+    assert res.severity is Severity.HALT
+    assert "SCANNER BLIND" in res.message
+    assert "not a quiet market" in res.message.lower()
+
+
+def test_scan_coverage_halts_when_the_universe_collapsed() -> None:
+    """A bad scrip master empties the F&O filter before any fetch is tried."""
+    res = _scan(_coverage(attempted=0, evaluated=0))
+    assert res.ok is False
+    assert res.severity is Severity.HALT
+    assert "universe collapsed" in res.message
+
+
+def test_scan_coverage_only_notices_degraded_data() -> None:
+    """Nearly-all-unusable has honest causes (a stub bin after a restart), so
+    it must page without halting — a wrongful halt costs a trading day."""
+    res = _scan(_coverage(evaluated=94, unevaluable=93))
+    assert res.ok is False
+    assert res.severity is Severity.NOTICE
+    assert "DEGRADED" in res.message
+
+
+def test_scan_coverage_is_silent_when_no_scan_was_recorded() -> None:
+    """Silence is bucket_liveness's job. Double-reporting one fault as two
+    invariants would make the Telegram digest lie about how much is wrong."""
+    assert _scan(None).ok is True
+
+
+def test_scan_coverage_ignores_an_empty_configured_universe() -> None:
+    """A scanner set with no symbols configured is disabled, not blind."""
+    assert _scan(_coverage(configured=0, attempted=0, evaluated=0)).ok is True
+
+
+# ── coverage_from_payload: "absent" must never mean "looked at nothing" ──
+def _from_payload(payload):
+    return si.coverage_from_payload(
+        bucket_id="swing-indian",
+        scanner_id="swing-indian",
+        payload=payload,
+        ts=datetime(2026, 8, 6, 14, 46, tzinfo=IST),
+    )
+
+
+def test_payload_without_counts_cannot_halt_a_bucket() -> None:
+    """The crypto run_scan engine and every pre-2026-08-07 row record no
+    funnel. Defaulting those to 0 would halt buckets that are working."""
+    assert _from_payload({"bucket_id": "x", "universe": []}) is None
+    assert _from_payload(None) is None
+    assert _scan(_from_payload({"universe": []})).ok is True
+
+
+def test_malformed_counts_are_unknown_not_zero() -> None:
+    assert _from_payload({"attempted": "lots"}) is None
+
+
+def test_payload_with_counts_is_read_through() -> None:
+    cov = _from_payload(
+        {"configured": 94, "attempted": 94, "evaluated": 0, "unevaluable": 0}
+    )
+    assert cov is not None
+    assert cov.evaluated == 0
+    assert _scan(cov).severity is Severity.HALT
+
+
+def test_blind_scan_halt_requires_more_than_one_tick() -> None:
+    """Cheap insurance against a torn read; see the comment on the check."""
+    assert _scan(_coverage(evaluated=0)).sustain_ticks == 2

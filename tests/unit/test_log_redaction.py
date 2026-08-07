@@ -110,3 +110,66 @@ def test_ordinary_colon_text_is_not_over_redacted() -> None:
         "bucket_id=intraday-indian symbol=RELIANCE qty=100",
     ):
         assert _redact_text(benign) == benign, benign
+
+
+# ── 2026-08-07: the Dhan mint URL leaked the login PIN ───────────────────
+# Every rule was SHAPE-based (hex ≥32, base64 ≥40, "digits:35-chars"). A 6-digit
+# PIN and a 6-digit TOTP match none of them, and no value-shaped rule could
+# safely catch them without also redacting quantities and security ids. So
+# httpx wrote the live PIN to the journal on every mint attempt — ~3,800 times
+# a day during the 2026-08-04/05 token outage. The fix matches by param NAME.
+_MINT_URL = (
+    "https://auth.dhan.co/app/generateAccessToken"
+    "?dhanClientId=1000000001&pin=990350&totp=216423"
+)
+
+
+def test_dhan_mint_url_does_not_leak_pin_or_totp() -> None:
+    out = _redact_text(_MINT_URL)
+    assert "990350" not in out
+    assert "216423" not in out
+    # The client id is not a secret, and keeping it makes the line diagnosable.
+    assert "dhanClientId=1000000001" in out
+    # Redacted by NAME, so the line still says what was scrubbed.
+    assert "pin=***REDACTED***" in out
+    assert "totp=***REDACTED***" in out
+
+
+def test_dhan_mint_url_is_redacted_through_the_stdlib_filter() -> None:
+    """The path that actually leaked: httpx passes the URL as a %s arg."""
+    record = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="HTTP Request: %s %s",
+        args=("POST", _MINT_URL),
+        exc_info=None,
+    )
+    out = _apply(record)
+    assert "990350" not in out
+    assert "216423" not in out
+
+
+def test_query_redaction_stops_at_the_parameter_boundary() -> None:
+    """Scrub the value, not the rest of the URL — an over-eager rule that ate
+    the whole query string would make every request log useless."""
+    out = _redact_text("https://x.test/a?pin=1234&symbol=SUZLON&qty=5")
+    assert "symbol=SUZLON" in out
+    assert "qty=5" in out
+    assert "pin=1234" not in out
+
+
+def test_secret_field_names_are_redacted_in_structlog_events() -> None:
+    event = _redact_processor(None, "info", {"event": "mint", "pin": "990350",
+                                             "totp": "216423", "symbol": "TCS"})
+    assert event["pin"] == "***REDACTED***"
+    assert event["totp"] == "***REDACTED***"
+    assert event["symbol"] == "TCS"
+
+
+def test_ordinary_numbers_are_not_redacted() -> None:
+    """The PIN is six digits; so are prices, quantities and security ids. The
+    rule must key on the NAME, never the shape, or it would scrub the logs."""
+    out = _redact_text("filled 990350 units of 216423 at 1234")
+    assert out == "filled 990350 units of 216423 at 1234"

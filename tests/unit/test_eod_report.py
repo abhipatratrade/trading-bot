@@ -107,11 +107,32 @@ class _Scan:
         self,
         message: str = "gap-reversal scan: 0/99 gapped down, top-5",
         strategy_id: str = "intraday-indian",
+        *,
+        configured: int | None = 99,
+        attempted: int | None = 99,
+        evaluated: int | None = 99,
+        unevaluable: int | None = 0,
+        payload: dict | None = None,
     ) -> None:
         self.event_type = AuditEventType.SCANNER_RUN
         self.strategy_id = strategy_id
         self.message = message
         self.ts = datetime(2026, 7, 28, 9, 31, tzinfo=IST)
+        # Defaults describe a HEALTHY pass: 99 symbols configured, attempted
+        # and evaluated. Pass evaluated=0 to model the 2026-08-04/05 blind
+        # scan, or payload={} for a row written before these were recorded.
+        if payload is None:
+            payload = {
+                k: v
+                for k, v in (
+                    ("configured", configured),
+                    ("attempted", attempted),
+                    ("evaluated", evaluated),
+                    ("unevaluable", unevaluable),
+                )
+                if v is not None
+            }
+        self.payload = payload
 
 
 class _Audit:
@@ -564,6 +585,55 @@ def test_a_quiet_day_still_shows_what_the_scanners_saw() -> None:
 def test_digest_reports_the_scan_count_on_a_quiet_day() -> None:
     text = render_digest(_report(scans=[_Scan(), _Scan()]))
     assert "Scanners ran 2 pass(es)" in text
+
+
+def test_digest_reports_symbols_evaluated_not_just_passes() -> None:
+    """A pass count alone cannot tell "looked and found nothing" from "blind"."""
+    text = render_digest(_report(scans=[_Scan(), _Scan()]))
+    assert "198 symbol-checks" in text
+
+
+# ── The 2026-08-04/05 blind-scanner failure mode ─────────────────────────
+def test_blind_scans_are_not_reported_as_a_quiet_day() -> None:
+    """The exact digest that lied for two days.
+
+    On 04/05 Aug 2026 a dead Dhan token meant every fetch 401'd, so each pass
+    evaluated 0 symbols. The report counted PASSES and said "Scanners ran 11
+    pass(es); nothing qualified." — indistinguishable from a real quiet day.
+    """
+    blind = [_Scan(attempted=99, evaluated=0), _Scan(attempted=99, evaluated=0)]
+    text = render_digest(_report(scans=blind))
+    assert "SCANNERS BLIND" in text
+    assert "2 of 2 pass(es) evaluated NO symbols" in text
+    # And it must NOT award the reassuring label.
+    assert "quiet day" not in text
+
+
+def test_a_collapsed_universe_also_counts_as_blind() -> None:
+    """Nothing ATTEMPTED is as blind as nothing evaluated, and can happen alone
+    — a bad scrip master empties the F&O filter before any fetch is tried."""
+    text = render_digest(_report(scans=[_Scan(configured=94, attempted=0, evaluated=0)]))
+    assert "SCANNERS BLIND" in text
+
+
+def test_a_real_quiet_day_still_reads_as_quiet() -> None:
+    """The guard must not cry wolf on the system's most common true state."""
+    text = render_digest(_report(scans=[_Scan(), _Scan()]))
+    assert "quiet day" in text
+    assert "SCANNERS BLIND" not in text
+
+
+def test_scans_without_recorded_counts_do_not_read_as_blind() -> None:
+    """Rows written before the funnel existed recorded nothing, which is not
+    the same as having looked at nothing — they must not manufacture an alarm."""
+    text = render_digest(_report(scans=[_Scan(payload={})]))
+    assert "SCANNERS BLIND" not in text
+
+
+def test_scan_block_flags_the_blind_passes() -> None:
+    md = render_markdown(_report(scans=[_Scan(attempted=99, evaluated=0)]))
+    assert "evaluated NO symbols" in md
+    assert "| attempted | evaluated |" in md
 
 
 def test_digest_shouts_when_no_scanner_pass_was_recorded() -> None:

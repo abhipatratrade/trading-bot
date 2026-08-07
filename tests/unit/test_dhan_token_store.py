@@ -43,7 +43,7 @@ class _FakeSession:
 def test_load_returns_row_token(monkeypatch) -> None:
     session = _FakeSession(load_value="TOKEN-XYZ")
     monkeypatch.setattr(ts, "get_session_factory", lambda: (lambda: session))
-    store = PostgresTokenStore("1103267589", minted_by="bot")
+    store = PostgresTokenStore("1000000001", minted_by="bot")
     assert store.load() == "TOKEN-XYZ"
 
 

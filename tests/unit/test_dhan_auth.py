@@ -23,9 +23,14 @@ def _fake_jwt(exp: int) -> str:
 
 
 class _FakeResp:
-    def __init__(self, payload: dict[str, object]) -> None:
+    # status_code is part of the real httpx.Response contract and the manager
+    # reads it to spot a 429. A fake missing it does not just fail — it fails
+    # as a generic exception inside the retry loop, which is indistinguishable
+    # from a network error.
+    def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
         self._payload = payload
         self.text = json.dumps(payload)
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:  # pragma: no cover - always ok here
         pass
@@ -34,16 +39,32 @@ class _FakeResp:
         return self._payload
 
 
-class _FakeHttp:
-    """Records POSTs and returns a queued access token."""
+# Dhan's real refusal when the 2-minute mint cooldown is still running: an
+# ordinary 200 whose body carries the error. Verified against the live journal
+# during the 2026-08-04/05 outage.
+_RATE_LIMIT_BODY: dict[str, object] = {
+    "message": "Token can be generated once every 2 minutes.",
+    "status": "error",
+}
 
-    def __init__(self, tokens: list[str]) -> None:
+
+class _FakeHttp:
+    """Records POSTs and returns a queued access token.
+
+    An entry of ``None`` in ``tokens`` yields Dhan's rate-limit refusal instead
+    of a token, so a test can reproduce the cooldown without a real endpoint.
+    """
+
+    def __init__(self, tokens: list[str | None]) -> None:
         self._tokens = list(tokens)
         self.calls: list[dict[str, object]] = []
 
     def post(self, url: str, params: dict[str, object] | None = None) -> _FakeResp:
         self.calls.append({"url": url, "params": params})
-        return _FakeResp({"accessToken": self._tokens.pop(0)})
+        tok = self._tokens.pop(0)
+        if tok is None:
+            return _FakeResp(_RATE_LIMIT_BODY)
+        return _FakeResp({"accessToken": tok})
 
 
 # ── jwt_exp ─────────────────────────────────────────────────────────────
@@ -85,7 +106,7 @@ def test_refresh_mints_and_caches_token() -> None:
     fresh = _fake_jwt(int(now[0]) + 86400)
     http = _FakeHttp(tokens=[fresh])
     mgr = DhanTokenManager(
-        client_id="1103267589", pin="0000", totp_secret=_TOTP_SECRET,
+        client_id="1000000001", pin="0000", totp_secret=_TOTP_SECRET,
         http=http, clock=lambda: now[0],
     )
     assert mgr.can_refresh is True
@@ -93,7 +114,7 @@ def test_refresh_mints_and_caches_token() -> None:
     # cached — a second call within validity does not refresh again
     assert mgr.token() == fresh
     assert len(http.calls) == 1
-    assert http.calls[0]["params"]["dhanClientId"] == "1103267589"
+    assert http.calls[0]["params"]["dhanClientId"] == "1000000001"
     assert len(str(http.calls[0]["params"]["totp"])) == 6
 
 
@@ -123,6 +144,10 @@ def test_invalidate_forces_refresh() -> None:
     )
     assert mgr.token() == first
     mgr.invalidate()
+    # Past the mint cooldown, so a re-mint is actually possible. Without
+    # advancing the clock Dhan would refuse (see the cooldown tests below) and
+    # the manager correctly declines to ask.
+    now[0] += _MINT_COOLDOWN_SECONDS + 1
     assert mgr.token() == second
     assert len(http.calls) == 2
 
@@ -143,7 +168,10 @@ import time as _time_mod  # noqa: E402
 
 import httpx  # noqa: E402
 
-from src.brokers.dhan.auth import _REFRESH_ATTEMPTS  # noqa: E402
+from src.brokers.dhan.auth import (  # noqa: E402
+    _MAX_REJECTED_SERVES,
+    _MINT_COOLDOWN_SECONDS,
+)
 
 
 class _FlakyHttp:
@@ -213,7 +241,117 @@ def test_transient_failure_falls_back_to_cached_token(monkeypatch) -> None:
     mgr.invalidate()
     # Must NOT raise — the cached token is still valid, so serve it.
     assert mgr.token() == good
-    assert http.calls == 1 + _REFRESH_ATTEMPTS  # initial + the failed retries
+    # And it must not have ASKED. The mint we just made started Dhan's 2-minute
+    # lockout, so every retry would be refused, and each refusal re-arms the
+    # window — that feedback loop is what kept the bot locked out for two days
+    # on 2026-08-04/05. Not asking is the fix, so the count stays at the
+    # initial mint rather than the 1 + _REFRESH_ATTEMPTS the old code burned.
+    assert http.calls == 1
+
+
+# ── The 2026-08-04/05 outage: rate limit, cooldown, dead-token escape ────
+def test_rate_limit_reply_is_recognised_despite_http_200(monkeypatch) -> None:
+    """Dhan refuses with a 200 whose BODY carries the error.
+
+    raise_for_status() passes it, so before this the refusal was indistinguish-
+    able from any other empty response and got retried straight back into the
+    lockout it was announcing.
+    """
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    http = _FakeHttp(tokens=[None, None, None])  # every mint refused
+    mgr = DhanTokenManager(
+        client_id="c", pin="p", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: now[0],
+    )
+    with pytest.raises(RuntimeError, match="no valid cached token"):
+        mgr.token()
+    # ONE attempt, not _REFRESH_ATTEMPTS: retrying into a rate limit extends it.
+    assert len(http.calls) == 1
+
+
+def test_mint_is_not_attempted_during_the_cooldown(monkeypatch) -> None:
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    first = _fake_jwt(int(now[0]) + 86400)
+    second = _fake_jwt(int(now[0]) + 86400)
+    http = _FakeHttp(tokens=[first, second])
+    mgr = DhanTokenManager(
+        client_id="c", pin="p", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: now[0],
+    )
+    assert mgr.token() == first
+    mgr.invalidate()
+
+    # Inside the cooldown: serve what we have, ask nobody.
+    now[0] += _MINT_COOLDOWN_SECONDS - 1
+    assert mgr.token() == first
+    assert len(http.calls) == 1
+
+    # Past it: minting resumes.
+    now[0] += 2
+    mgr.invalidate()
+    assert mgr.token() == second
+    assert len(http.calls) == 2
+
+
+def test_persistently_rejected_token_eventually_raises(monkeypatch) -> None:
+    """The heart of the outage: a dead token that is still timestamp-valid.
+
+    The last-good fallback exists for a SPURIOUS 401, so a few serves are
+    correct. But the token here is genuinely dead — every call 401s — and the
+    old code served it forever because its own `exp` was in the future. Two
+    trading days of scans fetched nothing behind exactly this loop. It must
+    give up and raise, loudly, so scan_coverage can halt the bucket.
+    """
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    good = _fake_jwt(int(now[0]) + 86400)  # valid for a day by its own clock
+    http = _FakeHttp(tokens=[good] + [None] * 20)  # mint once, then always refused
+    mgr = DhanTokenManager(
+        client_id="c", pin="p", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: now[0],
+    )
+    assert mgr.token() == good
+
+    # Each round trip is a real 401 from the server on that same token.
+    for _ in range(_MAX_REJECTED_SERVES):
+        now[0] += _MINT_COOLDOWN_SECONDS + 1
+        mgr.invalidate()
+        assert mgr.token() == good  # tolerated: might be propagation lag
+
+    now[0] += _MINT_COOLDOWN_SECONDS + 1
+    mgr.invalidate()
+    with pytest.raises(RuntimeError, match="being rejected by the server"):
+        mgr.token()
+
+
+def test_a_successful_mint_clears_the_rejection_streak(monkeypatch) -> None:
+    """A recovered account must not stay one strike from raising."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    good = _fake_jwt(int(now[0]) + 86400)
+    fresh = _fake_jwt(int(now[0]) + 90000)
+    http = _FakeHttp(tokens=[good, None, fresh] + [None] * 20)
+    mgr = DhanTokenManager(
+        client_id="c", pin="p", totp_secret=_TOTP_SECRET,
+        http=http, clock=lambda: now[0],
+    )
+    assert mgr.token() == good
+
+    now[0] += _MINT_COOLDOWN_SECONDS + 1
+    mgr.invalidate()
+    assert mgr.token() == good  # refused once → one rejected serve banked
+
+    now[0] += _MINT_COOLDOWN_SECONDS + 1
+    mgr.invalidate()
+    assert mgr.token() == fresh  # mint succeeds → streak reset
+
+    # Which means the full tolerance is available again.
+    for _ in range(_MAX_REJECTED_SERVES):
+        now[0] += _MINT_COOLDOWN_SECONDS + 1
+        mgr.invalidate()
+        assert mgr.token() == fresh
 
 
 def test_no_cached_token_and_refresh_fails_raises(monkeypatch) -> None:
