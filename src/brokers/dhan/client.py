@@ -98,6 +98,24 @@ def is_invalid_token_error(exc: BaseException) -> bool:
     return False
 
 
+def is_transient_upstream_error(exc: BaseException) -> bool:
+    """True when ``exc`` is Dhan being briefly unwell, not the bot being wrong.
+
+    A 5xx or a dropped/timed-out connection is upstream weather: the safety
+    sweeps re-run every 60s and the next one almost always succeeds. The Dhan
+    502 on ``/v2/positions`` at 08:20 IST on 2026-08-09 recovered on the very
+    next tick and still paged three times.
+
+    Deliberately narrow. 4xx is NOT transient — that is the bot sending
+    something wrong, and it will keep being wrong until someone looks. Nor is
+    DH-906, which has its own longer grace because it self-heals on a known
+    schedule; ``is_invalid_token_error`` is checked first by the caller.
+    """
+    if isinstance(exc, DhanAPIError):
+        return exc.code.isdigit() and 500 <= int(exc.code) <= 599
+    return isinstance(exc, httpx.TransportError)
+
+
 def _is_invalid_token(resp: httpx.Response) -> bool:
     """True when a response means the access token was rejected.
 

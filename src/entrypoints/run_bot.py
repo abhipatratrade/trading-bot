@@ -21,7 +21,11 @@ from decimal import Decimal
 
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
-from src.brokers.dhan.client import DhanClient, is_invalid_token_error
+from src.brokers.dhan.client import (
+    DhanClient,
+    is_invalid_token_error,
+    is_transient_upstream_error,
+)
 from src.core.alerts import (
     note_alert_recovery,
     note_sustained_failure,
@@ -69,7 +73,23 @@ TICK_INTERVAL_SECONDS = 60
 # account) self-heals once Dhan's "one token / 2 min" mint cooldown clears.
 # Safety-path DH-906s are silenced for this grace so a routine eviction never
 # pages; only a token stuck past it (bad creds/TOTP, IP block) alerts.
-_TOKEN_GRACE_SECONDS = 180.0
+#
+# 300s, raised from 180s on 2026-08-10 after a real eviction recovered in 186
+# and paged three sweeps by SIX SECONDS. 180 was calibrated against the mint
+# cooldown alone; the true worst case is longer, because the cooldown is
+# server-side per CLIENT ID and the competing login starts it — so the bot's
+# first attempt can be refused for reasons that predate it, and it then waits
+# out someone else's two minutes plus its own tick. 130s cooldown + 60s tick +
+# margin is comfortably under 300, while a token genuinely stuck (the 08-04/05
+# outage ran two DAYS) still pages within five minutes.
+_TOKEN_GRACE_SECONDS = 300.0
+
+# A 5xx/timeout from the broker is upstream weather, not a bot fault, and it
+# clears on the next 60s sweep — the Dhan 502 of 2026-08-09 did exactly that,
+# yet paged instantly. Give it two sweeps to resolve itself before waking
+# anyone. Deliberately shorter than the token grace: nothing self-heals a
+# genuine outage, so the sooner it escalates the better.
+_UPSTREAM_GRACE_SECONDS = 120.0
 
 _log = get_logger("entrypoints.run_bot")
 _shutdown = False
@@ -368,7 +388,16 @@ def main() -> None:
                 f"{int(_TOKEN_GRACE_SECONDS // 60)}m — not self-healing)",
                 grace_seconds=_TOKEN_GRACE_SECONDS,
             )
+        elif is_transient_upstream_error(exc):
+            note_sustained_failure(
+                key,
+                f"{message} (Dhan unreachable/5xx for "
+                f"{int(_UPSTREAM_GRACE_SECONDS // 60)}m — not a blip)",
+                grace_seconds=_UPSTREAM_GRACE_SECONDS,
+            )
         else:
+            # Everything else pages on the first failure, by design: a 4xx, a
+            # bug, or a bad config will not fix itself by being waited on.
             send_alert_dedup(key, message)
 
     def _note_safety_ok(key: str, message: str) -> None:

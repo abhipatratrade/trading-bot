@@ -12,6 +12,7 @@ from src.brokers.dhan.client import (
     DhanAPIError,
     DhanClient,
     is_invalid_token_error,
+    is_transient_upstream_error,
 )
 
 _UNIVERSE = {
@@ -356,3 +357,40 @@ def test_401_invalidates_and_retries() -> None:
     bal = client.get_balances()
     assert bal[0].available == Decimal("100")
     assert len(http.calls) == 2  # 401 then retry
+
+
+# ── transient upstream vs. a real fault (2026-08-10) ─────────────────────
+# The three safety sweeps paged instantly on a Dhan 502 that cleared on the
+# very next 60s tick (2026-08-09, 08:20 IST). Alert fatigue on the safety path
+# is its own hazard — the page you ignore is the page that mattered.
+def test_5xx_is_transient() -> None:
+    for code in ("500", "502", "503", "504", "599"):
+        assert is_transient_upstream_error(DhanAPIError(code, "upstream")) is True
+
+
+def test_dropped_connections_and_timeouts_are_transient() -> None:
+    import httpx
+
+    req = httpx.Request("GET", "https://api.dhan.co/v2/positions")
+    assert is_transient_upstream_error(httpx.ConnectTimeout("t", request=req)) is True
+    assert is_transient_upstream_error(httpx.ReadTimeout("t", request=req)) is True
+    assert is_transient_upstream_error(httpx.ConnectError("c", request=req)) is True
+
+
+def test_4xx_is_not_transient() -> None:
+    """A 4xx is the bot sending something wrong. Waiting cannot fix it, so it
+    must keep paging on the first failure."""
+    for code in ("400", "401", "403", "404", "429"):
+        assert is_transient_upstream_error(DhanAPIError(code, "client")) is False
+
+
+def test_dh906_is_not_classed_as_transient() -> None:
+    """It self-heals on a KNOWN schedule and has its own longer grace; the
+    caller checks is_invalid_token_error first and must not double-classify."""
+    assert is_transient_upstream_error(DhanAPIError("DH-906", "Invalid Token")) is False
+
+
+def test_an_ordinary_bug_is_not_transient() -> None:
+    """A KeyError in our own sweep is not upstream weather — page immediately."""
+    assert is_transient_upstream_error(KeyError("boom")) is False
+    assert is_transient_upstream_error(ValueError("boom")) is False
