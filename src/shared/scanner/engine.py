@@ -47,6 +47,40 @@ _log = get_logger("shared.scanner.engine")
 # weekend (Fri prepare → Mon scan). Beyond this, treat as no shortlist.
 _SHORTLIST_MAX_AGE_DAYS = 4
 
+# How many times the gap screen may re-run in a session when every symbol came
+# back data-limited. See the retry rationale in run_gap_reversal_scan: high
+# enough to ride out a slow feed at the open, low enough that it can never
+# become the hour of continuous re-fetching that would trip Dhan's 5 req/s cap.
+_MAX_SCREEN_ATTEMPTS = 5
+
+
+def should_rescreen(
+    reasons: list[str], attempts: int, cap: int = _MAX_SCREEN_ATTEMPTS
+) -> bool:
+    """Should the gap screen run again, given what today's rows already say? PURE.
+
+    True only when rows exist AND every one of them failed on a ``data_``
+    reason AND we are under the attempt cap. A single evaluable row means the
+    screen genuinely ran — an empty cut is then a real answer about the market
+    and must not be re-fetched every tick for the rest of the morning.
+
+    ``reasons`` is one entry per persisted symbol; "" is an evaluable pass
+    (the screen got all the way through and the symbol qualified).
+    """
+    if not reasons or attempts >= cap:
+        return False
+    return all(r.startswith("data_") for r in reasons)
+
+
+def _utc_start_of(day: date_type) -> datetime:
+    """Midnight UTC on ``day`` — the lower bound for 'attempts made today'.
+
+    The gap screen's ``scan_date`` is already the UTC date the run_bot loop
+    passes, and the morning cut happens ~04:00 UTC, so a UTC-day window and the
+    IST session it describes never disagree here.
+    """
+    return datetime(day.year, day.month, day.day, tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # scanner.yaml schema
@@ -782,15 +816,57 @@ def run_gap_reversal_scan(
     gcfg = GapReversalConfig.from_scanner_config(config)
 
     # Already screened today? Replay the persisted cut instead of re-fetching.
+    #
+    # "Screened" means the screen actually SAW something. A pass where every
+    # symbol failed on a ``data_`` reason answered no question — it only proves
+    # the data was not there yet — and treating it as the day's screen is what
+    # let one bad morning blank the bucket until midnight. Same distinction the
+    # sizer and the scanner cut already draw: could-not-evaluate is not
+    # did-not-qualify.
+    #
+    # Bounded, though. A retry costs a full re-fetch (~230 symbols x 2 calls,
+    # measured at 113s), the tick is 60s, and Dhan caps at 5 req/s on a token
+    # shared with swing-indian — so an unbounded retry would serialise into an
+    # hour of continuous scanning and manufacture the 429 storm of 2026-07-22,
+    # which is the very blindness this is meant to prevent. After
+    # _MAX_SCREEN_ATTEMPTS the empty cut stands for the day and says so.
     with session_scope() as session:
-        already_ran = session.execute(
-            select(func.count())
-            .select_from(ScannerSnapshot)
-            .where(
+        rows = session.execute(
+            select(ScannerSnapshot.filter_results).where(
                 ScannerSnapshot.date == scan_date,
                 ScannerSnapshot.strategy_id == bucket_id,
             )
+        ).scalars().all()
+        already_ran = len(rows)
+        reasons = [str((fr or {}).get("reason", "")) for fr in rows]
+        attempts = session.execute(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(
+                AuditLog.strategy_id == bucket_id,
+                AuditLog.event_type == AuditEventType.SCANNER_RUN,
+                AuditLog.ts >= _utc_start_of(scan_date),
+            )
         ).scalar_one()
+        data_limited = bool(reasons) and all(r.startswith("data_") for r in reasons)
+        if should_rescreen(reasons, attempts):
+            _log.info(
+                "gap_scan_retry_data_limited",
+                bucket_id=bucket_id,
+                date=str(scan_date),
+                attempt=attempts + 1,
+                of=_MAX_SCREEN_ATTEMPTS,
+                unevaluable=already_ran,
+            )
+            already_ran = 0  # fall through and re-screen
+        elif data_limited:
+            _log.warning(
+                "gap_scan_gave_up_data_limited",
+                bucket_id=bucket_id,
+                date=str(scan_date),
+                attempts=attempts,
+                hint="no symbol was evaluable all morning — the cut stands empty",
+            )
         if already_ran:
             cached = (
                 session.execute(

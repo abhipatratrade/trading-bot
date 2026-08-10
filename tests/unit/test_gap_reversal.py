@@ -16,6 +16,7 @@ from src.shared.allocator.sizer import load_allocator_config
 from src.shared.bucket import TradingType, load_bucket
 from src.shared.bucket_runner import BucketRunner
 from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
+from src.shared.scanner import engine as eng
 from src.shared.scanner import gap_reversal as gr
 from src.shared.scanner import indicators as ind
 from src.shared.scanner.engine import load_scanner_config
@@ -716,3 +717,61 @@ def test_gap_screen_wrapper_matches_screen_with_reason_exactly() -> None:
         wrapped = gr.gap_screen("TEST", intraday, daily, _DAY, _cfg())
         full = gr.screen_with_reason("TEST", intraday, daily, _DAY, _cfg())
         assert wrapped == full.candidate, gap
+
+
+# ── the morning screen's timing, and its retry (2026-08-10) ───────────────
+# intraday-indian had NEVER passed a symbol: 0 daily_universe rows, ever. The
+# screen fired on the first tick after the open (~09:31), _MIN_SESSION_BARS
+# demanded 6 bars (through 09:45), found 4, rejected every name with
+# data_too_few_session_bars, and that empty cut was cached for the day.
+def test_screen_needs_only_the_bars_it_actually_reads() -> None:
+    """It reads today[0].open and today[2].close — 09:15 and the 09:25 bar.
+
+    Four (not three) because Dhan's 5m response carries the in-progress candle,
+    so the fourth is what guarantees today[2] is CLOSED.
+    """
+    assert gr._MIN_SESSION_BARS == 4
+
+
+def test_screen_is_not_a_strategy_parameter() -> None:
+    """A complete NSE session is 75 5m bars (09:15→15:30), so this guard can
+    never bind on a replayed day — which is why gap_reversal_parity scores an
+    identical 75/76 at either threshold. It gates only how early in a LIVE
+    morning the screen may run.
+    """
+    full_session = gr.session_bars(_flat_session(_DAY, 100.0, n=75), _DAY)
+    assert len(full_session) == 75
+    assert gr._MIN_SESSION_BARS < 75
+
+    # And the screen still accepts a qualifying gap, unchanged.
+    intraday, daily = _screen_inputs(-5.0)
+    assert gr.gap_screen("TEST", intraday, daily, _DAY, _cfg()) is not None
+
+
+class TestShouldRescreen:
+    """A pass where every symbol was data-limited answered no question."""
+
+    def test_retries_when_every_row_was_data_limited(self) -> None:
+        assert eng.should_rescreen(["data_too_few_session_bars"] * 99, attempts=1)
+
+    def test_does_not_retry_once_any_symbol_was_evaluable(self) -> None:
+        """An empty cut with real rejections is a genuine answer about the
+        market, not a data failure — re-fetching it every tick is the 429 storm
+        this bound exists to avoid."""
+        reasons = ["data_too_few_session_bars"] * 98 + ["gap_out_of_band"]
+        assert not eng.should_rescreen(reasons, attempts=1)
+
+    def test_does_not_retry_a_clean_pass(self) -> None:
+        assert not eng.should_rescreen(["gap_out_of_band"] * 99, attempts=1)
+
+    def test_gives_up_at_the_cap(self) -> None:
+        """230 symbols x 2 calls takes 113s against a 60s tick and a 5 req/s
+        cap shared with swing-indian — unbounded retry manufactures the very
+        blindness it is meant to detect."""
+        rs = ["data_too_few_session_bars"] * 99
+        assert eng.should_rescreen(rs, attempts=eng._MAX_SCREEN_ATTEMPTS - 1)
+        assert not eng.should_rescreen(rs, attempts=eng._MAX_SCREEN_ATTEMPTS)
+
+    def test_no_rows_means_nothing_to_replay(self) -> None:
+        """Never screened today — the caller's normal first-pass path."""
+        assert not eng.should_rescreen([], attempts=0)

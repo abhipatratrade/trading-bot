@@ -55,7 +55,29 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _OPEN_BAR = time(9, 15)
 _THIRD_BAR = time(9, 25)
 # A clean session needs at least this many 5m bars present (engine: len(idx)<6).
-_MIN_SESSION_BARS = 6
+# The screen reads exactly two of today's bars — ``today[0].open`` (09:15) and
+# ``today[2].close`` (the 09:25 bar, closing 09:30). It never touches index 3 or
+# beyond, so three bars is what it NEEDS and 09:30 is when it can run. Four,
+# because Dhan's 5m response includes the in-progress candle (observed
+# 2026-08-10: four bars at 09:31 — 09:15/20/25 closed plus 09:30 forming), and
+# the fourth guarantees ``today[2]`` is a CLOSED bar either way.
+#
+# This was 6 until 2026-08-10, which is bars through 09:45, and it made
+# intraday-indian structurally unable to trade: the screen fired on the first
+# tick after the open (~09:31), found 4 bars, rejected all 99/230 names with
+# data_too_few_session_bars, and cached that empty cut for the day. It had NEVER
+# passed a symbol — 0 rows in daily_universe, ever.
+#
+# Do NOT "fix" it by delaying the scan to 09:45 instead. The entry window opens
+# at the bar stamped 09:25 (buckets.yaml entry_start 09:30) and the strategy's
+# _MAX_SIGNAL_AGE_BARS=1 only acts on a pattern that is the last closed bar or
+# the one before. Screening at 09:45 would age the 09:25 and 09:30 pattern bars
+# out of reach permanently — silently amputating the front of a validated entry
+# window while looking like a fix.
+#
+# Not a strategy parameter: a complete NSE session is 75 5m bars, so this never
+# binds on a replayed day. gap_reversal_parity is 75/76 identical either way.
+_MIN_SESSION_BARS = 4
 
 
 @dataclass(frozen=True, slots=True)
