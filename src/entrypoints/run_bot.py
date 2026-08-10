@@ -104,6 +104,42 @@ _ARCHIVE_ALERT_KEY = "archive_stale"
 _ARCHIVE_CHECK_EVERY_TICKS = 60
 
 
+# Startup probe retry schedule, in seconds to wait BEFORE each attempt after
+# the first. Must span Dhan's ~130s server-side mint cooldown, because a
+# restart landing inside that window is exactly the case this exists for.
+_PROBE_BACKOFF_SECONDS = (20.0, 60.0, 70.0)
+
+
+def _probe_with_retry(client: object, account_ref: str) -> None:
+    """Authed reachability probe that tolerates a self-healing token state.
+
+    Re-raises the last error once the schedule is exhausted, so a genuinely
+    bad credential or an edge-blocked IP still fails the account fast-ish and
+    loudly. Only DH-906 and transient upstream errors are retried; a 403 from
+    the sandbox edge is permanent and fails on the first attempt.
+    """
+    attempts = 1 + len(_PROBE_BACKOFF_SECONDS)
+    for i in range(attempts):
+        if i:
+            time.sleep(_PROBE_BACKOFF_SECONDS[i - 1])
+        try:
+            client.get_balances()  # type: ignore[attr-defined]
+            if i:
+                _log.info("dhan_probe_recovered", account_ref=account_ref, attempt=i + 1)
+            return
+        except Exception as exc:
+            healable = is_invalid_token_error(exc) or is_transient_upstream_error(exc)
+            if not healable or i == attempts - 1:
+                raise
+            _log.warning(
+                "dhan_probe_retrying",
+                account_ref=account_ref,
+                attempt=i + 1,
+                of=attempts,
+                error=str(exc)[:120],
+            )
+
+
 def _handle_signal(signum: int, _frame: object) -> None:
     global _shutdown
     _log.info("shutdown_signal_received", signal=signum)
@@ -267,13 +303,21 @@ def main() -> None:
                     settings,
                     data_token_manager=dhan_data.token_manager,
                 )
-                # Fail-fast reachability probe (one authed GET). Dhan's
-                # SANDBOX edge blocks datacenter IPs with a bodyless 403
-                # (confirmed from the GCP VM 2026-07-12: sandbox 403, live
-                # 401) — surface that here as a clean init failure (bucket
-                # skipped + one alert) instead of breaker/stop-sweep ERROR
-                # spam every tick against an unreachable host.
-                client.get_balances()
+                # Reachability probe (one authed GET). Dhan's SANDBOX edge
+                # blocks datacenter IPs with a bodyless 403 (confirmed from the
+                # GCP VM 2026-07-12: sandbox 403, live 401) — surface that here
+                # as a clean init failure (bucket skipped + one alert) instead
+                # of breaker/stop-sweep ERROR spam every tick against an
+                # unreachable host.
+                #
+                # But it must only fail fast on a PERMANENT fault. On 2026-08-10
+                # a deploy restarted the bot while Dhan's 2-minute mint cooldown
+                # was still running, so the probe was served a rejected token,
+                # got DH-906, and disabled the whole account for the process —
+                # which left no enabled buckets, and the bot exited. A token
+                # eviction self-heals within ~2 minutes; retrying across that
+                # window is the difference between a blip and an outage.
+                _probe_with_retry(client, ref)
                 brokers[ref] = client
                 order_managers[ref] = OrderManager(client, BrokerName.DHAN, clock)
                 reconcilers[ref] = Reconciler(
@@ -350,6 +394,25 @@ def main() -> None:
         )
 
     if not runners:
+        # WHY the exit code matters. systemd runs this with Restart=on-failure,
+        # so returning normally here means the bot stays DOWN until a human
+        # notices — which is what happened on 2026-08-10: a transient token
+        # state failed the Dhan probe, both Indian buckets were skipped, this
+        # branch returned 0, and the service sat inactive with NRestarts=0.
+        #
+        # An empty buckets.yaml is a legitimate configuration and should still
+        # exit cleanly. Buckets that are ENABLED but lost their account to an
+        # init failure are not a configuration — they are a failure, and the
+        # right response is to die loudly so systemd retries in RestartSec.
+        enabled_ids = [b.id for b in all_buckets if b.config.enabled]
+        if enabled_ids:
+            _log.error("no_runners_despite_enabled_buckets", enabled=enabled_ids)
+            send_alert(
+                f"[bot] {len(enabled_ids)} bucket(s) enabled but NONE could "
+                f"start ({', '.join(enabled_ids)}) — exiting non-zero so "
+                f"systemd retries. Usually an account init failure above."
+            )
+            raise SystemExit(1)
         _log.error("no_enabled_buckets")
         send_alert("[bot] No enabled buckets — nothing to do")
         return
