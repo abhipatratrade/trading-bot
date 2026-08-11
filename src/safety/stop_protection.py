@@ -260,9 +260,63 @@ def plan_stop_protection(
 def _load_attribution(
     bucket_ids: list[str],
 ) -> dict[str, tuple[str | None, str | None]]:
-    """symbol → (bucket_id, strategy_name) from open DB Position rows."""
+    """symbol → (bucket_id, strategy_name), from Position then the entry Trade.
+
+    Position is authoritative but LATE. Those rows are written by the
+    reconciler, which sweeps every 5 minutes — and the stop sweep runs seconds
+    after a fill, so on the one entry where the stop matters most this table is
+    still empty. An unattributed symbol then falls through to
+    ``bucket_ids[0]`` in ``ensure_stop_protection``, which sends the stop under
+    the WRONG bucket's product.
+
+    That is not hypothetical. On 2026-08-11 intraday-indian filled CASTROLIND
+    (product INTRADAY) at 09:40:40 and the sweep tried to protect it 9 seconds
+    later. No Position row existed, so it resolved to swing-indian and sent the
+    stop as MTF. Dhan rejected it, and kept rejecting it 116 times over 5.5
+    hours while a live ₹50k position sat with no resting stop.
+
+    So fall back to the entry Trade, the same shape ``_load_stop_distances``
+    uses below. Same lesson the sizer's dedup gate learned from the 2026-06-12
+    duplicate-order bug: between placement and the next reconcile, Trade is the
+    only record that the position exists.
+
+    PENDING IS IN THE STATUS FILTER ON PURPOSE. A Dhan order is ``pending`` the
+    moment it is placed — ``OrderManager.place_order`` writes PENDING and then
+    overwrites it with the broker ack, and Dhan's ``_STATUS_MAP`` maps both
+    TRANSIT and PENDING to ``pending``. CASTROLIND was still PENDING a full
+    minute after its fill. A filter of FILLED/PARTIAL/OPEN would therefore miss
+    the exact row this fallback exists to find, which is how the first draft of
+    this fix was inert. Attributing a PENDING order that later rejects is
+    harmless: ``plan_stop_protection`` only ever looks up symbols the BROKER
+    reports as open positions, so an entry that never filled is never consulted.
+
+    Position still wins where it exists — it reflects the exchange, whereas a
+    Trade row only reflects what we asked for. A NULL-bucket Position row (the
+    reconciler's orphan import on a shared account) simply does not match the
+    filter, so the Trade fallback covers it too.
+    """
     with session_scope() as session:
-        rows = list(
+        trades = (
+            session.execute(
+                select(Trade)
+                .where(
+                    Trade.bucket_id.in_(bucket_ids),
+                    Trade.status.in_(
+                        [
+                            OrderStatus.PENDING,
+                            OrderStatus.OPEN,
+                            OrderStatus.PARTIAL,
+                            OrderStatus.FILLED,
+                        ]
+                    ),
+                )
+                .order_by(Trade.created_at.desc())
+                .limit(500)
+            )
+            .scalars()
+            .all()
+        )
+        positions = list(
             session.execute(
                 select(Position).where(
                     Position.bucket_id.in_(bucket_ids),
@@ -270,7 +324,35 @@ def _load_attribution(
                 )
             ).scalars()
         )
-        return {p.symbol: (p.bucket_id, p.strategy_name) for p in rows}
+        return merge_attribution(
+            [(t.symbol, t.bucket_id, t.strategy_name, t.extra or {}) for t in trades],
+            [(p.symbol, p.bucket_id, p.strategy_name) for p in positions],
+        )
+
+
+def merge_attribution(
+    trades: list[tuple[str, str | None, str | None, dict]],
+    positions: list[tuple[str, str | None, str | None]],
+) -> dict[str, tuple[str | None, str | None]]:
+    """Resolve symbol → (bucket, strategy) from both records. PURE.
+
+    ``trades`` must arrive NEWEST FIRST; the first unpaired entry per symbol
+    wins, mirroring ``_load_stop_distances``. Positions are applied last so a
+    reconciled row overrides the Trade guess.
+    """
+    out: dict[str, tuple[str | None, str | None]] = {}
+    for symbol, bucket_id, strategy_name, extra in trades:
+        # A reduce-only leg is an EXIT — it attributes nothing, and letting it
+        # win would name the strategy that closed the position rather than the
+        # one that holds it. A closed entry is no longer held at all.
+        if symbol in out or extra.get("reduce_only"):
+            continue
+        if extra.get("closed_by_trade_id"):
+            continue
+        out[symbol] = (bucket_id, strategy_name)
+    for symbol, bucket_id, strategy_name in positions:
+        out[symbol] = (bucket_id, strategy_name)
+    return out
 
 
 def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
@@ -323,6 +405,7 @@ def ensure_stop_protection(
     broker: Broker,
     order_manager: OrderManager,
     stop_pct_by_bucket: dict[str, Decimal],
+    product_by_bucket: dict[str, str] | None = None,
     clock: Clock | None = None,
     shared_account: bool = False,
 ) -> StopPlan:
@@ -334,6 +417,15 @@ def ensure_stop_protection(
     ``shared_account`` (Decision 027 followup): on the Dhan account, which also
     holds the user's manual positions, only stops the bot's OWN holdings — the
     user's positions and their resting stops are never touched.
+
+    ``product_by_bucket`` is what makes the attribution above MATTER. Without
+    it ``place_order`` omits ``product``, ``OrderRequest.product`` is None, and
+    ``DhanClient`` falls back to its constructor default — MTF — so every stop
+    went out as MTF no matter which bucket held the position. A reduce-only MTF
+    sell against an INTRADAY long does not reduce it; on 2026-08-11 Dhan
+    rejected it 116 times, and now that MTF consent exists an accepted one
+    would be worse than a rejected one. The stop must carry the SAME product as
+    the entry it protects.
     """
     clk = clock or RealClock()
     if not stop_pct_by_bucket:
@@ -393,6 +485,11 @@ def ensure_stop_protection(
                 order_type=OrderType.MARKET,
                 reduce_only=True,
                 stop_price=stop.trigger,
+                # Must match the product the position is HELD under, or the
+                # "reduce-only" sell lands in a different product bucket at the
+                # venue and protects nothing. None ⇒ the adapter's default,
+                # which is the pre-2026-08-12 behaviour.
+                product=(product_by_bucket or {}).get(scope),
                 allow_when_killed=True,
                 intent_id=f"stop-{stop.trigger}-{stop.size}-{minute}",
             )

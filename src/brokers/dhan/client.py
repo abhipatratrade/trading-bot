@@ -563,7 +563,22 @@ class DhanClient(Broker):
             ),
             status=_STATUS_MAP.get(str(o.get("orderStatus", "")).upper(), "unknown"),
             stop_price=Decimal(str(trig)) if trig else None,
-            reduce_only=False,
+            # Dhan has no reduce-only flag for equities, so infer it: a resting
+            # order that carries BOTH a trigger price and OUR correlationId is a
+            # protective stop this bot placed. ``correlationId`` is only ever
+            # set by an API order with a client_order_id, so a stop the USER
+            # placed in the app can never match — which is the Decision 027
+            # property that matters, since plan_stop_protection CANCELS what it
+            # matches here.
+            #
+            # This was hardcoded False until 2026-08-12, which made
+            # ``stops_by_symbol`` permanently empty for Dhan: the sweep could
+            # never recognise a stop it had already placed, so it planned a
+            # fresh one every 60s. Harmless only while every stop was being
+            # rejected — the moment MTF consent let one through, it would have
+            # stacked a new resting stop each minute for the life of the
+            # position.
+            reduce_only=bool(trig) and bool(o.get("correlationId")),
             created_at=_parse_ts(o.get("createTime")),
             raw=o,
         )

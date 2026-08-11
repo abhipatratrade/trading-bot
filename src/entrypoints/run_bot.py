@@ -210,6 +210,9 @@ def main() -> None:
     accounts: dict[str, list[str]] = {}
     bucket_fx: dict[str, Decimal] = {}
     stop_pcts: dict[str, Decimal] = {}
+    # bucket → broker product its stops must be placed under. Crypto has no
+    # product dimension, so only the Dhan buckets populate this.
+    stop_products: dict[str, str] = {}
     for bucket in all_buckets:
         if not bucket.config.enabled or bucket.market != Market.CRYPTO:
             continue
@@ -286,6 +289,8 @@ def main() -> None:
             bucket_fx[bucket.id] = Decimal("1")  # Dhan wallet is INR-native
             if bucket.config.stop_loss_pct is not None:
                 stop_pcts[bucket.id] = bucket.config.stop_loss_pct
+            if bucket.config.product:
+                stop_products[bucket.id] = bucket.config.product
             if bucket.config.carry_interest_apr is not None:
                 carry_aprs[bucket.id] = bucket.config.carry_interest_apr
     if dhan_accounts:
@@ -531,6 +536,10 @@ def main() -> None:
                     broker=brokers[ref],
                     order_manager=order_managers[ref],
                     stop_pct_by_bucket=pcts,
+                    # A stop must be placed under the SAME product as the entry
+                    # it protects (2026-08-11: an INTRADAY position got an MTF
+                    # stop and Dhan rejected it 116 times).
+                    product_by_bucket=stop_products,
                     clock=clock,
                     shared_account=ref in dhan_accounts,
                 )

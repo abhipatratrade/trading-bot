@@ -6,6 +6,8 @@ from decimal import Decimal
 
 from src.brokers.base import OpenOrder, PositionInfo
 from src.brokers.delta_india.client import DeltaIndiaClient
+from src.brokers.dhan.client import DhanClient
+from src.safety import stop_protection as sp
 from src.safety.stop_protection import (
     expected_trigger,
     plan_stop_protection,
@@ -334,3 +336,141 @@ def test_exclusive_account_unchanged_without_owned() -> None:
         owned_quantities=None,
     )
     assert [p.symbol for p in plan.place] == ["BTCUSD"]
+
+
+# ── attribution: which bucket owns this position? (2026-08-11) ────────────
+# intraday-indian filled CASTROLIND (product INTRADAY) at 09:40:40 and the stop
+# sweep ran 9 seconds later. _load_attribution read only the Position table,
+# which the reconciler writes every 5 MINUTES, so it was empty. The symbol fell
+# through to bucket_ids[0] = swing-indian and the stop went out as MTF. Dhan
+# rejected it, and kept rejecting it 116 times over 5.5 hours while a live ₹50k
+# position sat with no resting stop.
+def _t(sym, bucket, strat="s", extra=None):
+    return (sym, bucket, strat, extra or {})
+
+
+class TestMergeAttribution:
+    def test_trade_attributes_before_the_reconciler_has_run(self) -> None:
+        """The exact failure: a fill with no Position row yet."""
+        got = sp.merge_attribution([_t("CASTROLIND", "intraday-indian")], [])
+        assert got["CASTROLIND"] == ("intraday-indian", "s")
+
+    def test_position_wins_once_reconciled(self) -> None:
+        """Position reflects the exchange; a Trade only reflects what we asked."""
+        got = sp.merge_attribution(
+            [_t("X", "swing-indian", "meanrev")],
+            [("X", "intraday-indian", "gap")],
+        )
+        assert got["X"] == ("intraday-indian", "gap")
+
+    def test_newest_entry_wins(self) -> None:
+        """Trades arrive newest-first, same convention as _load_stop_distances."""
+        got = sp.merge_attribution(
+            [_t("X", "intraday-indian", "new"), _t("X", "swing-indian", "old")], []
+        )
+        assert got["X"] == ("intraday-indian", "new")
+
+    def test_reduce_only_leg_does_not_attribute(self) -> None:
+        """An exit would name the strategy that CLOSED the position, not the
+        one holding it — and a protective stop is itself reduce-only, so this
+        would otherwise let the sweep attribute off its own past orders."""
+        got = sp.merge_attribution(
+            [
+                _t("X", "swing-indian", "exit", {"reduce_only": True}),
+                _t("X", "intraday-indian", "entry"),
+            ],
+            [],
+        )
+        assert got["X"] == ("intraday-indian", "entry")
+
+    def test_closed_entry_does_not_attribute(self) -> None:
+        got = sp.merge_attribution(
+            [_t("X", "swing-indian", "old", {"closed_by_trade_id": 42})], []
+        )
+        assert "X" not in got
+
+    def test_unknown_symbol_is_absent_not_guessed(self) -> None:
+        """plan_stop_protection reads .get(sym, (None, None)); absence must stay
+        absence so the bucket-percent fallback still applies."""
+        assert sp.merge_attribution([], []) == {}
+
+    def test_a_null_bucket_position_row_does_erase_the_trade_attribution(self) -> None:
+        """Documents the REAL behaviour, which is the opposite of what an
+        earlier version of this test claimed. Positions are applied last and
+        unconditionally, so a null-bucket row wins if one ever reaches here.
+
+        Nothing does today: _load_attribution's query filters on
+        ``Position.bucket_id.in_(bucket_ids)``, and SQL ``IN`` never matches
+        NULL, so the reconciler's orphan imports are excluded upstream. Pinned
+        because relaxing that filter — a plausible follow-up for the shared
+        account — would silently reintroduce the 2026-08-11 mis-attribution.
+        """
+        got = sp.merge_attribution(
+            [_t("X", "intraday-indian")], [("X", None, None)]
+        )
+        assert got["X"] == (None, None), (
+            "if this ever fails, merge_attribution grew a guard and "
+            "_load_attribution's Position filter may safely be widened"
+        )
+
+
+# ── the three defects the 2026-08-12 adversarial review found ────────────
+def test_attribution_query_includes_pending() -> None:
+    """A Dhan order is PENDING the instant it is placed, and stays PENDING for
+    minutes. CASTROLIND still read PENDING a full minute after its fill, and
+    the sweep runs ~9s after. The first draft of this fix filtered on
+    FILLED/PARTIAL/OPEN and so could never see the row it existed to find.
+    """
+    import inspect
+
+    src = inspect.getsource(sp._load_attribution)
+    assert "OrderStatus.PENDING" in src
+
+
+def test_stop_carries_the_buckets_product() -> None:
+    """Attribution is INERT without this. place_order omitted `product`, so
+    OrderRequest.product was None and DhanClient fell back to its MTF default —
+    every stop went out as MTF whatever bucket held the position.
+    """
+    import inspect
+
+    src = inspect.getsource(sp.ensure_stop_protection)
+    assert "product=" in src
+    assert "product_by_bucket" in src
+
+
+class TestDhanStopRecognition:
+    """plan_stop_protection only matches an existing stop when reduce_only is
+    True. Dhan hardcoded it False, so the sweep never recognised its own stops
+    and re-planned one every 60s — which only became dangerous once MTF consent
+    let a stop actually rest.
+    """
+
+    @staticmethod
+    def _order(trig, corr):
+        raw = {
+            "orderId": "1", "correlationId": corr, "tradingSymbol": "X",
+            "transactionType": "SELL", "quantity": 10, "filledQty": 0,
+            "orderType": "STOP_LOSS_MARKET", "orderStatus": "PENDING",
+            "triggerPrice": trig, "createTime": "2026-08-12 09:20:00",
+        }
+        return DhanClient._to_open_order.__wrapped__(None, raw) if hasattr(
+            DhanClient._to_open_order, "__wrapped__"
+        ) else DhanClient._to_open_order(_DUMMY_CLIENT, raw)
+
+    def test_our_own_resting_stop_is_recognised(self) -> None:
+        assert self._order(159.0, "abc123").reduce_only is True
+
+    def test_a_users_manual_stop_is_never_matched(self) -> None:
+        """No correlationId ⇒ not ours ⇒ plan_stop_protection must not cancel
+        it. This is the Decision 027 property, and it is why the inference is
+        keyed on correlationId rather than just 'has a trigger price'."""
+        assert self._order(159.0, None).reduce_only is False
+        assert self._order(159.0, "").reduce_only is False
+
+    def test_a_plain_order_is_not_a_stop(self) -> None:
+        assert self._order(None, "abc123").reduce_only is False
+        assert self._order(0, "abc123").reduce_only is False
+
+
+_DUMMY_CLIENT = DhanClient.__new__(DhanClient)
