@@ -554,6 +554,14 @@ def main() -> None:
             pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
             if not pcts:
                 continue
+            # An equity venue takes no orders outside its session, so sweeping a
+            # Dhan account at 22:40 can only produce rejects. On 2026-08-12 an
+            # unplaceable PIIND stop was retried every ~90s all evening — 117
+            # attempts in three hours, and it would have run all night, every
+            # night, until the position closed. Crypto has no session and is
+            # deliberately NOT gated: a 24/7 venue must be swept 24/7.
+            if ref in dhan_accounts and nse_session(clock.now()) is NseSession.CLOSED:
+                continue
             try:
                 ensure_stop_protection(
                     account_ref=ref,

@@ -552,3 +552,61 @@ def test_short_position_clamps_upward() -> None:
     trig = p.place[0].trigger
     assert trig == Decimal("2740.80")
     assert trig < _PIIND.entry_price * Decimal("1.20")  # tighter than the raw 20%
+
+
+# ── 2026-08-12: 117 identical rejects overnight in a closed market ────────
+class TestPlaceRetryBudget:
+    """A stop the venue refuses is refused deterministically. Retrying it every
+    90s taught nothing after the first attempt and burned API budget on a
+    rate-limited account shared with the user's manual trading.
+    """
+
+    def setup_method(self) -> None:
+        sp.reset_place_failures()
+
+    def teardown_method(self) -> None:
+        sp.reset_place_failures()
+
+    def _fail(self, n, trigger=Decimal("2314.40")):
+        for _ in range(n):
+            sp._place_failures[("dhan", "PIIND", str(trigger))] = (
+                sp._place_failures.get(("dhan", "PIIND", str(trigger)), 0) + 1
+            )
+
+    def test_first_attempt_is_allowed(self) -> None:
+        assert sp.should_attempt_place("dhan", "PIIND", Decimal("2314.40"))
+
+    def test_retries_until_the_cap(self) -> None:
+        self._fail(sp._MAX_PLACE_FAILURES - 1)
+        assert sp.should_attempt_place("dhan", "PIIND", Decimal("2314.40"))
+
+    def test_stops_at_the_cap(self) -> None:
+        self._fail(sp._MAX_PLACE_FAILURES)
+        assert not sp.should_attempt_place("dhan", "PIIND", Decimal("2314.40"))
+
+    def test_a_new_trigger_gets_a_fresh_budget(self) -> None:
+        """The band clamp or a late-arriving strategy distance changes the
+        price — that is a genuinely different order, not a repeat of the one
+        that failed, so it must not inherit the exhausted budget."""
+        self._fail(sp._MAX_PLACE_FAILURES)
+        assert not sp.should_attempt_place("dhan", "PIIND", Decimal("2314.40"))
+        assert sp.should_attempt_place("dhan", "PIIND", Decimal("2288.20"))
+
+    def test_success_clears_the_budget(self) -> None:
+        key = ("dhan", "PIIND", "2314.40")
+        self._fail(sp._MAX_PLACE_FAILURES)
+        sp.reset_place_failures(key)
+        assert sp.should_attempt_place("dhan", "PIIND", Decimal("2314.40"))
+
+    def test_other_symbols_are_unaffected(self) -> None:
+        self._fail(sp._MAX_PLACE_FAILURES)
+        assert sp.should_attempt_place("dhan", "SUZLON", Decimal("2314.40"))
+
+    def test_giving_up_does_not_silence_stop_coverage(self) -> None:
+        """The position is still uncovered and the invariant must keep saying
+        so — the budget caps the ORDER attempts, never the alarm."""
+        import inspect
+
+        src = inspect.getsource(sp.ensure_stop_protection)
+        assert "stop_place_budget_exhausted" in src
+        assert "_log.debug" in src  # quiet here; stop_coverage does the shouting

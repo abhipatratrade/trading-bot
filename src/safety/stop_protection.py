@@ -53,6 +53,38 @@ _TRIGGER_TOLERANCE = Decimal("0.005")
 # suggests. 0.9 buys margin for that drift without giving up much distance.
 _BAND_SAFETY = Decimal("0.9")
 
+# Consecutive placement failures for one (account, symbol, trigger) before the
+# sweep stops retrying it. A stop the venue refuses is refused deterministically
+# — the 117 identical PIIND attempts of 2026-08-12 taught nothing after the
+# first and just burned API budget on an account that is rate-limited and shared
+# with the user's manual trading. The position stays uncovered either way; that
+# is what stop_coverage exists to shout about, and it keeps shouting.
+#
+# Keyed on the TRIGGER too, so a changed price (band clamp, strategy distance
+# arriving late, entry re-priced) is a genuinely new attempt and gets its own
+# budget rather than inheriting the old one's exhaustion.
+_MAX_PLACE_FAILURES = 3
+_place_failures: dict[tuple[str, str, str], int] = {}
+
+
+def reset_place_failures(key: tuple[str, str, str] | None = None) -> None:
+    """Clear the retry budget — for tests, and for a symbol that recovered."""
+    if key is None:
+        _place_failures.clear()
+    else:
+        _place_failures.pop(key, None)
+
+
+def should_attempt_place(
+    account_ref: str, symbol: str, trigger: Decimal, cap: int = _MAX_PLACE_FAILURES
+) -> bool:
+    """False once this exact stop has failed ``cap`` times in a row. PURE-ish.
+
+    Only the counter is stateful; the decision is a plain comparison so the
+    policy is testable without a broker.
+    """
+    return _place_failures.get((account_ref, symbol, str(trigger)), 0) < cap
+
 
 @dataclass(frozen=True, slots=True)
 class PlannedStop:
@@ -527,6 +559,18 @@ def ensure_stop_protection(
     minute = clk.now().strftime("%Y%m%d%H%M")
     for stop in plan.place:
         scope = stop.bucket_id or fallback_bucket
+        fail_key = (account_ref, stop.symbol, str(stop.trigger))
+        if not should_attempt_place(account_ref, stop.symbol, stop.trigger):
+            # Budget exhausted. Stay quiet here — stop_coverage already pages
+            # about the uncovered position every tick, and repeating it from the
+            # placement path only doubles the noise about one problem.
+            _log.debug(
+                "stop_place_budget_exhausted",
+                account_ref=account_ref,
+                symbol=stop.symbol,
+                trigger=str(stop.trigger),
+            )
+            continue
         try:
             order_manager.place_order(
                 strategy_id=scope,
@@ -546,7 +590,9 @@ def ensure_stop_protection(
                 allow_when_killed=True,
                 intent_id=f"stop-{stop.trigger}-{stop.size}-{minute}",
             )
+            reset_place_failures(fail_key)
         except Exception:
+            _place_failures[fail_key] = _place_failures.get(fail_key, 0) + 1
             _log.error(
                 "stop_place_failed",
                 account_ref=account_ref,
