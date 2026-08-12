@@ -47,6 +47,12 @@ _log = get_logger("safety.stop_protection")
 # from the expected trigger (entry price moved on adds, config changed).
 _TRIGGER_TOLERANCE = Decimal("0.005")
 
+# Fraction of the daily circuit band a clamped stop may use. Not 1.0: the band
+# is measured from the PREVIOUS CLOSE, while we only have the entry price, so a
+# position already down on the day has less room left than entry × band
+# suggests. 0.9 buys margin for that drift without giving up much distance.
+_BAND_SAFETY = Decimal("0.9")
+
 
 @dataclass(frozen=True, slots=True)
 class PlannedStop:
@@ -124,6 +130,7 @@ def plan_stop_protection(
     tick_sizes: dict[str, Decimal | None] | None = None,
     owned_quantities: dict[str, Decimal] | None = None,
     stop_distances: dict[str, Decimal] | None = None,
+    price_band_pct: dict[str, Decimal | None] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -215,6 +222,33 @@ def plan_stop_protection(
                     symbol=pos.symbol,
                     strategy_trigger=str(strategy_trigger),
                     bucket_trigger=str(trigger),
+                )
+
+        # A trigger outside the scrip's daily circuit band cannot be placed AT
+        # ALL — the exchange refuses it at validation, so the position ends up
+        # with NO stop rather than a wide one. swing-indian's 20% crash net is
+        # wider than the 10% band most F&O names carry, so on 2026-08-12 PIIND's
+        # fallback trigger (-19%) was simply unplaceable and the bucket halted.
+        # Clamp to just inside the band: a tighter stop that EXISTS beats a
+        # correctly-sized one that does not. Only ever tightens, never widens.
+        band = (price_band_pct or {}).get(pos.symbol)
+        if band and band > 0 and pos.entry_price > 0:
+            limit = pos.entry_price * (
+                Decimal("1") - (band * _BAND_SAFETY) / Decimal("100")
+                if pos.side == "long"
+                else Decimal("1") + (band * _BAND_SAFETY) / Decimal("100")
+            )
+            outside = limit > trigger if pos.side == "long" else limit < trigger
+            if outside:
+                _log.warning(
+                    "stop_trigger_clamped_to_price_band",
+                    symbol=pos.symbol,
+                    requested=str(trigger),
+                    clamped_to=str(limit),
+                    band_pct=str(band),
+                )
+                trigger = expected_trigger_at_distance(
+                    pos.entry_price, pos.side, abs(pos.entry_price - limit), tick
                 )
 
         kept = None
@@ -362,6 +396,18 @@ def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
     order via ``OrderManager.place_order(extra_payload=...)``. The newest
     unpaired entry per symbol wins; anything unparseable is dropped so the
     sweep silently falls back to the bucket percent.
+
+    PENDING IS IN THE FILTER for the same reason as ``_load_attribution`` — and
+    this function is why that mattered on 2026-08-12. swing-indian's first ever
+    fill, PIIND, emitted its ATR stop distance (200.089 → trigger 2314.41,
+    −6.8% from the market). The sweep ran 14 seconds later, the entry Trade was
+    still PENDING, this query filtered it out, and the sweep fell back to the
+    bucket's 20% → trigger 2011.60, which is −19% and OUTSIDE PIIND's 10%
+    circuit band. Dhan refused it at request validation, so the position sat
+    naked and the bucket halted itself.
+
+    I fixed this exact filter in ``_load_attribution`` the night before and did
+    not fix it here, ten lines away. Both callers of the pattern now agree.
     """
     out: dict[str, Decimal] = {}
     with session_scope() as session:
@@ -371,7 +417,12 @@ def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
                 .where(
                     Trade.bucket_id.in_(bucket_ids),
                     Trade.status.in_(
-                        [OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.OPEN]
+                        [
+                            OrderStatus.PENDING,
+                            OrderStatus.OPEN,
+                            OrderStatus.PARTIAL,
+                            OrderStatus.FILLED,
+                        ]
                     ),
                 )
                 .order_by(Trade.created_at.desc())
@@ -406,6 +457,7 @@ def ensure_stop_protection(
     order_manager: OrderManager,
     stop_pct_by_bucket: dict[str, Decimal],
     product_by_bucket: dict[str, str] | None = None,
+    price_band_pct: dict[str, Decimal | None] | None = None,
     clock: Clock | None = None,
     shared_account: bool = False,
 ) -> StopPlan:
@@ -450,6 +502,7 @@ def ensure_stop_protection(
         tick_sizes={p.symbol: broker.tick_size(p.symbol) for p in positions},
         owned_quantities=owned,
         stop_distances=_load_stop_distances(bucket_ids),
+        price_band_pct=price_band_pct,
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"

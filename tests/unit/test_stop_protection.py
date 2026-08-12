@@ -474,3 +474,81 @@ class TestDhanStopRecognition:
 
 
 _DUMMY_CLIENT = DhanClient.__new__(DhanClient)
+
+
+# ── PIIND, 2026-08-12: swing-indian's first ever fill went unprotected ────
+_PIIND = PositionInfo(
+    symbol="PIIND", side="long", size=Decimal("15"), entry_price=Decimal("2514.50")
+)
+
+
+def _piind_plan(distance=None, band=None):
+    return plan_stop_protection(
+        positions=[_PIIND],
+        open_orders=[],
+        stop_pct_by_bucket={"swing-indian": Decimal("20")},
+        attribution={"PIIND": ("swing-indian", "mean_reversion_1h")},
+        tick_sizes={"PIIND": Decimal("0.05")},
+        stop_distances=({"PIIND": distance} if distance else None),
+        price_band_pct=({"PIIND": band} if band else None),
+    )
+
+
+def test_stop_distance_query_includes_pending() -> None:
+    """The strategy DID emit its ATR stop (200.089). The sweep ran 14s after the
+    fill, the entry Trade was still PENDING, this query filtered it out, and the
+    sweep fell back to the bucket's 20% — which is unplaceable. Same filter bug
+    I fixed in _load_attribution the night before and missed here.
+    """
+    import inspect
+
+    assert "OrderStatus.PENDING" in inspect.getsource(sp._load_stop_distances)
+
+
+def test_unclamped_bucket_stop_is_outside_the_band() -> None:
+    """Documents what actually shipped: -20%, which PIIND's 10% circuit band
+    makes impossible to place, so the position got NO stop at all."""
+    assert _piind_plan().place[0].trigger == Decimal("2011.60")
+
+
+def test_band_clamp_makes_the_fallback_placeable() -> None:
+    """A tighter stop that EXISTS beats a correctly-sized one that does not."""
+    trig = _piind_plan(band=Decimal("10")).place[0].trigger
+    pct = (trig / _PIIND.entry_price - 1) * 100
+    assert trig == Decimal("2288.20")
+    assert Decimal("-10") < pct < Decimal("0"), "must land inside the 10% band"
+
+
+def test_strategy_atr_stop_needs_no_clamp() -> None:
+    """The intended stop was always inside the band — the clamp is only a net
+    for when the strategy distance is missing."""
+    trig = _piind_plan(distance=Decimal("200.089"), band=Decimal("10")).place[0].trigger
+    assert trig == Decimal("2314.40")
+
+
+def test_clamp_only_ever_tightens() -> None:
+    """It must never widen a stop past what was asked for."""
+    tight = _piind_plan(distance=Decimal("50"), band=Decimal("10")).place[0].trigger
+    assert tight == Decimal("2464.50")  # untouched by the clamp
+
+
+def test_no_band_means_no_clamp() -> None:
+    """Crypto perps have no circuit band; behaviour must be unchanged there."""
+    assert _piind_plan(band=None).place[0].trigger == Decimal("2011.60")
+
+
+def test_short_position_clamps_upward() -> None:
+    short = PositionInfo(
+        symbol="PIIND", side="short", size=Decimal("15"),
+        entry_price=Decimal("2514.50"),
+    )
+    p = plan_stop_protection(
+        positions=[short], open_orders=[],
+        stop_pct_by_bucket={"swing-indian": Decimal("20")},
+        attribution={"PIIND": ("swing-indian", "m")},
+        tick_sizes={"PIIND": Decimal("0.05")},
+        price_band_pct={"PIIND": Decimal("10")},
+    )
+    trig = p.place[0].trigger
+    assert trig == Decimal("2740.80")
+    assert trig < _PIIND.entry_price * Decimal("1.20")  # tighter than the raw 20%

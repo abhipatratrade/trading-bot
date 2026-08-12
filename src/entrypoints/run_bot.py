@@ -140,6 +140,31 @@ def _probe_with_retry(client: object, account_ref: str) -> None:
             )
 
 
+def _price_bands(data: object, is_dhan: bool) -> dict[str, Decimal | None] | None:
+    """symbol → daily circuit band %, from Dhan's scrip master.
+
+    None for non-Dhan accounts: crypto perpetuals have no circuit band, so
+    there is nothing to clamp against and the stop percent stands as configured.
+    """
+    if not is_dhan or data is None:
+        return None
+    try:
+        universe = data.universe  # type: ignore[attr-defined]
+    except Exception:
+        _log.warning("price_band_lookup_failed", exc_info=True)
+        return None
+    out: dict[str, Decimal | None] = {}
+    for sym, info in universe.items():
+        raw = (info or {}).get("band_pct")
+        if not raw:
+            continue
+        try:
+            out[sym] = Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            continue
+    return out
+
+
 def _handle_signal(signum: int, _frame: object) -> None:
     global _shutdown
     _log.info("shutdown_signal_received", signal=signum)
@@ -540,6 +565,10 @@ def main() -> None:
                     # it protects (2026-08-11: an INTRADAY position got an MTF
                     # stop and Dhan rejected it 116 times).
                     product_by_bucket=stop_products,
+                    # A trigger outside the scrip's daily circuit band is
+                    # refused at validation, so the position ends up with NO
+                    # stop (PIIND, 2026-08-12). Clamp inside the band.
+                    price_band_pct=_price_bands(dhan_data, ref in dhan_accounts),
                     clock=clock,
                     shared_account=ref in dhan_accounts,
                 )
