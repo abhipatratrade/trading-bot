@@ -394,3 +394,80 @@ def test_an_ordinary_bug_is_not_transient() -> None:
     """A KeyError in our own sweep is not upstream weather — page immediately."""
     assert is_transient_upstream_error(KeyError("boom")) is False
     assert is_transient_upstream_error(ValueError("boom")) is False
+
+
+# ── holdings: the blind spot that made swing-indian unable to exit ────────
+# Dhan splits a delivery trade across two endpoints by TIME:
+#   /v2/positions  "all open positions FOR THE DAY"
+#   /v2/holdings   "bought/sold in PREVIOUS trading sessions"
+# The bot read only positions, so every swing-indian position — a strategy that
+# holds for DAYS by design — went invisible the morning after it opened. On
+# 2026-08-13 PIIND (15 @ 2514.50) had no stop, no exit and no alarm, because the
+# reconciler had concluded it was closed.
+_HOLDING = {
+    "tradingSymbol": "PIIND", "securityId": "24184", "exchange": "NSE",
+    "totalQty": 15, "availableQty": 15, "collateralQty": 15, "t1Qty": 0,
+    "avgCostPrice": 2514.5,
+}
+
+
+def _pos(symbol="PIIND", net=15, avg=2500.0):
+    return {"tradingSymbol": symbol, "netQty": net, "buyAvg": avg,
+            "productType": "MTF", "positionType": "LONG"}
+
+
+def test_settled_holding_appears_as_a_position() -> None:
+    http = _FakeHttp({"GET /v2/positions": [_Resp([])],
+                      "GET /v2/holdings": [_Resp([_HOLDING])]})
+    got = _client(http).get_positions()
+    assert len(got) == 1
+    assert got[0].symbol == "PIIND"
+    assert got[0].side == "long"
+    assert got[0].size == Decimal("15")
+    assert got[0].raw["_source"] == "holdings"
+
+
+def test_holding_uses_available_not_total_qty() -> None:
+    """Dhan defines availableQty as 'quantity available for transaction'.
+    totalQty can include stock that is not sellable, and sizing a reduce-only
+    sell off it would try to sell more than we can deliver."""
+    h = {**_HOLDING, "totalQty": 40, "availableQty": 15}
+    http = _FakeHttp({"GET /v2/positions": [_Resp([])],
+                      "GET /v2/holdings": [_Resp([h])]})
+    assert _client(http).get_positions()[0].size == Decimal("15")
+
+
+def test_zero_available_holding_is_skipped() -> None:
+    h = {**_HOLDING, "availableQty": 0}
+    http = _FakeHttp({"GET /v2/positions": [_Resp([])],
+                      "GET /v2/holdings": [_Resp([h])]})
+    assert _client(http).get_positions() == []
+
+
+def test_position_wins_over_holding_for_the_same_symbol() -> None:
+    """The endpoints are disjoint by Dhan's definition (today vs previous
+    sessions), but if a symbol ever appeared in both, counting it twice would
+    size a reduce-only sell at 2x and could flip the account short."""
+    http = _FakeHttp({"GET /v2/positions": [_Resp([_pos()])],
+                      "GET /v2/holdings": [_Resp([_HOLDING])]})
+    got = _client(http).get_positions()
+    assert len(got) == 1
+    assert got[0].raw.get("_source") is None  # the positions row, not holdings
+    assert got[0].entry_price == Decimal("2500.0")
+
+
+def test_positions_and_holdings_of_different_symbols_both_appear() -> None:
+    http = _FakeHttp({"GET /v2/positions": [_Resp([_pos(symbol="SUZLON")])],
+                      "GET /v2/holdings": [_Resp([_HOLDING])]})
+    got = {p.symbol for p in _client(http).get_positions()}
+    assert got == {"SUZLON", "PIIND"}
+
+
+def test_holdings_failure_degrades_to_positions_only() -> None:
+    """Fail-soft: losing the holdings leg returns the pre-2026-08-14 view.
+    Degrading to the old blind spot beats failing the whole sweep, which would
+    protect nothing at all."""
+    http = _FakeHttp({"GET /v2/positions": [_Resp([_pos(symbol="SUZLON")])],
+                      "GET /v2/holdings": [_Resp({"x": 1}, status=500)]})
+    got = _client(http).get_positions()
+    assert [p.symbol for p in got] == ["SUZLON"]

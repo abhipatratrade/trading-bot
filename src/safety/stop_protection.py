@@ -163,6 +163,7 @@ def plan_stop_protection(
     owned_quantities: dict[str, Decimal] | None = None,
     stop_distances: dict[str, Decimal] | None = None,
     price_band_pct: dict[str, Decimal | None] | None = None,
+    entry_prices: dict[str, Decimal] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -234,11 +235,15 @@ def plan_stop_protection(
 
         want_side = "sell" if pos.side == "long" else "buy"
         tick = ticks.get(pos.symbol)
-        trigger = expected_trigger(pos.entry_price, pos.side, pct, tick)
+        # A settled holding reports the BLENDED average across every buy of
+        # the scrip, the user's included. Our own ledger entry is the only
+        # price this bot's stop should be measured from.
+        entry = (entry_prices or {}).get(pos.symbol) or pos.entry_price
+        trigger = expected_trigger(entry, pos.side, pct, tick)
         distance = (stop_distances or {}).get(pos.symbol)
         if distance is not None and distance > 0:
             strategy_trigger = expected_trigger_at_distance(
-                pos.entry_price, pos.side, distance, tick
+                entry, pos.side, distance, tick
             )
             # Only ever tighten: the bucket pct is the guaranteed worst case.
             inside = (
@@ -264,8 +269,8 @@ def plan_stop_protection(
         # Clamp to just inside the band: a tighter stop that EXISTS beats a
         # correctly-sized one that does not. Only ever tightens, never widens.
         band = (price_band_pct or {}).get(pos.symbol)
-        if band and band > 0 and pos.entry_price > 0:
-            limit = pos.entry_price * (
+        if band and band > 0 and entry > 0:
+            limit = entry * (
                 Decimal("1") - (band * _BAND_SAFETY) / Decimal("100")
                 if pos.side == "long"
                 else Decimal("1") + (band * _BAND_SAFETY) / Decimal("100")
@@ -280,7 +285,7 @@ def plan_stop_protection(
                     band_pct=str(band),
                 )
                 trigger = expected_trigger_at_distance(
-                    pos.entry_price, pos.side, abs(pos.entry_price - limit), tick
+                    entry, pos.side, abs(entry - limit), tick
                 )
 
         kept = None
@@ -421,6 +426,60 @@ def merge_attribution(
     return out
 
 
+def _load_entry_prices(bucket_ids: list[str]) -> dict[str, Decimal]:
+    """symbol → the price the BOT actually entered at, from its own ledger.
+
+    Needed because a settled holding reports Dhan's ``avgCostPrice``, defined in
+    their spec as the average "across full position" — blended over every buy
+    of that scrip, including the user's own on this shared account (Decision
+    027). If the user holds 100 of a name at 2000 and the bot bought 15 at 2514,
+    the broker reports ~2067, and a stop computed from that sits at a price the
+    bot's trade never justified.
+
+    Same newest-unpaired-entry rule as the two loaders above, so all three agree
+    on what "the open entry" means.
+    """
+    out: dict[str, Decimal] = {}
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(Trade)
+                .where(
+                    Trade.bucket_id.in_(bucket_ids),
+                    Trade.status.in_(
+                        [
+                            OrderStatus.PENDING,
+                            OrderStatus.OPEN,
+                            OrderStatus.PARTIAL,
+                            OrderStatus.FILLED,
+                        ]
+                    ),
+                )
+                .order_by(Trade.created_at.desc())
+                .limit(500)
+            )
+            .scalars()
+            .all()
+        )
+        for t in rows:
+            extra = t.extra or {}
+            if t.symbol in out or extra.get("reduce_only"):
+                continue
+            if extra.get("closed_by_trade_id"):
+                continue
+            # Prefer the actual fill; fall back to the price we asked for.
+            raw = extra.get("avg_fill_price") or t.price
+            if raw is None:
+                continue
+            try:
+                value = Decimal(str(raw))
+            except (ArithmeticError, ValueError):
+                continue
+            if value > 0:
+                out[t.symbol] = value
+    return out
+
+
 def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
     """symbol → protective-stop distance stamped on its open entry Trade.
 
@@ -535,6 +594,7 @@ def ensure_stop_protection(
         owned_quantities=owned,
         stop_distances=_load_stop_distances(bucket_ids),
         price_band_pct=price_band_pct,
+        entry_prices=_load_entry_prices(bucket_ids),
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"

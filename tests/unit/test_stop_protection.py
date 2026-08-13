@@ -610,3 +610,43 @@ class TestPlaceRetryBudget:
         src = inspect.getsource(sp.ensure_stop_protection)
         assert "stop_place_budget_exhausted" in src
         assert "_log.debug" in src  # quiet here; stop_coverage does the shouting
+
+
+def test_ledger_entry_overrides_the_brokers_blended_average() -> None:
+    """A settled holding reports avgCostPrice, which Dhan defines as the average
+    "across full position" — blended over every buy of that scrip INCLUDING the
+    user's own on this shared account (Decision 027). If the user holds 100 at
+    2000 and the bot bought 15 at 2514, the broker reports ~2067 and a stop
+    computed from it sits at a price the bot's trade never justified.
+    """
+    holding = PositionInfo(
+        symbol="PIIND", side="long", size=Decimal("15"),
+        entry_price=Decimal("2067.00"),  # blended, what Dhan reports
+    )
+    p = plan_stop_protection(
+        positions=[holding], open_orders=[],
+        stop_pct_by_bucket={"swing-indian": Decimal("20")},
+        attribution={"PIIND": ("swing-indian", "mean_reversion_1h")},
+        tick_sizes={"PIIND": Decimal("0.05")},
+        stop_distances={"PIIND": Decimal("200.089")},
+        entry_prices={"PIIND": Decimal("2514.50")},  # ours, from the ledger
+    )
+    # 2514.50 - 200.089 = 2314.41 -> snapped. Off the BLENDED average it would
+    # have been 1866.91, which is a different trade entirely.
+    assert p.place[0].trigger == Decimal("2314.40")
+
+
+def test_falls_back_to_broker_entry_when_ledger_has_none() -> None:
+    """Crypto sub-accounts are exclusively the bot's, so the broker's entry is
+    correct there and must keep working unchanged."""
+    pos = PositionInfo(
+        symbol="BTCUSD", side="long", size=Decimal("1"),
+        entry_price=Decimal("1000"),
+    )
+    p = plan_stop_protection(
+        positions=[pos], open_orders=[],
+        stop_pct_by_bucket={"longterm-crypto": Decimal("10")},
+        attribution={"BTCUSD": ("longterm-crypto", "top5_volume")},
+        entry_prices=None,
+    )
+    assert p.place[0].trigger == Decimal("900")

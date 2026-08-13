@@ -376,7 +376,74 @@ class DhanClient(Broker):
             raw=result if isinstance(result, dict) else {"result": result},
         )
 
+    def get_holdings(self) -> list[PositionInfo]:
+        """Settled delivery stock, as positions.
+
+        Dhan splits a delivery trade across two endpoints by TIME, not by kind:
+
+            /v2/positions  "all open positions FOR THE DAY"
+            /v2/holdings   "bought/sold in PREVIOUS trading sessions,
+                            including T1 and delivered quantities"
+
+        So an MTF buy lives in ``positions`` on its purchase day and moves to
+        ``holdings`` from the next session onward. The bot read only positions,
+        which meant every swing-indian position — a strategy that holds for DAYS
+        by design — became invisible the morning after it opened. On 2026-08-13
+        PIIND (15 @ 2514.50) had no stop, no exit, no P&L and no alarm, because
+        the reconciler had concluded it was closed. The bucket could enter and
+        then never exit.
+
+        ``availableQty`` is the sellable number — Dhan defines it as "quantity
+        available for transaction". NOT ``totalQty``, which counts stock pledged
+        elsewhere or otherwise unsellable.
+
+        ``entry_price`` here is Dhan's ``avgCostPrice``, defined as the average
+        "across full position" — i.e. blended over every purchase INCLUDING the
+        user's own on this shared account. It is therefore a fallback only; the
+        stop path overrides it with the bot's own ledger entry (see
+        ``_load_entry_prices``), because a trigger computed off a blended
+        average is a trigger at the wrong price.
+        """
+        result = self._request("GET", "/v2/holdings") or []
+        out: list[PositionInfo] = []
+        for h in result:
+            qty = Decimal(str(h.get("availableQty", 0) or 0))
+            if qty <= 0:
+                continue
+            out.append(
+                PositionInfo(
+                    symbol=h.get("tradingSymbol", str(h.get("securityId", ""))),
+                    side="long",  # you cannot hold a short in a demat account
+                    size=qty,
+                    entry_price=Decimal(str(h.get("avgCostPrice", 0) or 0)),
+                    raw={**h, "_source": "holdings"},
+                )
+            )
+        return out
+
     def get_positions(self) -> list[PositionInfo]:
+        """Open positions, UNION settled holdings.
+
+        A union is correct rather than a merge because the two endpoints are
+        disjoint by Dhan's own definition — today vs previous sessions — so the
+        same shares cannot be counted twice. Positions still win on a symbol
+        present in both: that is the fresher view, and it carries the side, so a
+        same-day re-entry is never mistaken for settled stock.
+
+        Fail-soft on the holdings leg: if it errors we return positions alone,
+        which is exactly the pre-2026-08-14 behaviour. Degrading to the old blind
+        spot beats failing the whole sweep, which protects nothing at all.
+        """
+        positions = self._positions_only()
+        try:
+            holdings = self.get_holdings()
+        except Exception:
+            self._log.warning("dhan_holdings_fetch_failed", exc_info=True)
+            return positions
+        seen = {p.symbol for p in positions}
+        return positions + [h for h in holdings if h.symbol not in seen]
+
+    def _positions_only(self) -> list[PositionInfo]:
         result = self._request("GET", "/v2/positions") or []
         positions: list[PositionInfo] = []
         for p in result:
