@@ -65,3 +65,8 @@ Thumbs.db
 # that normally writes it has an ephemeral disk anyway. Committing it would put
 # the audit log in git history and grow the repo without bound.
 data/exports/
+# Generated cache: Dhan's scrip master, refetched on demand and written by
+# DhanData._load_universe. Committed by accident on 2026-08-14, which broke
+# the VM's ff-only deploy for 15 minutes — the box keeps its own copy as an
+# untracked file, and git refuses to overwrite one.
+data/dhan_universe.json
