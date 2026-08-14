@@ -85,6 +85,23 @@ class DhanAPIError(Exception):
         super().__init__(f"Dhan API error [{code}]: {message}")
 
 
+# Dhan returns the literal STRING "NA" for an order placed without a
+# correlation id — not null, not "". bool("NA") is True, so a naive truth test
+# reads every one of the user's manually-placed orders as the bot's own.
+#
+# That is not cosmetic. plan_stop_protection CANCELS the resting stops it
+# believes are its own, so on 2026-08-14 the sweep put the user's hand-placed
+# PIIND stop on the cancel list — exactly the Decision 027 violation the
+# correlationId check was added to prevent. The bot must be able to prove an
+# order is its own, and "NA" proves the opposite.
+_NOT_OURS = {"", "na", "none", "null", "0"}
+
+
+def _is_ours(correlation_id: object) -> bool:
+    """True only when Dhan echoes back a correlation id WE set."""
+    return str(correlation_id or "").strip().lower() not in _NOT_OURS
+
+
 def is_invalid_token_error(exc: BaseException) -> bool:
     """True when ``exc`` is a Dhan single-session token invalidation (DH-906).
 
@@ -645,7 +662,7 @@ class DhanClient(Broker):
             # rejected — the moment MTF consent let one through, it would have
             # stacked a new resting stop each minute for the life of the
             # position.
-            reduce_only=bool(trig) and bool(o.get("correlationId")),
+            reduce_only=bool(trig) and _is_ours(o.get("correlationId")),
             created_at=_parse_ts(o.get("createTime")),
             raw=o,
         )

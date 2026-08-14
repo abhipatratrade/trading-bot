@@ -471,3 +471,37 @@ def test_holdings_failure_degrades_to_positions_only() -> None:
                       "GET /v2/holdings": [_Resp({"x": 1}, status=500)]})
     got = _client(http).get_positions()
     assert [p.symbol for p in got] == ["SUZLON"]
+
+
+# ── correlationId "NA": the bot must not adopt the user's orders ──────────
+def _order_row(corr, trig=159.0):
+    return {"orderId": "1", "correlationId": corr, "tradingSymbol": "PIIND",
+            "transactionType": "SELL", "quantity": 1, "filledQty": 0,
+            "orderType": "STOP_LOSS_MARKET", "orderStatus": "PENDING",
+            "triggerPrice": trig, "createTime": "2026-08-14 09:15:05"}
+
+
+def test_dhan_na_correlation_id_is_not_ours() -> None:
+    """Dhan returns the literal string "NA" for an order placed without a
+    correlation id. bool("NA") is True, so the naive check adopted the user's
+    hand-placed PIIND stop on 2026-08-14 — and plan_stop_protection CANCELS
+    what it thinks is its own (Decision 027)."""
+    http = _FakeHttp({"GET /v2/orders": [_Resp([_order_row("NA")])]})
+    assert _client(http).get_open_orders()[0].reduce_only is False
+
+
+def test_our_own_correlation_id_is_recognised() -> None:
+    http = _FakeHttp({"GET /v2/orders": [_Resp([_order_row("abc123def")])]})
+    assert _client(http).get_open_orders()[0].reduce_only is True
+
+
+def test_other_absent_id_spellings_are_not_ours() -> None:
+    for corr in ("", None, "na", "None", "null", "0", "  NA  "):
+        http = _FakeHttp({"GET /v2/orders": [_Resp([_order_row(corr)])]})
+        got = _client(http).get_open_orders()[0].reduce_only
+        assert got is False, f"{corr!r} must not read as the bot's own order"
+
+
+def test_a_plain_order_with_our_id_is_still_not_a_stop() -> None:
+    http = _FakeHttp({"GET /v2/orders": [_Resp([_order_row("abc123", trig=0)])]})
+    assert _client(http).get_open_orders()[0].reduce_only is False
