@@ -16,6 +16,22 @@ from enum import StrEnum
 from typing import Any
 
 
+class AttachedStopRetireError(Exception):
+    """A closing order was ABANDONED because its attached stop could not go.
+
+    Lives on the broker CONTRACT rather than in one adapter because it says
+    something every caller needs to act on regardless of venue: **the closing
+    order was never sent**. ``OrderManager`` treats it differently from a
+    normal failure for that reason — no recovery lookup (nothing landed) and
+    no REJECTED row (nothing was refused).
+
+    Raised by adapters whose venue keeps a protective stop attached to the
+    entry (Decision 034), when that stop cannot be retired before the position
+    is closed. Letting the close proceed would leave the stop resting against a
+    position that no longer exists.
+    """
+
+
 class OrderType(StrEnum):
     MARKET = "market"
     LIMIT = "limit"
@@ -57,6 +73,25 @@ class OrderRequest:
     # a ₹10k slot silently consuming ₹40k of cash. The fallback must clamp to
     # this. None ⇒ no fallback; the rejection propagates.
     fallback_max_size: Decimal | None = None
+    # Protective stop to be placed ATOMICALLY WITH THIS ENTRY, by venues that
+    # support it (Dhan Super Order — Decision 034). Distinct from
+    # ``stop_price``, which makes the order ITSELF a standalone stop.
+    #
+    # The difference is the whole point of Decision 034: a separate stop is
+    # placed AFTER the entry fills, so a stop the venue refuses leaves a naked
+    # position. An attached stop is part of the same request, so a refused stop
+    # means the ENTRY never happens. Fail-safe instead of fail-open.
+    #
+    # Never set this without checking ``Broker.supports_attached_stop()`` —
+    # ``OrderManager.place_order`` raises rather than let an adapter that
+    # cannot honour it place an unprotected entry.
+    attached_stop_price: Decimal | None = None
+    # Take-profit for the same atomic order. Dhan REQUIRES a target leg on a
+    # super order, but no strategy here has a target, so this exists to be
+    # satisfied and then retired — see ``DhanClient.place_order``. Callers that
+    # genuinely want no target leave it None and let the adapter choose a value
+    # it can immediately cancel.
+    attached_target_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +269,46 @@ class Broker(ABC):
         placement.
         """
         return None
+
+    def supports_attached_stop(self) -> bool:  # noqa: B027
+        """True when this venue can carry a protective stop ON the entry order.
+
+        False (the default, and Delta India) means protection has to be a
+        SEPARATE order placed after the fill — the Decision 022 sweep, with the
+        window between fill and stop that Decision 034 exists to close.
+
+        Callers must consult this before setting ``OrderRequest``'s
+        ``attached_stop_price``; ``OrderManager.place_order`` refuses to send an
+        attached stop to an adapter that answers False, because an adapter that
+        silently dropped it would place exactly the unprotected entry the
+        attachment was meant to prevent.
+        """
+        return False
+
+    def attached_stop_triggers(self) -> dict[str, Decimal]:  # noqa: B027
+        """``symbol → trigger`` for stops the venue holds against our entries.
+
+        Only meaningful when :meth:`supports_attached_stop` is True. The
+        Decision 022 sweep reads this to know a position is ALREADY protected,
+        so it neither stacks a second resting stop on top nor treats the
+        venue's own leg as an orphan to cancel.
+
+        Empty dict ⇒ nothing attached (or the venue has no such concept), which
+        is the pre-Decision-034 behaviour.
+        """
+        return {}
+
+    def retire_attached_stop(self, symbol: str) -> None:  # noqa: B027
+        """Cancel the venue-side stop attached to ``symbol``'s entry.
+
+        Called on two paths: before the bot closes a position (so the stop
+        cannot outlive it), and by the sweep when a leg is found with no
+        position behind it at all.
+
+        Must raise :class:`AttachedStopRetireError` if a stop exists and cannot
+        be retired — callers rely on that to abandon a close rather than risk
+        selling twice. No-op by default, for venues with nothing attached.
+        """
 
     def wallet_flow_totals(self) -> tuple[Decimal, Decimal] | None:  # noqa: B027
         """(total_deposited, total_withdrawn) in the account's settlement

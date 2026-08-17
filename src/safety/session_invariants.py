@@ -206,18 +206,27 @@ def check_stop_coverage(
     holdings: dict[str, Decimal],
     open_orders: list[OpenOrder],
     sustain_ticks: int,
+    attached_stops: dict[str, Decimal] | None = None,
 ) -> InvariantResult:
     """Every bot-held position needs a resting reduce-only stop (Decision 022).
 
     Runs AFTER the sweep, so a gap here means the sweep tried and failed (or
     never planned one) — not that it hasn't got to it yet.
+
+    ``attached_stops`` (Decision 034) are positions the VENUE protects via a
+    stop leg carried on the entry order itself. They count as covered on their
+    own evidence rather than via ``open_orders``: a super-order leg is only
+    recognisable there if Dhan echoes our ``correlationId`` onto it, which is
+    unverified. Relying on that would make this check HALT every bucket holding
+    a super-order position — the invariant firing precisely because the
+    stronger protection was used.
     """
     name = "stop_coverage"
     covered = {
         o.symbol
         for o in open_orders
         if o.reduce_only and o.stop_price is not None and o.unfilled_size > 0
-    }
+    } | set(attached_stops or {})
     uncovered = sorted(set(holdings) - covered)
     if not uncovered:
         return InvariantResult(name, bucket_id, ok=True)
@@ -721,6 +730,7 @@ def run_session_invariants(
     clock: Clock | None = None,
     shared_account: bool = False,
     check_liveness: bool = True,
+    attached_stops_enabled: bool = False,
 ) -> list[InvariantResult]:
     """Evaluate every invariant for one account. Reads, never writes.
 
@@ -738,6 +748,22 @@ def run_session_invariants(
     open_orders = broker.get_open_orders()
     entry_prices = {p.symbol: p.entry_price for p in positions}
     reject_since = now - timedelta(minutes=thresholds.reject_window_minutes)
+
+    # Decision 034: stops the venue carries on the entry order itself. Fetched
+    # per account alongside the other two reads. Fail-soft to empty here — the
+    # opposite of the sweep's fail-closed — because this is an OBSERVER: an
+    # empty answer makes stop_coverage shout about positions that are in fact
+    # protected, which is noisy but safe, whereas skipping the check would
+    # silence the alarm that a genuinely naked position depends on.
+    # Gated on the feature, not the capability — see the same guard in
+    # ``ensure_stop_protection``. With the feature off there are no legs to
+    # find, so the request would be pure cost on a rate-limited account.
+    attached_stops: dict[str, Decimal] = {}
+    if attached_stops_enabled and broker.supports_attached_stop():
+        try:
+            attached_stops = broker.attached_stop_triggers()
+        except Exception:
+            _log.warning("invariant_attached_stop_lookup_failed", exc_info=True)
 
     account_owned: dict[str, Decimal] | None = None
     if shared_account:
@@ -784,6 +810,7 @@ def run_session_invariants(
                 holdings=holdings,
                 open_orders=open_orders,
                 sustain_ticks=thresholds.stop_coverage_sustain_ticks,
+                attached_stops=attached_stops,
             )
         )
         results.append(

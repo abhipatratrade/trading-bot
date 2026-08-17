@@ -41,6 +41,7 @@ from sqlalchemy import select
 from src.brokers.base import Broker, OrderType
 from src.core.alerts import send_alert_dedup
 from src.core.clock import Clock, RealClock
+from src.core.config import get_settings
 from src.core.db import session_scope
 from src.core.logging import get_logger
 from src.core.models import (
@@ -57,6 +58,7 @@ from src.core.models import (
 from src.data_sources.base import MarketData
 from src.order_manager.manager import KillSwitchEngagedError, OrderManager
 from src.safety import kill_switch
+from src.safety.stop_protection import resolve_stop_trigger, resolve_target_price
 from src.shared.allocator.sizer import (
     AllocatorConfig,
     dedup_window_hours_for_tf,
@@ -430,6 +432,13 @@ class BucketRunner:
                             margin_inr=res.required_margin_inr,
                             decision_price=mark_prices.get(sym),
                         ),
+                        # Decision 034: the same two numbers the sweep would
+                        # have used AFTER the fill, supplied BEFORE it so the
+                        # stop can ride on the entry order itself.
+                        mark_price=mark_prices.get(sym),
+                        stop_distance=_hint_decimal(
+                            hints.get(sym, {}), "stop_distance"
+                        ),
                     )
                     placed += 1
                 else:
@@ -797,8 +806,22 @@ class BucketRunner:
         size: Decimal,
         fallback_max_size: Decimal | None = None,
         extra_payload: dict[str, object] | None = None,
+        mark_price: Decimal | None = None,
+        stop_distance: Decimal | None = None,
     ) -> None:
         try:
+            # Inside the try ON PURPOSE. If the venue can attach a stop but we
+            # cannot compute one, this raises and the handler below skips the
+            # ENTRY. That is the whole point of Decision 034: no protection, no
+            # trade. Falling through to an unprotected entry would restore the
+            # exact failure mode being removed.
+            attached_stop, attached_target = self._attached_protection(
+                broker=broker,
+                symbol=symbol,
+                side=side,
+                mark_price=mark_price,
+                stop_distance=stop_distance,
+            )
             om.place_order(
                 strategy_id=self.bucket.id,
                 bucket_id=self.bucket.id,
@@ -811,6 +834,8 @@ class BucketRunner:
                 product=self.bucket.config.product,
                 fallback_max_size=fallback_max_size,
                 extra_payload=extra_payload,
+                attached_stop_price=attached_stop,
+                attached_target_price=attached_target,
                 intent_id=f"open-{self._clock.now().strftime('%Y%m%d%H%M')}",
             )
         except KillSwitchEngagedError:
@@ -832,10 +857,119 @@ class BucketRunner:
                 f"[{self.bucket.id}] FAILED to open {symbol} via {strat_name}",
             )
 
+    def _attached_protection(
+        self,
+        *,
+        broker: Broker,
+        symbol: str,
+        side: str,
+        mark_price: Decimal | None,
+        stop_distance: Decimal | None,
+    ) -> tuple[Decimal | None, Decimal | None]:
+        """``(stop, target)`` to carry ON this entry order, or ``(None, None)``.
+
+        ``(None, None)`` means "this venue protects positions the Decision 022
+        way" — a separate stop rested by the sweep after the fill. Crypto takes
+        that path unchanged.
+
+        Where the venue CAN attach a stop, failing to produce one raises rather
+        than returning None, because the caller treats an exception as "skip the
+        entry" and None as "the old path will handle it". Confusing the two is
+        how this feature would silently become a no-op.
+
+        Note the reference price is the MARK at decision time, not the fill: a
+        market entry has no fill price yet, and the stop has to be in the same
+        request. That is closer to the backtest than the sweep's behaviour, not
+        further — the backtest fixes the stop at the entry BAR — but it does
+        mean slippage between mark and fill shifts the stop by that much.
+        """
+        if not broker.supports_attached_stop():
+            return None, None
+        # BOTH gates. The bucket flag is the rollout unit (one bucket at a
+        # time); the setting is the process-wide master kill, so the feature can
+        # be switched off on the VM without editing and redeploying YAML.
+        if not (
+            self.bucket.config.attached_stops
+            and get_settings().attached_stops_enabled
+        ):
+            return None, None
+        pct = self.bucket.config.stop_loss_pct
+        if pct is None:
+            # A bucket with no crash net configured has nothing to attach. The
+            # sweep already pages about this via ``unprotectable``; do not also
+            # block its entries.
+            return None, None
+        if mark_price is None or mark_price <= 0:
+            raise ValueError(
+                f"no mark price for {symbol}: cannot compute an attached stop, "
+                "and an entry without one is exactly what Decision 034 forbids"
+            )
+
+        position_side = "long" if side == "buy" else "short"
+        tick = broker.tick_size(symbol)
+        band = self._price_band_pct(symbol)
+        stop = resolve_stop_trigger(
+            entry_price=mark_price,
+            position_side=position_side,
+            stop_pct=pct,
+            distance=stop_distance,
+            band_pct=band,
+            tick=tick,
+            symbol=symbol,
+        )
+        target = resolve_target_price(
+            entry_price=mark_price,
+            position_side=position_side,
+            band_pct=band,
+            tick=tick,
+        )
+        if stop <= 0 or target <= 0:
+            raise ValueError(
+                f"nonsensical attached protection for {symbol}: "
+                f"stop={stop} target={target}"
+            )
+        return stop, target
+
+    def _price_band_pct(self, symbol: str) -> Decimal | None:
+        """The scrip's daily circuit band, from Dhan's scrip master.
+
+        None when unknown — both callers degrade sensibly (the stop keeps its
+        configured distance, the target falls back to a tight default).
+        """
+        try:
+            universe = self._data.universe  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        raw = ((universe or {}).get(symbol) or {}).get("band_pct")
+        if not raw:
+            return None
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            return None
+        return value if value > 0 else None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _hint_decimal(hint: dict[str, object], key: str) -> Decimal | None:
+    """One numeric field off a strategy hint, or None if absent/unparseable.
+
+    Strategy hints are free-form dicts, so an unusable value must degrade to
+    None rather than raise — the caller then falls back to the bucket's percent
+    net, which is the pre-Decision-032 behaviour.
+    """
+    raw = hint.get(key)
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (ArithmeticError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _entry_extra(
     *,
     hint: dict[str, object],

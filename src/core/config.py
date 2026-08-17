@@ -259,6 +259,21 @@ class Settings(BaseSettings):
     # and is reversible from the dashboard.
     session_invariants_enforcing: bool = True
 
+    # -- Attached (venue-side) protective stops — Decision 034 ---------------
+    # OFF by default, and deliberately so. When on, an Indian equity entry is
+    # sent as a Dhan Super Order carrying its own STOP_LOSS_LEG, so a stop the
+    # venue refuses means the ENTRY is refused too — instead of the position
+    # opening and sitting naked while a 60s sweep fails to protect it, which is
+    # what happened to PIIND on 2026-08-12.
+    #
+    # It defaults off because it CANNOT BE REHEARSED. There is no usable Dhan
+    # sandbox for this endpoint, so the first real super order is also the
+    # first test, and every prior Dhan integration shipped unrehearsed has been
+    # wrong on first contact (the client-id header, the MTF product on stops,
+    # the trigger outside the price band). Turn it on for ONE bucket, watch the
+    # first entry, and keep the Decision 022 sweep behind it as the net.
+    attached_stops_enabled: bool = False
+
     # -- Retention (nightly prune job on the Railway scheduler) --------------
     # audit_log keeps 3× longer — it's the forensic record (House Rule #8).
     snapshot_retention_days: int = 60

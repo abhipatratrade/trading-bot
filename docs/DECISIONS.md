@@ -1298,3 +1298,224 @@ the broker would cause the very outage it exists to detect.
 **Placement:** not on the Mumbai VM. A dead VM must not be able to silence
 its own watchdog — the same reasoning that put the heartbeat watch on Railway
 (Decision 020's geo-block does not apply, since neither tier touches Binance).
+
+---
+
+## 034 — The stop rides on the entry order (Dhan Super Order)
+Date: 2026-08-17
+Status: Accepted, shipped behind a flag (OFF)
+Amends: 022 (for Dhan equity only), 032
+Related house rules: #2, #7, #8
+
+Context: Decision 022 protects a position with a SEPARATE reduce-only
+stop-market order, rested by a 60-second sweep AFTER the entry fills. That
+ordering has a window in it, and in the week of 2026-08-11 the window produced
+four production bugs:
+
+| Failure | Cause |
+|---|---|
+| Attribution race | the sweep ran seconds after the fill, before any `Position` row existed — twice (`_load_attribution`, then `_load_stop_distances` ten lines below it) |
+| Wrong product | the stop went out as MTF against an INTRADAY position; Dhan rejected it 116 times |
+| Duplicate stops | the adapter hardcoded `reduce_only=False`, so the sweep could never recognise a stop it had already placed |
+| **Naked position** | swing-indian's first ever fill (PIIND, 15 @ 2514.50) opened, and the stop was then found to be unplaceable — the position sat unprotected and the bucket halted itself |
+
+The last row is the one that matters. The bot entered a trade and only
+afterwards discovered it could not protect it. Three of the four fixes were
+patches around a race that a different design does not have.
+
+Decision: on Dhan, an entry is placed as a **Super Order** — entry, target and
+stop-loss legs in ONE request (`POST /v2/super/orders`) — so the protective
+stop is accepted or refused **with the entry, not after it**.
+
+The property being bought is not "a faster stop". It is the inversion of the
+failure mode: **an unplaceable stop now means the trade does not happen.**
+Fail-safe instead of fail-open.
+
+### What this does NOT change
+- **Crypto is untouched.** `Broker.supports_attached_stop()` is False by
+  default; Delta India keeps the Decision 022 sweep exactly as it was.
+- **The sweep stays.** It still protects legacy positions opened the old way,
+  still runs for crypto, and is still the net if this path is turned off.
+- **The stop distance is unchanged** — Decision 032's 3.5 × daily ATR14, via
+  the same arithmetic (now `resolve_stop_trigger`, shared by both paths so
+  they cannot drift apart the way the two loader functions did).
+
+### The mandatory target leg
+Dhan requires `targetPrice`. Neither strategy has a target — swing-indian
+exits on the band re-cross, intraday holds to 15:15 — so the leg is cancelled
+(`DELETE .../TARGET_LEG`) the moment the entry is accepted.
+
+The obvious implementation is wrong. A target placed "far enough away that it
+can never fill" sits **outside the scrip's daily circuit band**, and Dhan
+refuses an out-of-band price at validation — which here would reject the WHOLE
+super order, entry included. That is the PIIND failure again with the entry as
+the victim instead of the stop. So the target is placed **just inside the
+band** (the furthest it can legally be), then cancelled. A failed cancel is
+recorded on the Trade row, retried by the sweep, and alerted: a surviving
+target is a live exit at a price no backtest justifies (House Rule 7).
+
+### The naked-short guard (the crux)
+A `STOP_LOSS_LEG` rests independently of our position. If a strategy exits and
+the leg is not retired first, it later triggers against stock we no longer
+hold — **on MTF that opens a short**, which is worse than the missing stop this
+decision exists to fix.
+
+Every closing path — `BucketRunner._close_position` and
+`enforcement._flatten_positions` — funnels into `place_order(reduce_only=True)`
+and reaches the Dhan adapter, so the retirement happens **in the adapter**: one
+chokepoint, covering both paths and any written later, without teaching the
+broker-agnostic layer about Dhan leg semantics.
+
+Ordering is strict, and failure is fail-CLOSED: if the leg cannot be cancelled,
+or the lookup that finds it fails, **the closing order is not sent**. Refusing
+to sell is recoverable — the position remains protected by the very leg we
+could not cancel. Selling twice is not.
+
+### Ownership on the shared account (Decision 027)
+It is **unverified whether Dhan echoes `correlationId` onto super-order legs**,
+and it cannot be verified without placing a real order. If it does not, a
+correlationId-only ownership check would classify every one of our own super
+orders as the user's: the bot would never retire a stop before selling, and
+`stop_coverage` would read every position as uncovered and HALT the bucket
+every tick — the invariant firing *because* the stronger protection was used.
+
+So ownership takes two independent proofs: the correlation id, and a ledger
+lookup (`Trade.exchange_order_id`) injected into the adapter. The ledger proof
+also survives a restart, which an in-memory set would not. Neither proof ⇒ not
+ours ⇒ leave it alone, which is the safe direction on a shared account.
+
+### One bug this surfaced in existing code
+`reconciler._enrich_trades_pnl` groups fills by `exchange_order_id`. A super
+order's three legs **share one orderId**, so when the stop fires its SELL fill
+lands in the same bucket as the entry's BUY fill and the average blends the
+two — a number describing no trade that ever happened, flowing into realized
+P&L, the tax ledger and the EOD report. Fills are now matched on side as well
+as order id, which is correct for every broker.
+
+### Rollout
+`attached_stops_enabled` defaults **OFF**, and deliberately so: there is no
+usable Dhan sandbox for this endpoint, so the first real super order is also
+its first execution. Every prior Dhan integration shipped unrehearsed has been
+wrong on first contact — the `client-id` header (76/76 failures, months), the
+MTF product on stops, the trigger outside the price band. This one is written
+from the spec and 31 unit tests, and that is all it is until an entry proves
+otherwise.
+
+Enable for **one bucket**, watch the first entry, keep the sweep behind it.
+That needs TWO gates, because a process-wide switch cannot express it — one
+flip would arm swing-indian and intraday-indian in the same instant, on one
+shared live account, unrehearsed. So `attached_stops: true` per bucket in
+`buckets.yaml` is the rollout unit, and `attached_stops_enabled` stays as the
+env-level master kill (switch it off on the VM without editing YAML). Both
+must be true. Both default false.
+
+**intraday-indian is the right pilot, not swing-indian.** Its positions square
+off at 15:15, so a leg can never survive overnight — which removes the largest
+unverified assumption in the whole design (whether a super order placed on
+Monday is still listed, and its leg still resting, on Friday). Its stop is a
+15% crash net deliberately far outside normal range, so the leg firing is a
+tail event rather than the expected exit — which is what keeps the unbuilt
+settlement half (below) off the critical path. swing-indian is the opposite on
+both counts: it holds for days and its ATR stop is *meant* to fire.
+
+**Verifiable offline:** body construction, the CNC fallback keeping its stop,
+cancel-before-close ordering, fail-closed on cancel failure, ownership under a
+missing correlationId, sweep coexistence, the invariant, and the trigger/target
+arithmetic (the band clamp reproduces the live PIIND figure, 2288.20).
+**Only verifiable live:** whether Dhan accepts the body, and whether
+`correlationId` comes back on the legs.
+
+### The settlement half — built 2026-08-17, and it fixes an older hole too
+
+The first draft of this decision shipped placement only, and left a gap: when a
+`STOP_LOSS_LEG` fires, the venue sells the stock but the bot sends no order, so
+no `Trade` row is written. `net_owned` decrements only on a FILLED SELL row, so
+the ledger would keep counting shares that are gone — and that ledger is the
+ONLY thing separating the bot's stock from the user's on this shared account
+(Decision 027). A permanent over-count means the next time the user buys the
+same scrip, the bot treats part of THEIR holding as its own.
+
+The obvious fix — ask the venue "did the leg fire" — needs `GET /v2/super/orders`,
+whose cross-day retention is undocumented and unverifiable offline, and
+swing-indian holds for days. That looked like a chicken-and-egg: the feature
+could not ship without the answer, and the answer needed a live super order.
+
+**It is not one, because the bot does not need to know WHAT sold the shares —
+only that they are gone.** `Reconciler._detect_unrecorded_exits` compares the
+bot's own ledger against the position data the sweep already fetches, and
+writes the missing SELL row when the account holds less than the ledger claims.
+No super-order endpoint, no unverified assumption.
+
+Checking that premise turned up something better: **this hole is already open,
+and predates super orders.** `_reconcile_positions` flips the `Position` row
+FLAT when the exchange stops showing a position, but never writes a `Trade`
+row — and the ownership maths reads `Trade`, not `Position`. So today, if the
+user sells the bot's stock by hand, or Dhan's MIS auto-square-off closes an
+intraday position, the ledger is already wrong. Super orders would not have
+created this bug; they would have promoted it from rare to routine. One
+mechanism now covers all three causes.
+
+Two properties carry the safety:
+
+- **A shortfall must survive three consecutive passes.** Not paranoia:
+  `DhanClient.get_positions` fails SOFT on the holdings leg, so one errored
+  `/v2/holdings` makes every settled swing holding briefly look sold. Acting on
+  a single read would record a fictional exit and make the bot abandon a
+  position it still holds. A changed size restarts the count — a position being
+  sold down in pieces is still moving.
+- **A price is taken only when today's SELL fills match the shortfall exactly.**
+  On a shared account the trade book also carries the user's sells, and a
+  partial match cannot be told from theirs. An exit with no price still
+  corrects the ledger — the part that protects the user's stock — and simply
+  does not pair for P&L. A fabricated price would corrupt realized P&L and the
+  tax ledger permanently, which is worse than a gap somebody can see.
+
+The row is deterministic and day-scoped, so re-running cannot duplicate it, and
+it is self-limiting: once written, `net_owned` drops and the shortfall stops
+being detected. `exchange_order_id` is prefixed `unrecorded:` so it can never
+match an open-order set or a `get_order` lookup.
+
+### Adversarial round on the exit ordering (2026-08-17)
+
+**One blocker, found in this session's own code, reproduced and fixed.**
+
+`plan_stop_protection`'s orphan-leg pass called a leg orphaned whenever the
+broker reported no position behind it. But between placing a super order and
+Dhan surfacing the position, **"leg with no position" is exactly what a
+two-second-old entry looks like** — so the sweep would have cancelled the only
+protection a brand-new position had. That is the same race that produced the
+2026-08-11/12 attribution bugs, inverted into something worse: the pre-034 race
+placed a duplicate stop, this one strips the real one.
+
+A ledger check alone cannot fix it. `owned_quantities` counts an entry from
+PENDING and decrements only on a FILLED sell, so for precisely the cases the
+orphan pass exists for — Dhan's 15:20 auto-square-off, a manual close by the
+user — it reports the symbol held forever and the leg would never be retired.
+The guard has to be TIME-bounded: a symbol with a bot entry in the last
+`_ENTRY_GRACE_MINUTES` (5) is never called orphaned. Both directions are pinned
+by test.
+
+**Accepted, not fixed:**
+
+- *Partial entry fill vs leg size.* If Dhan sizes the STOP_LOSS_LEG to the
+  REQUESTED quantity and the market entry only partly fills, the leg oversells
+  on trigger. The old sweep compared stop size to position size; the attached
+  branch cannot, because the leg's quantity is not something we set. Unverifiable
+  offline — **watch the first partial fill.**
+- *Same-minute retry after a blocked exit.* `client_order_id` is UNIQUE and the
+  idempotent-hit set excludes CANCELED, so a second close attempt inside the
+  same minute would raise `IntegrityError` rather than dedupe. Pre-existing —
+  `_mark_rejected` has the identical shape — and out of reach for swing-indian
+  (180s bucket tick). Noted because a misbehaving super-order API would hit the
+  CANCELED path on *every* exit, which is the one scenario that makes it likely.
+- *Three `GET /v2/super/orders` per sweep tick* (target retry, sweep, invariants),
+  plus one per blocked close, on a rate-limited token shared with the user's
+  manual trading. Ownership lookups are now process-cached (positive answers
+  only — a negative is a statement about timing, not ownership). Fetching the
+  list once per tick and passing it down is the remaining cleanup.
+
+**Survived:** the chokepoint itself. Both close paths reach it, the
+`reduce_only and stop_price is None` discriminator excludes protective-stop
+placement, failure is fail-closed, and a crash between the leg DELETE and the
+close self-heals on the next sweep (the symbol drops out of `attached_stops`,
+so the normal path rests a standalone stop).

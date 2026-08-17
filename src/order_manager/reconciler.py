@@ -89,6 +89,11 @@ class Reconciler:
         # model it (~4% of net over 24 months), so the bot books it itself when
         # a round-trip closes: bucket_id → annual rate, e.g. 0.146 = 14.6%/yr.
         self._carry_apr = carry_interest_apr or {}
+        # symbol → (shortfall qty, consecutive passes seen). See
+        # ``_detect_unrecorded_exits``: a position that vanished without a bot
+        # order must be observed repeatedly before the bot writes an exit for
+        # it, because a single bad read would fabricate one.
+        self._shortfall_seen: dict[str, tuple[Decimal, int]] = {}
 
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
@@ -105,7 +110,14 @@ class Reconciler:
     def run(self) -> ReconcileReport:
         """Full pass: positions, orders, wallet sync, then P&L enrichment."""
         report = ReconcileReport()
-        self._reconcile_positions(report)
+        positions = self._reconcile_positions(report)
+        try:
+            # Runs BEFORE P&L enrichment so a recovered exit pairs with its
+            # entry in the same pass, and reuses the positions already fetched
+            # above — Dhan is rate-limited and this sweep is on the 5-min loop.
+            self._detect_unrecorded_exits(report, positions)
+        except Exception:
+            self._log.error("unrecorded_exit_detection_failed", exc_info=True)
         self._reconcile_orders(report)
         self._sync_bucket_state()
         try:
@@ -137,9 +149,277 @@ class Reconciler:
             self._log.info("reconcile_clean")
         return report
 
+    # ── Unrecorded exits ────────────────────────────────────────────
+
+    # Consecutive passes a shortfall must survive before the bot writes an exit
+    # it never sent. NOT paranoia: ``DhanClient.get_positions`` fails SOFT on
+    # the holdings leg — if ``/v2/holdings`` errors it returns intraday
+    # positions alone, which makes every settled swing holding briefly look
+    # sold. Acting on one such read would record a fictional exit and make the
+    # bot abandon a position it still holds. A transient failure does not
+    # survive three passes; a real exit does, and stays detected forever after.
+    _SHORTFALL_CONFIRM_PASSES = 3
+
+    def _detect_unrecorded_exits(
+        self, report: ReconcileReport, positions: list[Any] | None = None
+    ) -> None:
+        """Record exits the ACCOUNT took but the bot never placed.
+
+        The bot answers "how many shares are mine?" by adding its BUY rows and
+        subtracting its SELL rows (``net_owned``). That only balances while
+        every sale of its stock passes through ``OrderManager``. Three things
+        break that assumption, and one of them is new:
+
+          * Dhan's MIS auto-square-off (~15:20) closes intraday positions;
+          * the user sells, by hand, on this SHARED account;
+          * **a Decision 034 stop leg fires** — placed by the venue as part of
+            the entry, so no order is ever sent and no row is ever written.
+
+        In all three the shares leave the account and the ledger keeps counting
+        them. That ledger is the ONLY thing separating the bot's stock from the
+        user's (Decision 027), so a permanent over-count means that the next
+        time the user buys the same scrip, the bot treats part of THEIR holding
+        as its own — and may rest a stop on it or sell it. The trade also never
+        reaches realized P&L, the tax ledger or the EOD report.
+
+        The fix deliberately does NOT try to identify what sold the shares.
+        Asking the venue "did the stop leg fire" needs ``GET /v2/super/orders``,
+        whose cross-day retention is unverified and unverifiable offline. But
+        the bot does not need to know WHAT sold them — only that they are gone,
+        which is a comparison between our own ledger and position data this
+        sweep already fetches. So this rests on nothing unverified, works for
+        all three causes at once, and could have shipped before super orders
+        existed. It fixes a hole that is already open today.
+        """
+        if not self._shared_account or not self._bucket_ids:
+            # Crypto sub-accounts are exclusive (Decision 019) and the bot
+            # trusts exchange positions directly there, so the Trade ledger
+            # drives nothing and an over-count is harmless.
+            return
+
+        if positions is None:
+            positions = self._broker.get_positions()
+
+        broker_qty: dict[str, Decimal] = {}
+        for p in positions:
+            if p.side == "long" and p.size > 0:
+                broker_qty[p.symbol] = broker_qty.get(
+                    p.symbol, Decimal("0")
+                ) + p.size
+
+        now = self._clock.now()
+        with session_scope() as session:
+            ledger = bot_owned_quantities(
+                session,
+                broker_name=self._broker_name,
+                bucket_ids=self._bucket_ids,
+                now=now,
+            )
+
+        shortfalls: dict[str, Decimal] = {}
+        for symbol, owned in ledger.items():
+            gap = owned - broker_qty.get(symbol, Decimal("0"))
+            if gap > 0:
+                shortfalls[symbol] = gap
+
+        confirmed = self._confirm_shortfalls(shortfalls)
+        if not confirmed:
+            return
+
+        sells = self._todays_sell_fills()
+        for symbol, qty in confirmed.items():
+            try:
+                self._write_unrecorded_exit(
+                    symbol, qty, sells.get(symbol, []), report
+                )
+            except Exception:
+                self._log.error(
+                    "unrecorded_exit_write_failed",
+                    symbol=symbol,
+                    qty=str(qty),
+                    exc_info=True,
+                )
+                continue
+            self._shortfall_seen.pop(symbol, None)
+
+    def _confirm_shortfalls(
+        self, shortfalls: dict[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Shortfalls seen the same size for enough passes to act on. PURE-ish.
+
+        A CHANGED size restarts the count rather than advancing it: a position
+        being sold down in pieces is still moving, and the right moment to
+        record it is once it has settled.
+        """
+        confirmed: dict[str, Decimal] = {}
+        for symbol, qty in shortfalls.items():
+            prev_qty, count = self._shortfall_seen.get(symbol, (None, 0))
+            count = count + 1 if prev_qty == qty else 1
+            self._shortfall_seen[symbol] = (qty, count)
+            if count >= self._SHORTFALL_CONFIRM_PASSES:
+                confirmed[symbol] = qty
+        # A shortfall that healed on its own was a bad read, not an exit.
+        for symbol in list(self._shortfall_seen):
+            if symbol not in shortfalls:
+                self._shortfall_seen.pop(symbol, None)
+        return confirmed
+
+    def _todays_sell_fills(self) -> dict[str, list]:
+        """``symbol → today's SELL fills``. Empty on any failure."""
+        try:
+            fills = self._broker.get_fills()
+        except Exception:
+            self._log.warning("unrecorded_exit_fills_fetch_failed", exc_info=True)
+            return {}
+        out: dict[str, list] = {}
+        for f in fills:
+            if str(f.side).lower() == "sell":
+                out.setdefault(f.symbol, []).append(f)
+        return out
+
+    def _write_unrecorded_exit(
+        self,
+        symbol: str,
+        qty: Decimal,
+        sell_fills: list,
+        report: ReconcileReport,
+    ) -> None:
+        """Write the SELL row the bot never sent, and page about it.
+
+        The price is taken from today's SELL fills ONLY when their total
+        quantity matches the shortfall exactly. That is a deliberately strict
+        rule: on a shared account the trade book also carries the USER's sells,
+        and a partial match could not be told apart from theirs. An exit with
+        no price still corrects the ledger — which is the part that protects
+        the user's stock — and simply does not pair for P&L. A fabricated
+        price would corrupt realized P&L and the tax ledger permanently, which
+        is far worse than a gap somebody can see.
+        """
+        # Local imports match this module's existing idiom for cross-module
+        # helpers (see ``_enrich_trades_pnl``) and keep the reconciler free of
+        # an import-time dependency on the order manager.
+        from src.order_manager.manager import make_client_order_id
+        from src.order_manager.pnl import aggregate_fills
+
+        now = self._clock.now()
+        price: Decimal | None = None
+        if sell_fills and sum((f.size for f in sell_fills), Decimal("0")) == qty:
+            agg = aggregate_fills(
+                [(f.price, f.size, f.commission) for f in sell_fills]
+            )
+            price = agg.avg_price if agg else None
+
+        with session_scope() as session:
+            entry = self._latest_open_entry(session, symbol)
+            bucket_id = entry.bucket_id if entry else self._bucket_ids[0]
+            strategy_name = entry.strategy_name if entry else None
+
+            # Deterministic and DAY-scoped, so re-running the reconciler cannot
+            # duplicate the row. It self-limits too: once written, net_owned
+            # drops by qty and the shortfall stops being detected at all.
+            client_oid = make_client_order_id(
+                bucket_id or "unknown",
+                symbol,
+                "sell",
+                now,
+                f"unrecorded-exit-{now.strftime('%Y%m%d')}",
+            )
+            if session.execute(
+                select(Trade.id).where(Trade.client_order_id == client_oid)
+            ).first():
+                return
+
+            extra: dict[str, Any] = {
+                "reduce_only": True,
+                "synthetic_exit": True,
+                "detected_by": "position_shortfall",
+            }
+            if price is not None:
+                extra["avg_fill_price"] = str(price)
+
+            session.add(
+                Trade(
+                    strategy_id=bucket_id or "unknown",
+                    bucket_id=bucket_id,
+                    strategy_name=strategy_name or "unrecorded_exit",
+                    broker=self._broker_name,
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    quantity=qty,
+                    price=price,
+                    client_order_id=client_oid,
+                    # Never a real venue id — this order was never sent. The
+                    # prefix keeps it from ever matching an open-order set or a
+                    # get_order lookup.
+                    exchange_order_id=f"unrecorded:{symbol}:{now:%Y%m%d%H%M%S}",
+                    status=OrderStatus.FILLED,
+                    submitted_at=now,
+                    filled_at=now,
+                    extra=extra,
+                )
+            )
+            session.add(
+                AuditLog(
+                    strategy_id=bucket_id or "unknown",
+                    event_type=AuditEventType.RECONCILE_DIFF,
+                    message=f"Unrecorded exit recorded for {symbol}",
+                    payload={
+                        "symbol": symbol,
+                        "quantity": str(qty),
+                        "price": str(price) if price is not None else None,
+                    },
+                )
+            )
+
+        report.diffs.append(
+            {
+                "type": "unrecorded_exit_recorded",
+                "symbol": symbol,
+                "quantity": str(qty),
+                "price": str(price) if price is not None else None,
+            }
+        )
+        self._log.warning(
+            "unrecorded_exit_recorded",
+            symbol=symbol,
+            quantity=str(qty),
+            price=str(price) if price is not None else None,
+        )
+        send_alert(
+            f"[reconciler] {symbol}: {qty} share(s) left the account with no "
+            f"order from the bot "
+            f"({'@ ' + str(price) if price is not None else 'FILL PRICE UNKNOWN'})"
+            f" — ledger corrected. Cause: stop leg, auto-square-off, or a "
+            f"manual sell."
+        )
+
+    def _latest_open_entry(self, session: Any, symbol: str) -> Trade | None:
+        """Newest unpaired BUY entry for ``symbol``, for attribution."""
+        rows = (
+            session.execute(
+                select(Trade)
+                .where(
+                    Trade.broker == self._broker_name,
+                    Trade.symbol == symbol,
+                    Trade.side == OrderSide.BUY,
+                    *self._scope_trades(),
+                )
+                .order_by(Trade.created_at.desc())
+                .limit(50)
+            )
+            .scalars()
+            .all()
+        )
+        for t in rows:
+            extra = t.extra or {}
+            if extra.get("reduce_only") or extra.get("closed_by_trade_id"):
+                continue
+            return t
+        return None
+
     # ── Position reconciliation ─────────────────────────────────────
 
-    def _reconcile_positions(self, report: ReconcileReport) -> None:
+    def _reconcile_positions(self, report: ReconcileReport) -> list[Any]:
         exchange_positions = self._broker.get_positions()
         exchange_by_symbol: dict[str, Any] = {
             p.symbol: p for p in exchange_positions
@@ -350,6 +630,11 @@ class Reconciler:
                     )
                     self._log.warning("position_size_mismatch", **diff)
 
+        # Handed to ``_detect_unrecorded_exits`` so the account is read once
+        # per pass rather than twice — Dhan is rate-limited and shared with the
+        # user's manual trading.
+        return exchange_positions
+
     def _latest_filled_trade(self, session, symbol: str) -> Trade | None:
         """Most-recent FILLED Trade for this symbol on this broker.
 
@@ -536,7 +821,9 @@ class Reconciler:
             for trade in rows.values():
                 if (trade.extra or {}).get("pnl_final"):
                     continue
-                order_fills = by_order.get(trade.exchange_order_id or "")
+                order_fills = _fills_for_trade(
+                    by_order.get(trade.exchange_order_id or ""), trade
+                )
                 if not order_fills:
                     continue
                 agg = aggregate_fills(
@@ -711,7 +998,21 @@ class Reconciler:
 
     def _reconcile_orders(self, report: ReconcileReport) -> None:
         exchange_open = self._broker.get_open_orders()
-        open_ids = {o.exchange_order_id for o in exchange_open}
+        # Keyed on (id, side), not id alone. A Dhan Super Order's legs SHARE one
+        # orderId (Decision 034), and the resting STOP_LOSS_LEG stays in an open
+        # state for the whole life of the position — so an id-only set would
+        # report the filled BUY entry as "still open at the exchange" until the
+        # position closed, and the loop below would `continue` past it every
+        # time. The entry Trade would never leave OPEN.
+        #
+        # That is not cosmetic. FILLED is the gate on realized-P&L pairing
+        # (``_lookup_entry_for_exit``), the tax ledger, the EOD round-trip
+        # stats and the dashboard status. The entry would silently drop out of
+        # all four. Side separates the legs cleanly: the entry is a BUY, its
+        # protective leg is a SELL.
+        open_keys = {
+            (o.exchange_order_id, str(o.side).lower()) for o in exchange_open
+        }
 
         with session_scope() as session:
             pending_trades = list(
@@ -728,7 +1029,11 @@ class Reconciler:
             )
 
             for trade in pending_trades:
-                if trade.exchange_order_id and trade.exchange_order_id in open_ids:
+                still_open = (
+                    trade.exchange_order_id,
+                    trade.side.value.lower(),
+                ) in open_keys
+                if trade.exchange_order_id and still_open:
                     if trade.status == OrderStatus.PENDING:
                         trade.status = OrderStatus.OPEN
                         report.orders_updated += 1
@@ -766,6 +1071,31 @@ class Reconciler:
                     )
                 )
                 self._log.info("order_status_updated", **diff)
+
+
+def _fills_for_trade(fills: list | None, trade: Trade) -> list:
+    """The fills on ``trade``'s order that belong to THIS trade's side. PURE.
+
+    Grouping by ``exchange_order_id`` alone was safe only while one exchange
+    order meant one logical order. A Dhan Super Order (Decision 034) breaks
+    that: entry, target and stop-loss legs SHARE a single ``orderId``, so when
+    the stop leg fires, its SELL fill lands in the same bucket as the entry's
+    BUY fill. Averaging them together would hand the entry Trade a blended
+    ``avg_fill_price`` sitting between the buy and the stop — a number that
+    describes no trade that ever happened, and one that then flows into
+    realized P&L, the tax ledger and the EOD report without ever looking
+    obviously wrong.
+
+    A fill whose side the venue did not report is KEPT rather than dropped: for
+    every non-super order the id match is already conclusive, and discarding
+    those would silently disable P&L enrichment on any broker with a sparse
+    trade book. The filter only ever needs to separate legs that genuinely
+    disagree about direction.
+    """
+    if not fills:
+        return []
+    want = trade.side.value.lower()
+    return [f for f in fills if not f.side or str(f.side).lower() == want]
 
 
 def _decimal_or_none(raw: object) -> Decimal | None:

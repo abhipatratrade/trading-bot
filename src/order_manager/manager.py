@@ -19,6 +19,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.brokers.base import (
+    AttachedStopRetireError,
     Broker,
     OrderRequest,
     OrderType,
@@ -108,6 +109,8 @@ class OrderManager:
         time_in_force: TimeInForce = TimeInForce.GTC,
         reduce_only: bool = False,
         stop_price: Decimal | None = None,
+        attached_stop_price: Decimal | None = None,
+        attached_target_price: Decimal | None = None,
         product: str | None = None,
         fallback_max_size: Decimal | None = None,
         intent_id: str = "",
@@ -120,6 +123,18 @@ class OrderManager:
         client_oid = make_client_order_id(
             strategy_id, symbol, side, now, intent_id
         )
+
+        # 0. An attached stop (Decision 034) is only safe on a venue that
+        # actually honours it. An adapter that quietly ignored the field would
+        # place a BARE entry while every layer above believed the position was
+        # protected from the first instant — strictly worse than the sweep it
+        # replaces, because the sweep at least knows it has work to do. Refuse
+        # loudly instead; the caller checks ``supports_attached_stop`` first.
+        if attached_stop_price is not None and not self._broker.supports_attached_stop():
+            raise ValueError(
+                f"{self._broker_name.value} cannot place an attached stop for "
+                f"{symbol}; refusing to place an unprotected entry"
+            )
 
         # 1. Kill switch. ``allow_when_killed`` is reserved for the breaker
         # flatten path (Decision 021): position-REDUCING orders may pass an
@@ -162,6 +177,14 @@ class OrderManager:
         extra: dict[str, Any] = dict(extra_payload or {})
         if reduce_only:
             extra["reduce_only"] = True
+        if attached_stop_price is not None:
+            # The ledger must record that this entry carries its OWN protection,
+            # so the sweep does not plan a second stop for it and the invariant
+            # can tell a covered position from a naked one.
+            extra["attached_stop"] = str(attached_stop_price)
+            extra["super_order"] = True
+            if attached_target_price is not None:
+                extra["attached_target"] = str(attached_target_price)
         if stop_price is not None:
             extra["stop_price"] = str(stop_price)
             if reduce_only:
@@ -221,10 +244,28 @@ class OrderManager:
                     reduce_only=reduce_only,
                     client_order_id=client_oid,
                     stop_price=stop_price,
+                    attached_stop_price=attached_stop_price,
+                    attached_target_price=attached_target_price,
                     product=product,
                     fallback_max_size=fallback_max_size,
                 )
             )
+        except AttachedStopRetireError:
+            # Decision 034: the adapter refused to send this CLOSING order
+            # because it could not first retire the venue-side stop leg that
+            # would otherwise outlive the position. Nothing reached the venue,
+            # so the recovery lookup below would burn a rate-limited day-book
+            # scan to learn nothing, and REJECTED would be a lie that feeds
+            # check_reject_rate straight into a bucket halt.
+            #
+            # CANCELED is the honest status: we chose not to send it. The exit
+            # is retried on the next tick, and until it succeeds the position
+            # stays open AND stays protected by the very leg we could not
+            # cancel — the safe resting state.
+            self._mark_canceled(
+                trade_id, strategy_id, client_oid, "attached_stop_retire_failed"
+            )
+            raise
         except Exception:
             # The request may have DIED IN TRANSIT after the exchange
             # accepted it (e.g. response timeout). Marking it REJECTED in
@@ -281,6 +322,17 @@ class OrderManager:
                         placed=str(result.size),
                     )
                     t.quantity = result.size
+                # Decision 034: whether the mandatory target leg was actually
+                # retired. False means a live take-profit is resting at a price
+                # no backtest justifies (House Rule 7) — the sweep retries it,
+                # and this flag is how anyone reading the ledger can tell.
+                if "_target_leg_cancelled" in result.raw:
+                    t.extra = {
+                        **(t.extra or {}),
+                        "target_leg_cancelled": bool(
+                            result.raw["_target_leg_cancelled"]
+                        ),
+                    }
             session.add(
                 AuditLog(
                     strategy_id=strategy_id,
@@ -387,6 +439,28 @@ class OrderManager:
                 exc_info=True,
             )
             return None
+
+    def _mark_canceled(
+        self, trade_id: int, strategy_id: str, client_oid: str, reason: str
+    ) -> None:
+        """Record an order the bot DECIDED not to send (Decision 034).
+
+        Deliberately not REJECTED: nothing was refused by the venue, and the
+        reject-rate invariant must keep meaning "the venue is refusing us".
+        """
+        with session_scope() as session:
+            t = session.get(Trade, trade_id)
+            if t:
+                t.status = OrderStatus.CANCELED
+                t.extra = {**(t.extra or {}), "not_sent_reason": reason}
+            session.add(
+                AuditLog(
+                    strategy_id=strategy_id,
+                    event_type=AuditEventType.ORDER_CANCELED,
+                    message=f"NOT SENT {client_oid}: {reason}",
+                    payload={"client_order_id": client_oid, "reason": reason},
+                )
+            )
 
     def _mark_rejected(
         self, trade_id: int, strategy_id: str, client_oid: str, reason: str

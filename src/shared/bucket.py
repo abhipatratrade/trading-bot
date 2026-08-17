@@ -68,6 +68,15 @@ class BucketConfig(BaseModel):
     # stop-market order at this distance, so a max loss holds even when the
     # bot/VM is down. None ⇒ no broker-side stop for this bucket.
     stop_loss_pct: Decimal | None = Field(default=None, gt=0, lt=100)
+    # Decision 034 — carry the protective stop ON the entry order (Dhan Super
+    # Order) instead of resting it separately after the fill. Per-BUCKET, not
+    # just per-process: the whole rollout plan is "enable for one bucket, watch
+    # the first entry, keep the Decision 022 sweep behind it", and a global
+    # switch cannot express that — flipping it would arm swing-indian and
+    # intraday-indian in the same instant, on one shared live account, with no
+    # rehearsal. Both this AND the ``attached_stops_enabled`` setting must be
+    # true, so the env var stays a process-wide master kill.
+    attached_stops: bool = False
     # Decision 029 — per-bucket entry window (IST "HH:MM"), consumed by
     # ``market_calendar.nse_session`` via BucketRunner. Defaults reproduce the
     # original module-level constants, so every pre-existing bucket is

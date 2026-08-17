@@ -28,6 +28,7 @@ the Decision 021 flatten path).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -37,7 +38,13 @@ from src.core.alerts import send_alert_dedup
 from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
-from src.core.models import OrderStatus, Position, PositionSide, Trade
+from src.core.models import (
+    OrderSide,
+    OrderStatus,
+    Position,
+    PositionSide,
+    Trade,
+)
 from src.order_manager.manager import OrderManager
 from src.order_manager.ownership import bot_owned_quantities
 
@@ -52,6 +59,18 @@ _TRIGGER_TOLERANCE = Decimal("0.005")
 # position already down on the day has less room left than entry × band
 # suggests. 0.9 buys margin for that drift without giving up much distance.
 _BAND_SAFETY = Decimal("0.9")
+
+# Target distance used when the scrip's circuit band is unknown (Decision 034).
+# 4% is inside even a 5% band, the tightest NSE applies. See
+# ``resolve_target_price`` for why erring tight is the safe direction.
+_FALLBACK_TARGET_PCT = Decimal("4")
+
+# How long after placing an entry the orphan-leg pass refuses to call its stop
+# leg orphaned. Covers the window where the venue holds the leg but has not yet
+# reported the position. Minutes, not seconds: a sweep runs every 60s, and one
+# extra sweep before retiring a genuinely dead leg costs nothing, while acting
+# one sweep too early strips a live position of its only stop.
+_ENTRY_GRACE_MINUTES = 5
 
 # Consecutive placement failures for one (account, symbol, trigger) before the
 # sweep stops retrying it. A stop the venue refuses is refused deterministically
@@ -105,6 +124,18 @@ class StopPlan:
     place: list[PlannedStop] = field(default_factory=list)
     cancel: list[OpenOrder] = field(default_factory=list)
     unprotectable: list[str] = field(default_factory=list)  # no pct configured
+    # Positions the VENUE already protects via an attached stop leg (Decision
+    # 034). The sweep deliberately does nothing for these — recorded so
+    # "did nothing" is visible in the logs as a decision rather than a gap.
+    attached: list[str] = field(default_factory=list)
+    # Attached stop legs with NO position behind them any more. These must be
+    # retired: a stop leg that outlives its position sells stock we no longer
+    # hold, which on MTF is a short. The adapter's cancel-before-close guard
+    # cannot catch these because nothing the bot did closed them — Dhan's MIS
+    # auto-square-off, a manual close by the user on this shared account, or
+    # the target leg filling all end the position without passing through
+    # ``place_order``.
+    retire_legs: list[str] = field(default_factory=list)
 
 
 def _round_to_tick(price: Decimal, tick: Decimal | None) -> Decimal:
@@ -153,6 +184,117 @@ def expected_trigger_at_distance(
     return _round_to_tick(raw, tick)
 
 
+def resolve_stop_trigger(
+    *,
+    entry_price: Decimal,
+    position_side: str,
+    stop_pct: Decimal,
+    distance: Decimal | None = None,
+    band_pct: Decimal | None = None,
+    tick: Decimal | None = None,
+    symbol: str = "",
+) -> Decimal:
+    """The protective trigger this position should carry. PURE.
+
+    Three inputs, applied in a strict order that can only ever TIGHTEN:
+
+      1. the bucket's ``stop_loss_pct`` — the guaranteed crash net;
+      2. the strategy's own distance (Decision 032), used only if it sits
+         INSIDE the net, so a bad number can never widen the worst case;
+      3. the scrip's daily circuit band, which is not a preference but a
+         placement constraint — a trigger outside it is refused by the
+         exchange at validation, so the position ends up with NO stop rather
+         than a wide one (PIIND, 2026-08-12).
+
+    Extracted so the Decision 022 sweep and the Decision 034 attached stop
+    compute the SAME number. They were briefly going to own separate copies of
+    this arithmetic, which is exactly how ``_load_attribution`` and
+    ``_load_stop_distances`` drifted apart and cost a live position its stop.
+    """
+    trigger = expected_trigger(entry_price, position_side, stop_pct, tick)
+
+    if distance is not None and distance > 0:
+        strategy_trigger = expected_trigger_at_distance(
+            entry_price, position_side, distance, tick
+        )
+        inside = (
+            strategy_trigger > trigger
+            if position_side == "long"
+            else strategy_trigger < trigger
+        )
+        if inside and strategy_trigger > 0:
+            trigger = strategy_trigger
+        else:
+            _log.warning(
+                "stop_distance_ignored_wider_than_bucket_net",
+                symbol=symbol,
+                strategy_trigger=str(strategy_trigger),
+                bucket_trigger=str(trigger),
+            )
+
+    if band_pct and band_pct > 0 and entry_price > 0:
+        limit = entry_price * (
+            Decimal("1") - (band_pct * _BAND_SAFETY) / Decimal("100")
+            if position_side == "long"
+            else Decimal("1") + (band_pct * _BAND_SAFETY) / Decimal("100")
+        )
+        outside = limit > trigger if position_side == "long" else limit < trigger
+        if outside:
+            _log.warning(
+                "stop_trigger_clamped_to_price_band",
+                symbol=symbol,
+                requested=str(trigger),
+                clamped_to=str(limit),
+                band_pct=str(band_pct),
+            )
+            trigger = expected_trigger_at_distance(
+                entry_price, position_side, abs(entry_price - limit), tick
+            )
+
+    return trigger
+
+
+def resolve_target_price(
+    *,
+    entry_price: Decimal,
+    position_side: str,
+    band_pct: Decimal | None = None,
+    tick: Decimal | None = None,
+) -> Decimal:
+    """A take-profit we intend to CANCEL, priced so it cannot do harm. PURE.
+
+    Dhan makes ``targetPrice`` mandatory on a super order (Decision 034) and no
+    strategy here has a target, so the leg is cancelled immediately after
+    placement. This price only has to survive the moments before that, and one
+    failed cancel.
+
+    The naive choice — a target so far away it can never fill — is the wrong
+    one, and for the exact reason the stop clamp exists: a price outside the
+    scrip's daily circuit band is refused at validation, and here that would
+    reject the WHOLE super order, entry included. A stop we could not place
+    cost us a protected position; a target we cannot place would cost us the
+    trade.
+
+    So it sits just inside the band (the same ``_BAND_SAFETY`` margin the stop
+    uses), which is the furthest away it can legally be. When the band is
+    unknown we fall back to ``_FALLBACK_TARGET_PCT`` — deliberately tighter
+    than any real band, because being wrong towards "too close" only risks an
+    unwanted profit-take on a cancel we already failed to make, while being
+    wrong towards "too far" kills the entry outright.
+    """
+    pct = (
+        band_pct * _BAND_SAFETY
+        if band_pct and band_pct > 0
+        else _FALLBACK_TARGET_PCT
+    )
+    frac = pct / Decimal("100")
+    if position_side == "long":
+        raw = entry_price * (Decimal("1") + frac)
+    else:
+        raw = entry_price * (Decimal("1") - frac)
+    return _round_to_tick(raw, tick)
+
+
 def plan_stop_protection(
     *,
     positions: list[PositionInfo],
@@ -164,6 +306,8 @@ def plan_stop_protection(
     stop_distances: dict[str, Decimal] | None = None,
     price_band_pct: dict[str, Decimal | None] | None = None,
     entry_prices: dict[str, Decimal] | None = None,
+    attached_stops: dict[str, Decimal] | None = None,
+    recent_entries: set[str] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -215,6 +359,36 @@ def plan_stop_protection(
         if shared and pos.symbol not in owned_quantities:  # type: ignore[operator]
             continue
 
+        # Decision 034: the venue is already holding a stop attached to this
+        # entry. Do nothing at all — and POP its orders first, so the leg is
+        # not mistaken for an orphan by the cancel pass below. Both halves
+        # matter: without the skip the sweep stacks a second stop on top of the
+        # venue's every minute, and without the pop it CANCELS the very
+        # protection the entry was placed with.
+        if pos.symbol in (attached_stops or {}):
+            plan.attached.append(pos.symbol)
+            # Pop so the cancel pass below cannot treat the venue's own leg as
+            # an orphan. But do not discard blindly: anything popped that is
+            # OURS and rests at a DIFFERENT price is a second protective stop
+            # on one position — a legacy standalone stop left over from a
+            # rollback, say. Two resting stops on one long means the second one
+            # sells stock the first already sold, i.e. a short. Exactly one
+            # protective stop per symbol, always, and the attached one wins.
+            want = (attached_stops or {})[pos.symbol]
+            for o in stops_by_symbol.pop(pos.symbol, []):
+                if o.stop_price is None or want <= 0:
+                    continue
+                drift = abs(o.stop_price - want) / want
+                if drift > _TRIGGER_TOLERANCE:
+                    _log.warning(
+                        "duplicate_stop_alongside_attached_leg",
+                        symbol=pos.symbol,
+                        standalone_trigger=str(o.stop_price),
+                        attached_trigger=str(want),
+                    )
+                    plan.cancel.append(o)
+            continue
+
         existing = stops_by_symbol.pop(pos.symbol, [])
 
         bucket_id, strategy_name = attribution.get(pos.symbol, (None, None))
@@ -239,54 +413,15 @@ def plan_stop_protection(
         # the scrip, the user's included. Our own ledger entry is the only
         # price this bot's stop should be measured from.
         entry = (entry_prices or {}).get(pos.symbol) or pos.entry_price
-        trigger = expected_trigger(entry, pos.side, pct, tick)
-        distance = (stop_distances or {}).get(pos.symbol)
-        if distance is not None and distance > 0:
-            strategy_trigger = expected_trigger_at_distance(
-                entry, pos.side, distance, tick
-            )
-            # Only ever tighten: the bucket pct is the guaranteed worst case.
-            inside = (
-                strategy_trigger > trigger
-                if pos.side == "long"
-                else strategy_trigger < trigger
-            )
-            if inside and strategy_trigger > 0:
-                trigger = strategy_trigger
-            else:
-                _log.warning(
-                    "stop_distance_ignored_wider_than_bucket_net",
-                    symbol=pos.symbol,
-                    strategy_trigger=str(strategy_trigger),
-                    bucket_trigger=str(trigger),
-                )
-
-        # A trigger outside the scrip's daily circuit band cannot be placed AT
-        # ALL — the exchange refuses it at validation, so the position ends up
-        # with NO stop rather than a wide one. swing-indian's 20% crash net is
-        # wider than the 10% band most F&O names carry, so on 2026-08-12 PIIND's
-        # fallback trigger (-19%) was simply unplaceable and the bucket halted.
-        # Clamp to just inside the band: a tighter stop that EXISTS beats a
-        # correctly-sized one that does not. Only ever tightens, never widens.
-        band = (price_band_pct or {}).get(pos.symbol)
-        if band and band > 0 and entry > 0:
-            limit = entry * (
-                Decimal("1") - (band * _BAND_SAFETY) / Decimal("100")
-                if pos.side == "long"
-                else Decimal("1") + (band * _BAND_SAFETY) / Decimal("100")
-            )
-            outside = limit > trigger if pos.side == "long" else limit < trigger
-            if outside:
-                _log.warning(
-                    "stop_trigger_clamped_to_price_band",
-                    symbol=pos.symbol,
-                    requested=str(trigger),
-                    clamped_to=str(limit),
-                    band_pct=str(band),
-                )
-                trigger = expected_trigger_at_distance(
-                    entry, pos.side, abs(entry - limit), tick
-                )
+        trigger = resolve_stop_trigger(
+            entry_price=entry,
+            position_side=pos.side,
+            stop_pct=pct,
+            distance=(stop_distances or {}).get(pos.symbol),
+            band_pct=(price_band_pct or {}).get(pos.symbol),
+            tick=tick,
+            symbol=pos.symbol,
+        )
 
         kept = None
         for o in existing:
@@ -324,6 +459,37 @@ def plan_stop_protection(
         if shared and sym not in owned_quantities:  # type: ignore[operator]
             continue
         plan.cancel.extend(leftovers)
+
+    # The same orphan question for VENUE-ATTACHED legs (Decision 034). "Held"
+    # here means held BY THE BOT: on a shared account the user may hold the
+    # same scrip, and a position row that is entirely theirs must not keep our
+    # orphaned leg alive. Every symbol in ``attached_stops`` is already proven
+    # ours by the adapter, so anything the bot no longer holds is a leg with
+    # nothing behind it.
+    bot_held: set[str] = set()
+    for pos in positions:
+        if pos.size <= 0 or pos.side not in ("long", "short"):
+            continue
+        if shared and (owned_quantities or {}).get(pos.symbol, Decimal("0")) <= 0:
+            continue
+        bot_held.add(pos.symbol)
+    # ``recent_entries`` is the guard against the race this sweep would
+    # otherwise LOSE. Between placing a super order and Dhan surfacing the
+    # position, the venue holds a stop leg for a position the broker does not
+    # report yet — so "leg with no position" is ALSO what a two-second-old
+    # entry looks like. Retiring on that reading cancels the only protection a
+    # brand-new position has, which is strictly worse than the bug this whole
+    # decision fixes: the pre-034 race merely placed a DUPLICATE stop.
+    #
+    # A ledger check alone cannot do this job. ``owned_quantities`` counts an
+    # entry from PENDING and only decrements on a FILLED sell — so for exactly
+    # the cases the orphan pass exists for (Dhan's auto-square-off, a manual
+    # close by the user) it would report the symbol as still held forever and
+    # the leg would never be retired. The guard has to be TIME-bounded, not
+    # existence-bounded.
+    plan.retire_legs = sorted(
+        set(attached_stops or {}) - bot_held - (recent_entries or set())
+    )
 
     return plan
 
@@ -480,6 +646,48 @@ def _load_entry_prices(bucket_ids: list[str]) -> dict[str, Decimal]:
     return out
 
 
+def _load_recent_entry_symbols(
+    bucket_ids: list[str], now: datetime, within_minutes: int = _ENTRY_GRACE_MINUTES
+) -> set[str]:
+    """Symbols with a bot ENTRY placed in the last few minutes.
+
+    Sole purpose: keep the orphan-leg pass from cancelling the protection of a
+    position the broker has not surfaced yet (see ``plan_stop_protection``).
+    Deliberately generous — Dhan reports a filled position within seconds, and
+    the cost of being too generous is one sweep's delay in retiring a genuinely
+    orphaned leg, while the cost of being too tight is a naked position.
+
+    PENDING is in the filter for the third time in this module, and for the same
+    reason as ``_load_attribution`` and ``_load_stop_distances``: a Dhan order is
+    ``pending`` from the moment it is placed, so a filter without it would miss
+    the exact rows this function exists to find — the newest ones.
+    """
+    cutoff = now - timedelta(minutes=within_minutes)
+    with session_scope() as session:
+        rows = (
+            session.execute(
+                select(Trade.symbol)
+                .where(
+                    Trade.bucket_id.in_(bucket_ids),
+                    Trade.side == OrderSide.BUY,
+                    Trade.created_at > cutoff,
+                    Trade.status.in_(
+                        [
+                            OrderStatus.PENDING,
+                            OrderStatus.OPEN,
+                            OrderStatus.PARTIAL,
+                            OrderStatus.FILLED,
+                        ]
+                    ),
+                )
+                .distinct()
+            )
+            .scalars()
+            .all()
+        )
+    return set(rows)
+
+
 def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
     """symbol → protective-stop distance stamped on its open entry Trade.
 
@@ -551,6 +759,7 @@ def ensure_stop_protection(
     price_band_pct: dict[str, Decimal | None] | None = None,
     clock: Clock | None = None,
     shared_account: bool = False,
+    attached_stops_enabled: bool = False,
 ) -> StopPlan:
     """Make the exchange state match the plan for one sub-account.
 
@@ -576,6 +785,40 @@ def ensure_stop_protection(
 
     positions = broker.get_positions()
     open_orders = broker.get_open_orders()
+
+    # Decision 034: which positions the venue already protects itself. This is
+    # read BEFORE anything is planned and a failure aborts the whole sweep,
+    # because an empty answer here is indistinguishable from "nothing is
+    # attached" — and acting on that false negative is precisely how the sweep
+    # would stack a duplicate stop or cancel a live one. Skipping a tick is
+    # safe; the positions in question are protected by the legs we could not
+    # enumerate, and the next tick tries again.
+    #
+    # Gated on the FEATURE being on, not merely on the venue supporting it.
+    # ``DhanClient.supports_attached_stop()`` is True the moment this code
+    # deploys, so keying off capability alone would send this request every
+    # tick on an account where nothing has been enabled — and, because the
+    # failure branch below abandons the sweep, an endpoint the account cannot
+    # use would SILENTLY DISABLE PROTECTIVE STOPS for both live Indian buckets.
+    # A dark deploy has to be genuinely inert.
+    attached: dict[str, Decimal] = {}
+    if attached_stops_enabled and broker.supports_attached_stop():
+        try:
+            attached = broker.attached_stop_triggers()
+        except Exception:
+            _log.error(
+                "attached_stop_lookup_failed_skipping_sweep",
+                account_ref=account_ref,
+                exc_info=True,
+            )
+            send_alert_dedup(
+                f"attached_stop_lookup:{account_ref}",
+                f"[{account_ref}] could not read venue-attached stops — stop "
+                f"sweep skipped this tick (positions remain protected by their "
+                f"own legs)",
+            )
+            return StopPlan()
+
     owned = None
     if shared_account:
         with session_scope() as session:
@@ -595,9 +838,38 @@ def ensure_stop_protection(
         stop_distances=_load_stop_distances(bucket_ids),
         price_band_pct=price_band_pct,
         entry_prices=_load_entry_prices(bucket_ids),
+        attached_stops=attached,
+        recent_entries=(
+            _load_recent_entry_symbols(bucket_ids, clk.now()) if attached else None
+        ),
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"
+
+    # Orphaned attached legs FIRST — before any placement, and before the
+    # cancels below. This is the only pass that catches a stop leg whose
+    # position ended without the bot closing it (Dhan's MIS auto-square-off,
+    # a manual close by the user, the target leg filling). Left resting, such a
+    # leg eventually sells stock that is not there.
+    for sym in plan.retire_legs:
+        try:
+            broker.retire_attached_stop(sym)  # type: ignore[attr-defined]
+            _log.info(
+                "orphan_attached_leg_retired", account_ref=account_ref, symbol=sym
+            )
+        except Exception:
+            _log.error(
+                "orphan_attached_leg_retire_failed",
+                account_ref=account_ref,
+                symbol=sym,
+                exc_info=True,
+            )
+            send_alert_dedup(
+                f"orphan_leg:{account_ref}:{sym}",
+                f"[{account_ref}] {sym} has a venue stop leg with NO position "
+                f"behind it and it could not be cancelled — if it triggers it "
+                f"SELLS STOCK YOU DO NOT HOLD. Check the exchange.",
+            )
 
     # Cancels first so a replace never briefly doubles the stop size.
     for order in plan.cancel:
@@ -673,11 +945,12 @@ def ensure_stop_protection(
             f"no stop_loss_pct configured for its bucket",
         )
 
-    if plan.place or plan.cancel:
+    if plan.place or plan.cancel or plan.attached:
         _log.info(
             "stop_protection_swept",
             account_ref=account_ref,
             placed=[s.symbol for s in plan.place],
             canceled=[o.symbol for o in plan.cancel],
+            venue_attached=plan.attached,
         )
     return plan

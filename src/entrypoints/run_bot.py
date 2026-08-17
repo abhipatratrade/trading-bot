@@ -19,6 +19,8 @@ import signal
 import time
 from decimal import Decimal
 
+from sqlalchemy import select
+
 from src.brokers.base import Broker
 from src.brokers.delta_india.client import DeltaIndiaClient
 from src.brokers.dhan.client import (
@@ -40,7 +42,7 @@ from src.core.db import session_scope
 from src.core.export import archive_lag_days, audit_archived_through
 from src.core.heartbeat import SERVICE_BOT_WORKER, beat
 from src.core.logging import configure_logging, get_logger
-from src.core.models import AuditEventType, AuditLog, BrokerName
+from src.core.models import AuditEventType, AuditLog, BrokerName, Trade
 from src.data_sources.base import MarketData
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
@@ -138,6 +140,30 @@ def _probe_with_retry(client: object, account_ref: str) -> None:
                 of=attempts,
                 error=str(exc)[:120],
             )
+
+
+def _bot_placed_order_id(exchange_order_id: str) -> bool:
+    """True when our own ledger records placing this exchange order.
+
+    The ownership proof of last resort on the shared Dhan account (Decision
+    027). ``correlationId`` is the first proof and this is the second; a "no"
+    from both means the order belongs to the user and the bot leaves it alone.
+
+    Reads Trade directly rather than going through the reconciler's scoping
+    helpers because it is called from inside the broker adapter, where the only
+    question is "did WE place this id".
+    """
+    if not exchange_order_id:
+        return False
+    with session_scope() as session:
+        return (
+            session.execute(
+                select(Trade.id).where(
+                    Trade.exchange_order_id == exchange_order_id
+                )
+            ).first()
+            is not None
+        )
 
 
 def _price_bands(data: object, is_dhan: bool) -> dict[str, Decimal | None] | None:
@@ -332,6 +358,12 @@ def main() -> None:
                     dhan_data.resolve,
                     settings,
                     data_token_manager=dhan_data.token_manager,
+                    # Decision 034 / 027: how the adapter PROVES a super order
+                    # is the bot's on an account shared with the user's own
+                    # trading. correlationId alone is not enough — it is
+                    # unverified whether Dhan echoes it onto super-order legs,
+                    # and it would not survive a restart if it did not.
+                    owns_order_id=_bot_placed_order_id,
                 )
                 # Reachability probe (one authed GET). Dhan's SANDBOX edge
                 # blocks datacenter IPs with a bodyless 403 (confirmed from the
@@ -549,6 +581,37 @@ def main() -> None:
                 f"✅ Audit archive healthy again (through {watermark}).",
             )
 
+    def _retire_stale_targets(ref: str) -> None:
+        """Clear target legs whose cancel failed at placement (Decision 034).
+
+        Dhan forces a TARGET_LEG onto every super order and no strategy here
+        has a target, so the leg is cancelled the moment the entry is accepted.
+        When that cancel fails, a live take-profit is left resting at a price no
+        backtest justifies (House Rule 7) — this is the retry, riding the sweep
+        that already runs every 60s inside market hours.
+
+        Best-effort by design: a failure here means the target is still live,
+        which the next tick tries again, and which never threatens the position
+        the way a missing stop does.
+        """
+        if not settings.attached_stops_enabled:
+            return  # no super orders exist ⇒ no target legs to retire
+        broker = brokers[ref]
+        retire = getattr(broker, "retire_stale_target_legs", None)
+        if retire is None:
+            return
+        try:
+            cleared = retire()
+        except Exception:
+            _log.warning("target_leg_retry_failed", account_ref=ref, exc_info=True)
+            return
+        if cleared:
+            _log.info("target_legs_retired_late", account_ref=ref, order_ids=cleared)
+            send_alert(
+                f"[{ref}] retired {len(cleared)} stale super-order target "
+                f"leg(s) that failed to cancel at placement"
+            )
+
     def _sweep_stops() -> None:
         for ref, ref_bucket_ids in accounts.items():
             pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
@@ -562,6 +625,10 @@ def main() -> None:
             # deliberately NOT gated: a 24/7 venue must be swept 24/7.
             if ref in dhan_accounts and nse_session(clock.now()) is NseSession.CLOSED:
                 continue
+            # Before the sweep, and outside its try: a target leg that failed
+            # to cancel at placement is an armed unbacktested exit, and it must
+            # not depend on the sweep succeeding to get retried.
+            _retire_stale_targets(ref)
             try:
                 ensure_stop_protection(
                     account_ref=ref,
@@ -579,6 +646,9 @@ def main() -> None:
                     price_band_pct=_price_bands(dhan_data, ref in dhan_accounts),
                     clock=clock,
                     shared_account=ref in dhan_accounts,
+                    # Decision 034 master switch. OFF ⇒ the sweep never
+                    # touches the super-order endpoint at all.
+                    attached_stops_enabled=settings.attached_stops_enabled,
                 )
                 _note_safety_ok(
                     f"stop_sweep_error:{ref}",
@@ -653,6 +723,7 @@ def main() -> None:
                     clock=clock,
                     shared_account=ref in dhan_accounts,
                     check_liveness=live_session,
+                    attached_stops_enabled=settings.attached_stops_enabled,
                 )
                 enforce_session_invariants(
                     results,
