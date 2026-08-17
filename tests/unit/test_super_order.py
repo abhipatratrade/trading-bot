@@ -743,11 +743,23 @@ class TestFeatureGating:
         def tick_size(self, symbol: str):
             return Decimal("0.05")
 
-    def _sweep(self, enabled: bool) -> list[str]:
-        from src.safety.stop_protection import ensure_stop_protection
+    def _sweep(self, enabled: bool, monkeypatch) -> list[str]:
+        """Runs the real sweep with its DB loaders stubbed.
+
+        They MUST be stubbed. Every one of them queries Postgres, and the local
+        .env points at the LIVE production database — so an unstubbed version of
+        this test passes by reading prod and then fails in CI against an empty
+        SQLite. That is exactly how these two tests reached CI broken.
+        """
+        from src.safety import stop_protection as sp
+
+        monkeypatch.setattr(sp, "_load_attribution", lambda *a, **k: {})
+        monkeypatch.setattr(sp, "_load_stop_distances", lambda *a, **k: {})
+        monkeypatch.setattr(sp, "_load_entry_prices", lambda *a, **k: {})
+        monkeypatch.setattr(sp, "_load_recent_entry_symbols", lambda *a, **k: set())
 
         broker = self._Spy()
-        ensure_stop_protection(
+        sp.ensure_stop_protection(
             account_ref="dhan",
             bucket_ids=["swing-indian"],
             broker=broker,  # type: ignore[arg-type]
@@ -757,11 +769,11 @@ class TestFeatureGating:
         )
         return broker.calls
 
-    def test_switch_off_never_touches_the_super_order_endpoint(self) -> None:
-        assert self._sweep(False) == []
+    def test_switch_off_never_touches_the_super_order_endpoint(self, monkeypatch) -> None:
+        assert self._sweep(False, monkeypatch) == []
 
-    def test_switch_on_reads_the_legs(self) -> None:
-        assert self._sweep(True) == ["super"]
+    def test_switch_on_reads_the_legs(self, monkeypatch) -> None:
+        assert self._sweep(True, monkeypatch) == ["super"]
 
 
 # ── Coverage must recognise a stop the bot did not place ─────────────────
