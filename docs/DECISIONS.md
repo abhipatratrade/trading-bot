@@ -1519,3 +1519,100 @@ by test.
 placement, failure is fail-closed, and a crash between the leg DELETE and the
 close self-heals on the next sweep (the symbol drops out of `attached_stops`,
 so the normal path rests a standalone stop).
+
+---
+
+## 035 — GTT (Forever Orders) for overnight stop protection — PROPOSED, NOT BUILT
+Date: 2026-08-18
+Status: **Proposed. Nothing is built. Do not treat as implemented.**
+Amends (if adopted): 022, for the multi-day Indian buckets only
+Related house rules: #2, #8
+
+Context: Decision 022 exists on one premise — "the stop rests ON the exchange,
+so a max loss holds even when the bot or its VM is down." **For Dhan equity that
+premise is false overnight, and has been since swing-indian went live on
+2026-07-27.**
+
+Two independent confirmations, found 2026-08-18 while checking whether a super
+order's stop leg could survive multiple days:
+
+1. `DhanClient._order_body` sends `"validity": "DAY"` on every protective stop.
+   No inference needed — we *request* an order that expires at close.
+2. The user's own hand-placed PIIND stop (order `1200000000373477`, accepted
+   2026-08-14) was gone from the order book by 08-18.
+
+So a swing-indian position carries no venue-resident stop between close and the
+next morning's sweep.
+
+### Sizing this honestly
+
+A resting overnight stop would NOT have saved us from a gap: it triggers at the
+open and fills at the gapped price, much like one re-placed at 09:15. The sweep
+already re-places a missing stop each morning, so protection during market hours
+is real.
+
+The genuine exposure is narrower and worth stating plainly: **the bot or VM is
+down at the open and the stock slides during that session.** No stop rests, and
+nothing places one. That is precisely the scenario Decision 022 was written for,
+and it is not covered.
+
+Scope is the multi-day buckets only. intraday-indian squares off at 15:15, so
+DAY validity is exactly right there and this decision does not apply to it.
+
+### What GTT is, and why it fits
+
+Dhan's **Forever Order** API (`/forever/orders`, with PUT/DELETE/GET siblings)
+rests a trigger that outlives the session.
+
+The load-bearing fact, quoted from the Dhan docs: the allowed
+`productType` values are "`CNC` `MTF`" — which is exactly swing-indian's
+product, and the reason this is worth pursuing at all rather than being blocked
+the way MTF has blocked so much else.
+
+It also carries the same leg vocabulary we already handle: `orderFlag` of
+`SINGLE` or `OCO`, with `TARGET_LEG` / `STOP_LOSS_LEG` and a `triggerPrice`.
+A protective stop is the `SINGLE` shape: SELL, `triggerPrice`, no target.
+
+**One ambiguity, recorded rather than resolved:** the docs list `validity` as
+`DAY`/`IOC` on the Forever Order too, which reads oddly for a product whose
+point is persistence. The standard GTT design — the trigger rests indefinitely
+and `validity` governs the child order placed WHEN it fires — reconciles it, but
+that is a reading, not something the page states. Verify before building.
+
+### The question that decides whether this is needed at all
+
+`_super_order_body` sends **no `validity` field**, deliberately (it is limited to
+documented fields), so Dhan's default applies to a super order's `STOP_LOSS_LEG`
+and we do not know what that default is. Dhan's own line that you can place
+"intraday, carry forward or even MTF orders via this order type" implies the
+legs persist for a carry-forward product — suggestive, not proof.
+
+So:
+
+- **If a super-order SL leg survives overnight on MTF → this decision is
+  unnecessary.** Super orders already give atomic protection at entry, which is
+  strictly better than a separately-placed GTT.
+- **If it does not → build this.** The two are then complementary: the super
+  order closes the fill→stop gap during the session, the GTT is the overnight
+  net.
+
+**This is answered by observation, not by reasoning — watch swing-indian's first
+MTF super order across a session boundary.** Guessing at Dhan's behaviour is how
+the client-id header, the MTF product on stops, and the out-of-band trigger all
+happened. Do not build this until that observation exists.
+
+### If adopted, the known design constraints
+
+- **One protective stop per symbol, always.** The sweep already enforces this
+  against standalone stops and super-order legs (Decision 034); a GTT would be a
+  third source and must join the same suppression, or a position ends up with
+  two resting sells and the second one shorts.
+- **Ownership.** A GTT must be provably ours before the bot ever cancels it —
+  `correlationId` plus the ledger fallback, exactly as Decision 034 does, and for
+  the same Decision 027 reason.
+- **Retirement on exit.** A GTT that outlives its position is the naked-short
+  hazard again, and worse than a super-order leg because it outlives the
+  SESSION. It must retire through the same adapter chokepoint.
+- **`_detect_unrecorded_exits` already covers the settlement side** — a GTT that
+  fires while the bot is down writes no Trade row, and that mechanism records it
+  from the position shortfall without needing to ask the venue.
