@@ -222,11 +222,30 @@ def check_stop_coverage(
     stronger protection was used.
     """
     name = "stop_coverage"
-    covered = {
-        o.symbol
-        for o in open_orders
-        if o.reduce_only and o.stop_price is not None and o.unfilled_size > 0
-    } | set(attached_stops or {})
+    covered = set(attached_stops or {})
+    for o in open_orders:
+        if o.stop_price is None or o.unfilled_size <= 0:
+            continue
+        if o.reduce_only:
+            # Provably ours (Dhan infers this from OUR correlationId).
+            covered.add(o.symbol)
+            continue
+        # NOT provably ours — a stop the user placed by hand in the Dhan app
+        # comes back with correlationId "NA". Ownership is the right test for
+        # CANCELLING an order and the wrong one for this check: "is the
+        # position protected" is a question about the market, not about who
+        # placed the order. Without this branch a hand-placed stop leaves the
+        # bucket halting every tick while the position is in fact protected.
+        #
+        # Two conditions keep it honest. SELL, because a resting BUY stop is an
+        # entry trigger, not protection for a long (Indian equity is long-only;
+        # crypto sub-accounts are exclusive, so no foreign order exists there).
+        # And big enough to cover OUR holding, because on a shared account the
+        # user may hold the same scrip — a stop sized for their 100 shares says
+        # nothing about the bot's 15.
+        held = holdings.get(o.symbol, Decimal("0"))
+        if str(o.side).lower() == "sell" and held > 0 and o.unfilled_size >= held:
+            covered.add(o.symbol)
     uncovered = sorted(set(holdings) - covered)
     if not uncovered:
         return InvariantResult(name, bucket_id, ok=True)

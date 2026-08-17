@@ -112,6 +112,11 @@ buckets:
     # any position that arrives without a distance (manual import, reconciler
     # adoption) — deliberately wide, and the sweep only ever tightens from it.
     stop_loss_pct: 20
+    # Decision 034 — entries carry their protective stop ON the order
+    # (Dhan Super Order), so a stop the venue refuses refuses the ENTRY too.
+    # Armed 2026-08-18 (user decision). The Decision 022 sweep stays behind
+    # it for legacy positions and as the net if the master switch goes off.
+    attached_stops: true
 
   # Decision 029 — seventh bucket, amending 013's fixed six. NIFTY-100
   # gap-down reversal: long-only intraday fade, entries 09:30–10:30, square-off
@@ -158,3 +163,8 @@ buckets:
     # play out. This is a crash net for a bot/VM outage only, deliberately far
     # outside the 15:15 square-off's normal range.
     stop_loss_pct: 15
+    # Decision 034 — entries carry their protective stop ON the order
+    # (Dhan Super Order), so a stop the venue refuses refuses the ENTRY too.
+    # Armed 2026-08-18 (user decision). The Decision 022 sweep stays behind
+    # it for legacy positions and as the net if the master switch goes off.
+    attached_stops: true

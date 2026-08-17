@@ -762,3 +762,46 @@ class TestFeatureGating:
 
     def test_switch_on_reads_the_legs(self) -> None:
         assert self._sweep(True) == ["super"]
+
+
+# ── Coverage must recognise a stop the bot did not place ─────────────────
+class TestForeignStopCoverage:
+    """A stop the user places by hand comes back with correlationId "NA", so
+    the adapter cannot mark it reduce_only. Ownership is the right test for
+    CANCELLING an order and the wrong one here: "is the position protected" is
+    a question about the market. Without this the bucket halts every tick while
+    the position is genuinely protected.
+    """
+
+    def _order(self, *, side: str = "sell", size: str = "15", ours: bool = False):
+        from src.brokers.base import OpenOrder
+
+        return OpenOrder(
+            exchange_order_id="777", client_order_id=None, symbol="PIIND",
+            side=side, size=Decimal(size), unfilled_size=Decimal(size),
+            order_type="STOP_LOSS_MARKET", limit_price=None, status="open",
+            stop_price=Decimal("2200"), reduce_only=ours,
+        )
+
+    def _check(self, order):
+        return check_stop_coverage(
+            bucket_id="swing-indian",
+            holdings={"PIIND": Decimal("15")},
+            open_orders=[order],
+            sustain_ticks=1,
+        )
+
+    def test_a_hand_placed_stop_counts_as_coverage(self) -> None:
+        assert self._check(self._order()).ok
+
+    def test_a_stop_too_small_to_cover_us_does_not(self) -> None:
+        """On a shared account the user may hold the same scrip; a stop sized
+        for their shares says nothing about the bot's."""
+        assert not self._check(self._order(size="5")).ok
+
+    def test_a_resting_buy_stop_is_not_protection(self) -> None:
+        """That is an entry trigger, not a stop on a long."""
+        assert not self._check(self._order(side="buy")).ok
+
+    def test_our_own_stop_still_counts_regardless_of_size(self) -> None:
+        assert self._check(self._order(size="5", ours=True)).ok
