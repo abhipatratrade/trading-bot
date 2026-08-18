@@ -579,6 +579,8 @@ class Reconciler:
             )
             db_symbols = {p.symbol for p in db_positions}
 
+            self._close_unattributed_positions(report, session, exchange_by_symbol)
+
             # Case 0: a SHORT row on a shared account is not ours, whatever put
             # it there. Flatten it, and do so BEFORE anything else reads it.
             #
@@ -827,6 +829,94 @@ class Reconciler:
         # per pass rather than twice — Dhan is rate-limited and shared with the
         # user's manual trading.
         return exchange_positions
+
+    def _close_unattributed_positions(
+        self, report: ReconcileReport, session: Any, exchange_by_symbol: dict
+    ) -> None:
+        """Flatten IMMORTAL ``bucket_id IS NULL`` rows on a shared account.
+
+        The orphan import writes ``bucket_id`` from the most recent filled Trade
+        for the symbol, and leaves it NULL when it cannot attribute one. Nothing
+        can ever clean those rows up again: every consumer that could close them
+        scopes on ``Position.bucket_id.in_(bucket_ids)``, and NULL never matches
+        ``IN``. They live forever.
+
+        That looked harmless — exits, the stop sweep, attribution and the
+        dashboard all scope by bucket, so none of them can see one. But
+        ``eod.py`` reads ``select(Position).where(side != FLAT)`` with NO
+        scoping, so a ghost row is reported as a position CARRIED OVERNIGHT.
+        On 2026-08-18 that would have claimed 15 PIIND and 238 PPLPHARMA the
+        user had not held for days — in the one section of the report you would
+        read specifically to check overnight exposure.
+
+        Two conditions, either sufficient, and both mean the row is telling
+        nobody anything true:
+
+          * the exchange does not report the symbol at all; or
+          * a properly attributed non-flat row already exists for it, making
+            this one a duplicate.
+
+        A NULL row is deliberately NOT flattened when it is the only record of
+        something the exchange still reports — that would be destroying the sole
+        trace of a live position to tidy a report.
+        """
+        if not self._shared_account:
+            # Only the shared Dhan account produces unattributed rows, and
+            # crypto sub-accounts share a broker — a Delta reconciler must not
+            # reach across into a sibling sub-account's rows.
+            return
+
+        ghosts = list(
+            session.execute(
+                select(Position).where(
+                    Position.broker == self._broker_name,
+                    Position.bucket_id.is_(None),
+                    Position.side != PositionSide.FLAT,
+                )
+            ).scalars()
+        )
+        if not ghosts:
+            return
+
+        attributed = {
+            p.symbol
+            for p in session.execute(
+                select(Position).where(
+                    Position.broker == self._broker_name,
+                    Position.bucket_id.isnot(None),
+                    Position.side != PositionSide.FLAT,
+                )
+            ).scalars()
+        }
+
+        for ghost in ghosts:
+            duplicate = ghost.symbol in attributed
+            absent = ghost.symbol not in exchange_by_symbol
+            if not (duplicate or absent):
+                continue
+            diff = {
+                "type": "unattributed_position_flattened",
+                "symbol": ghost.symbol,
+                "quantity": str(ghost.quantity),
+                "reason": "duplicate" if duplicate else "not_on_exchange",
+            }
+            ghost.side = PositionSide.FLAT
+            ghost.quantity = Decimal("0")
+            ghost.closed_at = self._clock.now()
+            report.positions_closed += 1
+            report.diffs.append(diff)
+            session.add(
+                AuditLog(
+                    strategy_id=ghost.strategy_id or "unknown",
+                    event_type=AuditEventType.RECONCILE_DIFF,
+                    message=(
+                        f"Unattributed position row {ghost.symbol} flattened "
+                        f"({diff['reason']})"
+                    ),
+                    payload=diff,
+                )
+            )
+            self._log.warning("unattributed_position_flattened", **diff)
 
     def _latest_filled_trade(self, session, symbol: str) -> Trade | None:
         """Most-recent FILLED Trade for this symbol on this broker.

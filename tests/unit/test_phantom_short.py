@@ -109,3 +109,46 @@ class TestReconcilerDoesNotAdoptShorts:
             "an existing short row must be flattened — it is what feeds the "
             "exit engine the phantom position"
         )
+
+
+class TestUnattributedGhostRows:
+    """`bucket_id IS NULL` rows are immortal: everything that could close them
+    scopes on `bucket_id.in_(ids)`, and NULL never matches IN.
+
+    That looked harmless — exits, the stop sweep, attribution and the dashboard
+    all scope by bucket. But `eod.py` reads positions with NO scoping, so a
+    ghost is reported as CARRIED OVERNIGHT. On 2026-08-18 that would have
+    claimed 15 PIIND and 238 PPLPHARMA the user had not held for days.
+    """
+
+    def test_eod_still_reads_positions_unscoped(self) -> None:
+        """Pins WHY this cleanup has to exist. If eod.py ever starts scoping by
+        bucket, this test fails and the reasoning above should be revisited."""
+        import inspect
+
+        from src.reporting import eod
+
+        src = inspect.getsource(eod)
+        assert "select(Position).where(Position.side != PositionSide.FLAT)" in src
+
+    def test_cleanup_is_scoped_to_shared_accounts(self) -> None:
+        """Crypto sub-accounts share a broker, so an unscoped sweep would let
+        one Delta reconciler flatten a sibling sub-account's rows."""
+        import inspect
+
+        from src.order_manager.reconciler import Reconciler
+
+        src = inspect.getsource(Reconciler._close_unattributed_positions)
+        assert "if not self._shared_account:" in src
+        assert "return" in src
+
+    def test_a_sole_record_of_a_live_position_is_kept(self) -> None:
+        """Flattening the only trace of something the exchange still reports
+        would be destroying state to tidy a report."""
+        import inspect
+
+        from src.order_manager.reconciler import Reconciler
+
+        src = inspect.getsource(Reconciler._close_unattributed_positions)
+        assert "if not (duplicate or absent):" in src
+        assert "continue" in src
