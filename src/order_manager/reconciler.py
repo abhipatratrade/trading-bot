@@ -579,6 +579,41 @@ class Reconciler:
             )
             db_symbols = {p.symbol for p in db_positions}
 
+            # Case 0: a SHORT row on a shared account is not ours, whatever put
+            # it there. Flatten it, and do so BEFORE anything else reads it.
+            #
+            # This is cleanup AND containment. The stop sweep now refuses to
+            # protect a short, but a short Position row is also picked up by
+            # ``BucketRunner._run_exits``, which would compute the closing side
+            # as BUY and try to "close" the phantom by BUYING 15 shares. Exits
+            # carry ``allow_when_killed=True`` (Decision 024), so the kill
+            # switch would NOT have stopped it — the one path where a stale row
+            # could still have opened a real position.
+            for db_pos in db_positions:
+                if not self._shared_account or db_pos.side != PositionSide.SHORT:
+                    continue
+                self._log.warning(
+                    "short_position_row_flattened",
+                    symbol=db_pos.symbol,
+                    quantity=str(db_pos.quantity),
+                    bucket_id=db_pos.bucket_id,
+                )
+                db_pos.side = PositionSide.FLAT
+                db_pos.quantity = Decimal("0")
+                db_pos.closed_at = self._clock.now()
+                report.positions_closed += 1
+                report.diffs.append(
+                    {
+                        "type": "short_position_row_flattened",
+                        "symbol": db_pos.symbol,
+                        "reason": "shorts are never the bot's on a shared account",
+                    }
+                )
+            db_positions = [
+                p for p in db_positions if p.side != PositionSide.FLAT
+            ]
+            db_symbols = {p.symbol for p in db_positions}
+
             # Case 1: DB has position, exchange doesn't → close it
             for db_pos in db_positions:
                 if db_pos.symbol not in exchange_by_symbol:
@@ -640,6 +675,24 @@ class Reconciler:
                         "external_position_ignored",
                         symbol=sym,
                         exchange_side=ex_pos.side,
+                        exchange_size=str(ex_pos.size),
+                    )
+                    continue
+                if self._shared_account and ex_pos.side == "short":
+                    # A short is never provably ours here: ``net_owned``
+                    # expresses only long quantities, so the check above can
+                    # pass on a symbol we are LONG in the ledger while the
+                    # broker reports a SHORT — which is precisely what a
+                    # settlement artifact looks like.
+                    #
+                    # On 2026-08-18 selling PIIND out of holdings produced a
+                    # negative day-position, and this branch adopted it as a
+                    # short Position row (``orphan_position_reopened``). That
+                    # row then told the stop sweep there was a short to
+                    # protect. Adopting it is how the artifact became state.
+                    self._log.warning(
+                        "short_position_not_adopted",
+                        symbol=sym,
                         exchange_size=str(ex_pos.size),
                     )
                     continue

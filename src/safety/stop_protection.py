@@ -359,6 +359,31 @@ def plan_stop_protection(
         if shared and pos.symbol not in owned_quantities:  # type: ignore[operator]
             continue
 
+        # A SHORT can never be proven ours on a shared account, because the
+        # ownership ledger cannot express one: ``net_owned`` returns only
+        # positive (long) nets by construction. So a short here is either the
+        # user's, or an artifact — and on 2026-08-18 it was an artifact that
+        # nearly cost real money.
+        #
+        # What happened: swing-indian sold its 15 PIIND at 12:16. Selling stock
+        # out of HOLDINGS shows up as a negative day-position in Dhan's
+        # /v2/positions until settlement catches up, so the broker reported
+        # PIIND short 15. The exit order was still PENDING, so ``net_owned``
+        # had not yet decremented and the symbol still looked owned — it passed
+        # the check above. The sweep then read side=short and planned a BUY
+        # stop ABOVE the market to "protect" it.
+        #
+        # Dhan rejected that one. Had it been accepted, triggering it would have
+        # BOUGHT 15 shares — opening a real long position with no strategy
+        # behind it, from the module whose entire job is reducing risk.
+        if shared and pos.side == "short":
+            _log.warning(
+                "short_position_not_protected_on_shared_account",
+                symbol=pos.symbol,
+                size=str(pos.size),
+            )
+            continue
+
         # Decision 034: the venue is already holding a stop attached to this
         # entry. Do nothing at all — and POP its orders first, so the leg is
         # not mistaken for an orphan by the cancel pass below. Both halves

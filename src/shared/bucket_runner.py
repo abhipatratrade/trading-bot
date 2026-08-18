@@ -534,6 +534,35 @@ class BucketRunner:
         if not held_rows:
             return 0
 
+        # An Indian equity bucket cannot legitimately hold a SHORT: every
+        # strategy here is long-only and a demat account cannot carry one. A
+        # short row is therefore corrupt — on 2026-08-18 Dhan reported PIIND
+        # short 15 for a few minutes after the position was SOLD (a sale out of
+        # holdings shows as a negative day-position until settlement), and that
+        # artifact was adopted as a Position row.
+        #
+        # Exiting it would compute the closing side as BUY and purchase 15
+        # shares to "close" a position that does not exist. Exits pass an
+        # engaged kill switch by design (Decision 024), so nothing downstream
+        # would have stopped it. The reconciler now flattens these rows, but it
+        # sweeps on its own 5-minute clock; this refuses to act on one in the
+        # window before it does.
+        if self.bucket.market == Market.INDIAN:
+            shorts = [p for p in held_rows if p.side == PositionSide.SHORT]
+            if shorts:
+                for p in shorts:
+                    _log.warning(
+                        "short_row_ignored_long_only_bucket",
+                        bucket_id=self.bucket.id,
+                        symbol=p.symbol,
+                        quantity=str(p.quantity),
+                    )
+                held_rows = [
+                    p for p in held_rows if p.side != PositionSide.SHORT
+                ]
+                if not held_rows:
+                    return 0
+
         by_strategy: dict[str, dict[str, Position]] = {}
         for pos in held_rows:
             if not pos.strategy_name:
