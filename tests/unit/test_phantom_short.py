@@ -142,13 +142,19 @@ class TestUnattributedGhostRows:
         assert "if not self._shared_account:" in src
         assert "return" in src
 
-    def test_a_sole_record_of_a_live_position_is_kept(self) -> None:
+    def test_a_sole_record_of_a_live_owned_position_is_kept(self) -> None:
         """Flattening the only trace of something the exchange still reports
-        would be destroying state to tidy a report."""
+        AND the bot still owns would be destroying state to tidy a report.
+
+        The `unowned` arm is what covers T+1: a scrip sold today still shows in
+        holdings tonight, so `absent` is False — but the ledger knows it is
+        gone, and without that arm PIIND would have been reported as carried
+        overnight on 2026-08-18."""
         import inspect
 
         from src.order_manager.reconciler import Reconciler
 
         src = inspect.getsource(Reconciler._close_unattributed_positions)
-        assert "if not (duplicate or absent):" in src
+        assert "if not (duplicate or absent or unowned):" in src
         assert "continue" in src
+        assert "bot_owned_quantities" in src, "ownership is the T+1 discriminator"

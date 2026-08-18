@@ -854,7 +854,10 @@ class Reconciler:
 
           * the exchange does not report the symbol at all; or
           * a properly attributed non-flat row already exists for it, making
-            this one a duplicate.
+            this one a duplicate; or
+          * the bot's own ledger says it does not own the symbol. Indian
+            equity settles T+1, so a scrip SOLD today still shows in
+            holdings tonight — and would be reported as carried overnight.
 
         A NULL row is deliberately NOT flattened when it is the only record of
         something the exchange still reports — that would be destroying the sole
@@ -888,17 +891,37 @@ class Reconciler:
                 )
             ).scalars()
         }
+        owned = bot_owned_quantities(
+            session,
+            broker_name=self._broker_name,
+            bucket_ids=self._bucket_ids or [],
+            now=self._clock.now(),
+        )
 
         for ghost in ghosts:
             duplicate = ghost.symbol in attributed
             absent = ghost.symbol not in exchange_by_symbol
-            if not (duplicate or absent):
+            # The exchange may still report a scrip the bot has SOLD: Indian
+            # equity settles T+1, so a holding lingers for a day after the sale.
+            # PIIND on 2026-08-18 was exactly that — sold at 12:16, still in
+            # holdings, and about to be reported as "carried overnight" in a
+            # report the user reads to check overnight exposure.
+            #
+            # An unattributed row the bot does not OWN is not the bot's business
+            # by Decision 027, and `foreign_positions` already reports it as the
+            # user's. Keeping a Position row for it contradicts that.
+            unowned = ghost.symbol not in owned
+            if not (duplicate or absent or unowned):
                 continue
             diff = {
                 "type": "unattributed_position_flattened",
                 "symbol": ghost.symbol,
                 "quantity": str(ghost.quantity),
-                "reason": "duplicate" if duplicate else "not_on_exchange",
+                "reason": (
+                    "duplicate" if duplicate
+                    else "not_on_exchange" if absent
+                    else "not_owned_by_bot"
+                ),
             }
             ghost.side = PositionSide.FLAT
             ghost.quantity = Decimal("0")
