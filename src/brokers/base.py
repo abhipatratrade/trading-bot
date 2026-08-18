@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -153,6 +153,53 @@ class FillInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderCharges:
+    """Statutory + brokerage costs the venue billed for ONE order.
+
+    Kept as a breakdown rather than a single number because the components are
+    not interchangeable: STT and stamp duty are taxes, brokerage is negotiable,
+    and a tax filing needs them apart. ``total`` is what P&L subtracts.
+
+    Every field defaults to zero so a venue that reports only some of them maps
+    cleanly, but note that a genuinely all-zero result on an Indian equity trade
+    is essentially impossible — STT alone is non-zero on both legs of a delivery
+    trade. Callers use that to tell "no charges" from "not computed yet"; see
+    ``Reconciler._enrich_trade_charges``.
+    """
+
+    exchange_order_id: str
+    brokerage: Decimal = Decimal("0")
+    stt: Decimal = Decimal("0")
+    exchange_txn: Decimal = Decimal("0")
+    sebi: Decimal = Decimal("0")
+    stamp_duty: Decimal = Decimal("0")
+    gst: Decimal = Decimal("0")
+
+    @property
+    def total(self) -> Decimal:
+        return (
+            self.brokerage
+            + self.stt
+            + self.exchange_txn
+            + self.sebi
+            + self.stamp_duty
+            + self.gst
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        """Breakdown as strings, for lossless JSONB round-tripping."""
+        return {
+            "brokerage": str(self.brokerage),
+            "stt": str(self.stt),
+            "exchange_txn": str(self.exchange_txn),
+            "sebi": str(self.sebi),
+            "stamp_duty": str(self.stamp_duty),
+            "gst": str(self.gst),
+            "total": str(self.total),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class OpenOrder:
     exchange_order_id: str
     client_order_id: str | None
@@ -224,6 +271,21 @@ class Broker(ABC):
         commissions, and realized P&L per trade.
         """
         return []
+
+    def get_order_charges(  # noqa: B027
+        self, *, start: date, end: date
+    ) -> dict[str, OrderCharges]:
+        """``exchange_order_id → charges`` billed over a DATE RANGE.
+
+        Separate from :meth:`get_fills` because the two answer different
+        questions on different clocks. Fills are known the instant an order
+        executes; charges are computed by the broker at end of day. A caller
+        that asked for both at once would bake in zeros.
+
+        Default empty — a venue without a charges report simply leaves
+        ``Trade.fees`` alone, which is the pre-existing behaviour.
+        """
+        return {}
 
     def required_margin(  # noqa: B027
         self,

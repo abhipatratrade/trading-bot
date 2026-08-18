@@ -126,6 +126,13 @@ class Reconciler:
             # Observability only — never let it fail the sweep.
             self._log.warning("wallet_flows_sync_failed", exc_info=True)
         try:
+            # BEFORE P&L: charges must land first, or the pairing pass would
+            # recompute against fees that are still zero and re-stamp
+            # pnl_final, undoing the unstamp in the same run.
+            self._enrich_trade_charges()
+        except Exception:
+            self._log.warning("trade_charges_enrichment_failed", exc_info=True)
+        try:
             self._enrich_trades_pnl()
         except Exception:
             # P&L enrichment is observability — never let it fail the sweep.
@@ -148,6 +155,139 @@ class Reconciler:
         else:
             self._log.info("reconcile_clean")
         return report
+
+    # ── Broker charges ──────────────────────────────────────────────
+
+    # How far back to look for trades still missing their charges. Generous
+    # because charges land at END OF DAY: a trade filled at 15:20 cannot be
+    # enriched until that evening at the earliest, and a weekend or a bot
+    # outage stretches that further.
+    _CHARGES_LOOKBACK_DAYS = 10
+
+    def _enrich_trade_charges(self) -> None:
+        """Fill in what the broker actually billed, and re-derive P&L.
+
+        ``Trade.fees`` has been a hardcoded zero on every Dhan trade since the
+        integration was written: ``get_fills`` reads ``/v2/trades``, the intraday
+        day book, which reports executions and no costs. The costs live on a
+        DIFFERENT resource — ``/v2/trades/{from}/{to}/{page}``, the trade-history
+        report — which nobody wired up.
+
+        That is not cosmetic. ``realized_pnl`` already subtracts
+        ``entry.fees + exit.fees``; it has simply been subtracting nothing. So
+        every P&L figure in the dashboard, the EOD report, the tax ledger and the
+        edge stats has been GROSS of brokerage, STT, stamp duty, exchange and
+        SEBI charges and GST. For swing-indian, whose backtested mean trade is
+        ~0.62%, round-trip charges are a large fraction of the edge — which makes
+        this the difference between measuring the strategy and flattering it.
+
+        Ordering is the whole difficulty. Fills are known in seconds and charges
+        only at end of day, so P&L is inevitably computed first, with zero fees,
+        and stamped ``pnl_final``. When charges arrive later this UNSTAMPS the
+        round trip — both legs, including the entry's ``closed_by_trade_id``
+        pairing mark — so the next ``_enrich_trades_pnl`` pass re-pairs and
+        recomputes against real costs. That cannot loop: ``charges_final`` is
+        written in the same transaction, so the trade is skipped from then on.
+        """
+        charges_by_order = None  # fetched lazily; skip the API call if idle
+        now = self._clock.now()
+        window_start = now - timedelta(days=self._CHARGES_LOOKBACK_DAYS)
+
+        with session_scope() as session:
+            candidates = list(
+                session.execute(
+                    select(Trade).where(
+                        Trade.broker == self._broker_name,
+                        Trade.exchange_order_id.isnot(None),
+                        Trade.status.in_(
+                            [OrderStatus.FILLED, OrderStatus.PARTIAL]
+                        ),
+                        Trade.created_at > window_start,
+                        *self._scope_trades(),
+                    )
+                ).scalars()
+            )
+            pending = [
+                t
+                for t in candidates
+                if not (t.extra or {}).get("charges_final")
+                # A synthetic exit was never an order, so the venue billed
+                # nothing against it and there is nothing to look up.
+                and not (t.extra or {}).get("synthetic_exit")
+            ]
+            if not pending:
+                return
+
+            charges_by_order = self._broker.get_order_charges(
+                start=window_start.date(), end=now.date()
+            )
+            if not charges_by_order:
+                return
+
+            for trade in pending:
+                charges = charges_by_order.get(trade.exchange_order_id or "")
+                if charges is None:
+                    continue
+                if not charges_are_billed(charges):
+                    continue
+
+                trade.fees = charges.total
+                trade.extra = {
+                    **(trade.extra or {}),
+                    "charges": charges.as_dict(),
+                    "charges_final": True,
+                }
+                self._unstamp_pnl_for_recompute(session, trade)
+                self._log.info(
+                    "trade_charges_recorded",
+                    exchange_order_id=trade.exchange_order_id,
+                    symbol=trade.symbol,
+                    total=str(charges.total),
+                )
+
+    def _unstamp_pnl_for_recompute(self, session: Any, trade: Trade) -> None:
+        """Clear a finalised P&L so it recomputes with real fees.
+
+        Both legs must be cleared, and the entry's ``closed_by_trade_id`` with
+        them: the pairing loop skips entries already marked closed, so leaving
+        it would make the exit permanently unpairable and strand it with no P&L
+        at all — worse than the gross figure we are correcting.
+        """
+        pnl_keys = (
+            "pnl_usd",
+            "pnl_pct",
+            "pnl_kind",
+            "pnl_final",
+            "pnl_updated_at",
+            "carry_interest",
+        )
+        legs = [trade]
+        extra = trade.extra or {}
+        partner_id = extra.get("closed_by_trade_id")
+        if partner_id:
+            partner = session.get(Trade, partner_id)
+            if partner:
+                legs.append(partner)
+        else:
+            # This may itself be the exit; find the entry it closed.
+            entry = session.execute(
+                select(Trade).where(
+                    Trade.broker == self._broker_name,
+                    Trade.symbol == trade.symbol,
+                    Trade.extra["closed_by_trade_id"].astext == str(trade.id),
+                )
+            ).scalars().first()
+            if entry:
+                legs.append(entry)
+
+        for leg in legs:
+            e = dict(leg.extra or {})
+            if not any(k in e for k in pnl_keys):
+                continue
+            for k in pnl_keys:
+                e.pop(k, None)
+            e.pop("closed_by_trade_id", None)
+            leg.extra = e
 
     # ── Unrecorded exits ────────────────────────────────────────────
 
@@ -1071,6 +1211,20 @@ class Reconciler:
                     )
                 )
                 self._log.info("order_status_updated", **diff)
+
+
+def charges_are_billed(charges: Any) -> bool:
+    """True when the venue has actually billed this order. PURE.
+
+    A zero total means "not computed yet", NOT "free". Brokers compute charges
+    at end of day, and STT alone is non-zero on both legs of an Indian delivery
+    trade — so an all-zero report is the absence of a bill, not a free trade.
+
+    The distinction is the whole point. Accepting a zero would stamp
+    ``charges_final`` and bake the placeholder in permanently, which is exactly
+    the bug this enrichment exists to fix. Rejecting it costs one more pass.
+    """
+    return charges is not None and charges.total > 0
 
 
 def _fills_for_trade(fills: list | None, trade: Trade) -> list:

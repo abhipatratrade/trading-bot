@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -46,6 +46,7 @@ from src.brokers.base import (
     CancelResult,
     FillInfo,
     OpenOrder,
+    OrderCharges,
     OrderRequest,
     OrderResult,
     OrderType,
@@ -70,6 +71,10 @@ _STOP_LOSS_LEG = "STOP_LOSS_LEG"
 
 # Super-order leg states that still rest at the venue.
 _LEG_LIVE_STATES = {"PENDING", "TRANSIT", "OPEN", "PART_TRADED", "PARTIALLY_FILLED"}
+
+# Hard ceiling on trade-history pagination. The page size is undocumented, so
+# the walk stops on an empty page; this only bounds a pathological loop.
+_MAX_CHARGE_PAGES = 50
 
 # Dhan orderStatus → canonical status (matches the Delta client's vocabulary).
 _STATUS_MAP: dict[str, str] = {
@@ -956,6 +961,66 @@ class DhanClient(Broker):
                 self._log.warning("fill_parse_failed", fill=f)
         return fills
 
+    def get_order_charges(
+        self, *, start: date, end: date
+    ) -> dict[str, OrderCharges]:
+        """``orderId → charges``, from Dhan's TRADE HISTORY report.
+
+        Note the endpoint: ``/v2/trades/{from}/{to}/{page}``, which is a
+        different resource from the ``/v2/trades`` day book that
+        :meth:`get_fills` reads. The day book carries executions and no costs;
+        this one carries the per-trade breakdown. Reading the wrong one is why
+        every Dhan ``Trade.fees`` in this database has been a hardcoded zero
+        since the integration was written, and why every P&L figure downstream —
+        dashboard, EOD report, tax ledger, profit factor — has been gross of
+        charges.
+
+        Charges arrive per FILL and an order can fill in pieces, so they are
+        summed per ``orderId``: one Trade row is one order.
+
+        Paginated, and the page size is not documented, so it walks until a page
+        comes back empty rather than assuming one page is everything — a
+        truncated read here would silently under-report costs, which is worse
+        than not reading them at all.
+        """
+        out: dict[str, OrderCharges] = {}
+        page = 0
+        while page < _MAX_CHARGE_PAGES:
+            try:
+                rows = self._request(
+                    "GET",
+                    f"/v2/trades/{start:%Y-%m-%d}/{end:%Y-%m-%d}/{page}",
+                )
+            except DhanAPIError:
+                self._log.warning(
+                    "trade_charges_fetch_failed", page=page, exc_info=True
+                )
+                break
+            if not isinstance(rows, list) or not rows:
+                break
+            for r in rows:
+                order_id = str(r.get("orderId", ""))
+                if not order_id:
+                    continue
+                prev = out.get(order_id)
+                out[order_id] = OrderCharges(
+                    exchange_order_id=order_id,
+                    brokerage=_charge(r, "brokerageCharges")
+                    + (prev.brokerage if prev else Decimal("0")),
+                    stt=_charge(r, "stt") + (prev.stt if prev else Decimal("0")),
+                    exchange_txn=_charge(r, "exchangeTransactionCharges")
+                    + (prev.exchange_txn if prev else Decimal("0")),
+                    sebi=_charge(r, "sebiTax")
+                    + (prev.sebi if prev else Decimal("0")),
+                    stamp_duty=_charge(r, "stampDuty")
+                    + (prev.stamp_duty if prev else Decimal("0")),
+                    # Dhan reports GST under its pre-2017 name.
+                    gst=_charge(r, "serviceTax")
+                    + (prev.gst if prev else Decimal("0")),
+                )
+            page += 1
+        return out
+
     def contract_size(
         self, symbol: str, default: Decimal | None = Decimal("1")  # noqa: ARG002
     ) -> Decimal | None:
@@ -1011,6 +1076,22 @@ class DhanClient(Broker):
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _charge(row: dict[str, Any], key: str) -> Decimal:
+    """One charge field as a Decimal; 0 when absent or unparseable.
+
+    Never raises: a single malformed field must not cost us the whole
+    charges report, and an under-read is visible (P&L looks too good)
+    whereas a crashed sweep is not.
+    """
+    raw = row.get(key)
+    if raw is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(raw))
+    except (ArithmeticError, ValueError):
+        return Decimal("0")
 
 
 def _parse_ts(value: Any) -> datetime | None:
