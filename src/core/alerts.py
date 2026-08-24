@@ -73,6 +73,37 @@ def send_alert(message: str) -> bool:
         return False
 
 
+def verify_alert_channel() -> tuple[bool, str]:
+    """Prove the Telegram credentials work, without sending a message.
+
+    A dead alert path is invisible by construction: a healthy watchdog is
+    silent, and a broken one is silent too. ``send_alert`` turns a 401 into a
+    log line and a ``False`` no caller inspects — which is how the scheduler's
+    revoked token went unnoticed from 2026-08-17 until the 2026-08-21 outage
+    it existed to report.
+
+    Returns ``(ok, detail)``; never raises. ``detail`` NEVER carries the
+    token — the credential sits in the request URL, so failures are described
+    by status code or exception type only.
+    """
+    settings = get_settings()
+    if not settings.telegram_enabled:
+        return False, "not configured (bot token or chat id missing)"
+    token = settings.telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
+    try:
+        resp = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10.0)
+    except Exception as exc:
+        return False, f"unreachable ({type(exc).__name__})"
+    if resp.status_code == 401:
+        return False, "401 Unauthorized - token revoked or rotated elsewhere"
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    try:
+        return True, str(resp.json()["result"]["username"])
+    except Exception:
+        return True, "ok"
+
+
 def send_alert_dedup(
     key: str,
     message: str,

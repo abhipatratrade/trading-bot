@@ -29,7 +29,12 @@ from datetime import UTC, datetime, timedelta
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from src.core import retention
-from src.core.alerts import note_alert_recovery, send_alert, send_alert_dedup
+from src.core.alerts import (
+    note_alert_recovery,
+    send_alert,
+    send_alert_dedup,
+    verify_alert_channel,
+)
 from src.core.config import get_settings
 from src.core.export import (
     export_audit_log,
@@ -37,7 +42,13 @@ from src.core.export import (
     mark_audit_archived,
     upload_to_gdrive,
 )
-from src.core.heartbeat import SERVICE_BOT_WORKER, last_beat, staleness
+from src.core.heartbeat import (
+    SERVICE_ALERT_CHANNEL,
+    SERVICE_BOT_WORKER,
+    beat_with,
+    last_beat,
+    staleness,
+)
 from src.core.logging import configure_logging, get_logger
 from src.core.retention import prune_old_rows
 from src.reporting import eod
@@ -78,6 +89,21 @@ def _heartbeat_watch() -> None:
             f"✅ {SERVICE_BOT_WORKER} heartbeat recovered "
             f"(age {int(age)}s)" if age is not None else "✅ heartbeat recovered",
         )
+
+
+def _alert_channel_watch() -> None:
+    """Dead-man's switch for the alert path itself.
+
+    Beats ONLY while Telegram is provably usable. On failure it deliberately
+    does NOT beat: the stale row is the alarm, and a DB row is the only signal
+    that survives the channel being dead. Nothing here tries to page — paging
+    is exactly the thing that is broken.
+    """
+    ok, detail = verify_alert_channel()
+    if ok:
+        beat_with(SERVICE_ALERT_CHANNEL, {"ok": True, "detail": detail})
+        return
+    _log.error("alert_channel_unusable", detail=detail)
 
 
 def _nightly_export() -> None:
@@ -169,6 +195,10 @@ def main() -> None:
     configure_logging()
     _log.info("scheduler_starting")
 
+    # Check once at boot too: a token rotated while this service was down must
+    # not wait an hour to be noticed.
+    _alert_channel_watch()
+
     scheduler = BlockingScheduler(timezone="UTC")
 
     scheduler.add_job(
@@ -177,6 +207,14 @@ def main() -> None:
         hour=0,
         minute=30,
         id="nightly_export",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        _alert_channel_watch,
+        "interval",
+        minutes=60,
+        id="alert_channel_watch",
         replace_existing=True,
     )
 

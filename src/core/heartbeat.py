@@ -24,6 +24,11 @@ _log = get_logger("core.heartbeat")
 
 SERVICE_BOT_WORKER = "bot-worker"
 
+# The alert channel's OWN dead-man's switch. Beaten only while Telegram is
+# provably reachable, so the row going stale is itself the alarm — Telegram
+# cannot be used to report that Telegram is down.
+SERVICE_ALERT_CHANNEL = "alert-channel"
+
 
 def beat(service: str, clock: Clock | None = None) -> None:
     """Upsert the service's heartbeat row to now. Never raises."""
