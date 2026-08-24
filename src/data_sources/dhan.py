@@ -43,6 +43,16 @@ _DEFAULT_UNIVERSE_CACHE = _DATA_DIR / "dhan_universe.json"
 # BSE cash-equity series kept when a name is BSE-only (no NSE listing).
 _BSE_EQUITY_SERIES = {"A", "B", "X", "XT", "T"}
 
+# The only scrip-master columns _fetch_universe consumes. Reading just these
+# keeps the parse clear of the VM's memory ceiling: the full 33-column frame
+# is 213k rows x 33 cols of dtype=str -- 7M Python str objects -- and
+# StringIO(resp.text) adds a UCS-4 copy of the 34.5MB payload on top.
+_UNIVERSE_COLUMNS = [
+    "EXCH_ID", "SEGMENT", "SECURITY_ID", "ISIN", "INSTRUMENT",
+    "UNDERLYING_SYMBOL", "SERIES", "MTF_LEVERAGE",
+    "SM_UPPER_LIMIT", "SM_LOWER_LIMIT",
+]
+
 # MarketData interval → Dhan intraday interval (minutes, as string). "1d" is
 # served by the daily historical endpoint instead.
 _INTRADAY_MINUTES: dict[str, str] = {
@@ -204,9 +214,14 @@ class DhanData(MarketData):
         _log.info("dhan_universe_fetch_start", url=_SCRIP_MASTER_URL)
         resp = self._http.get(_SCRIP_MASTER_URL, timeout=60.0)
         resp.raise_for_status()
-        from io import StringIO
+        from io import BytesIO
 
-        m = pd.read_csv(StringIO(resp.text), dtype=str, low_memory=False)
+        # Parse straight from the response bytes, and only the columns used
+        # below. Measured 2026-08-24 on this exact payload: peak RSS 259MB ->
+        # 166MB, for a byte-identical universe (4,705 symbols, same sha256).
+        # The 93MB matters -- the bot VM is a 958MB e2-micro with no swap.
+        m = pd.read_csv(BytesIO(resp.content), dtype=str,
+                        usecols=_UNIVERSE_COLUMNS, low_memory=False)
 
         # Underlyings that have NSE derivatives. Their SM_UPPER/LOWER band is a
         # *dynamic* (flexible) band, not a hard circuit — it widens on a cool-off
