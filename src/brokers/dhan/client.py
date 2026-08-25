@@ -624,8 +624,13 @@ class DhanClient(Broker):
         stop on a position the venue already protects, nor mistakes the venue's
         own leg for an orphan and cancels it.
         """
+        raw_orders = self._request("GET", _SUPER_PATH) or []
+        if not isinstance(raw_orders, list):
+            raw_orders = []
+        owned = [o for o in raw_orders if self._owns_super_order(o)]
+
         out: dict[str, Decimal] = {}
-        for order in self._live_super_orders():
+        for order in owned:
             leg = self._stop_leg(order)
             if leg is None:
                 continue
@@ -639,6 +644,27 @@ class DhanClient(Broker):
                 continue
             if value > 0:
                 out[symbol] = value
+
+        # DIAGNOSTIC (2026-08-25). The first live super order rested a stop leg
+        # the venue confirmed at 573.80, yet this method returned {} and the
+        # sweep halted the bucket as uncovered. Three shapes could explain it and
+        # nothing offline can separate them: the parent may vanish from this
+        # endpoint once the entry fills, the resting leg's ``orderStatus`` may
+        # fall outside ``_LEG_LIVE_STATES``, or ``tradingSymbol`` may not be the
+        # key. The unit fixtures assert against a hand-written body that was
+        # never validated against Dhan, so they cannot arbitrate either.
+        #
+        # Owned orders are logged in full because they are ours; the rest are
+        # reduced to ids so a shared account does not spill the user's own
+        # orders into journald. Remove once the shape is pinned.
+        if not out:
+            self._log.info(
+                "attached_stop_scan_empty",
+                raw_count=len(raw_orders),
+                owned_count=len(owned),
+                owned=owned,
+                unowned_ids=[str(o.get("orderId", "")) for o in raw_orders if o not in owned],
+            )
         return out
 
     def _retire_attached_stop(self, symbol: str) -> None:
