@@ -635,7 +635,16 @@ class DhanClient(Broker):
             if leg is None:
                 continue
             symbol = order.get("tradingSymbol") or str(order.get("securityId", ""))
-            raw = leg.get("stopLossPrice", order.get("stopLossPrice"))
+            # Dhan reports a resting leg's trigger under ``price``. The
+            # ``stopLossPrice`` key exists only on the PLACEMENT body we send —
+            # it does not come back on the read, so reading it alone returned
+            # None for every leg and the sweep saw every position as uncovered
+            # (confirmed against the live response for IIFL, 2026-08-25).
+            raw = leg.get("stopLossPrice")
+            if raw is None:
+                raw = leg.get("price")
+            if raw is None:
+                raw = order.get("stopLossPrice")
             if not symbol or raw is None:
                 continue
             try:
@@ -645,19 +654,16 @@ class DhanClient(Broker):
             if value > 0:
                 out[symbol] = value
 
-        # DIAGNOSTIC (2026-08-25). The first live super order rested a stop leg
-        # the venue confirmed at 573.80, yet this method returned {} and the
-        # sweep halted the bucket as uncovered. Three shapes could explain it and
-        # nothing offline can separate them: the parent may vanish from this
-        # endpoint once the entry fills, the resting leg's ``orderStatus`` may
-        # fall outside ``_LEG_LIVE_STATES``, or ``tradingSymbol`` may not be the
-        # key. The unit fixtures assert against a hand-written body that was
-        # never validated against Dhan, so they cannot arbitrate either.
+        # Super orders exist but none yielded a trigger — the shape changed
+        # under us. This is exactly how the 2026-08-25 IIFL halt presented (the
+        # venue held a leg at 573.80 while this returned {}), and the body is
+        # the only thing that identifies it, so log it rather than re-deriving
+        # it live a second time. Silent when nothing is resting.
         #
         # Owned orders are logged in full because they are ours; the rest are
         # reduced to ids so a shared account does not spill the user's own
-        # orders into journald. Remove once the shape is pinned.
-        if not out:
+        # orders into journald.
+        if raw_orders and not out:
             self._log.info(
                 "attached_stop_scan_empty",
                 raw_count=len(raw_orders),

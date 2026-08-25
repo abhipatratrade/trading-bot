@@ -109,8 +109,11 @@ def _super_order(
     target_status: str | None = None,
     stop_price: float = 2314.40,
 ) -> dict:
+    # ``price`` — not ``stopLossPrice`` — is what Dhan actually returns for a
+    # resting leg. Verified against the live response 2026-08-25; the old
+    # fixture asserted a key that only exists on the request we send.
     legs = [{"legName": "STOP_LOSS_LEG", "orderStatus": stop_status,
-             "stopLossPrice": stop_price}]
+             "price": stop_price}]
     if target_status is not None:
         legs.append({"legName": "TARGET_LEG", "orderStatus": target_status})
     return {
@@ -385,6 +388,42 @@ class TestOwnership:
             "GET /v2/super/orders": [_Resp([_super_order(stop_status="TRADED")])]
         })
         assert _client(http).attached_stop_triggers() == {}
+
+    def test_verbatim_live_response_is_read_as_protection(self) -> None:
+        """The exact body Dhan returned for IIFL on 2026-08-25.
+
+        Captured from the first real super order. Every other fixture here was
+        hand-written and asserted a ``stopLossPrice`` key that the venue never
+        sends, so the whole suite passed while the sweep read every position as
+        uncovered and halted the bucket. This one is copied from the wire.
+        """
+        http = _FakeHttp({"GET /v2/super/orders": [_Resp([{
+            "dhanClientId": "1103267589",
+            "orderId": "23326082518175",
+            "exchangeOrderId": "1100000018349211",
+            # Dhan TRUNCATES correlationId to 25 chars — the id we sent was
+            # "2d4349af506f1900e2154c3f647fd9e7". Any future equality check
+            # against our client_order_id would silently disown the order.
+            "correlationId": "2d4349af506f1900e2154c3f6",
+            "orderStatus": "TRADED",
+            "transactionType": "BUY",
+            "productType": "INTRADAY",
+            "tradingSymbol": "IIFL",
+            "securityId": "11809",
+            "quantity": 74,
+            "legName": "ENTRY_LEG",
+            "legDetails": [
+                {"orderId": "23326082518175", "legName": "STOP_LOSS_LEG",
+                 "transactionType": "SELL", "remainingQuantity": 74,
+                 "price": 573.8, "orderStatus": "PENDING", "trailingJump": 0.0},
+                {"orderId": "23326082518175", "legName": "TARGET_LEG",
+                 "transactionType": "SELL", "remainingQuantity": 0,
+                 "price": 796.55, "orderStatus": "CANCELLED",
+                 "trailingJump": 0.0},
+            ],
+            "filledQty": 74,
+        }])]})
+        assert _client(http).attached_stop_triggers() == {"IIFL": Decimal("573.8")}
 
 
 # ── Coexistence with the Decision 022 sweep ──────────────────────────────
