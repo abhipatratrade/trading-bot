@@ -1200,10 +1200,11 @@ class Reconciler:
                 e_extra, x_extra = entry.extra or {}, exit_trade.extra or {}
                 entry_avg = Decimal(e_extra["avg_fill_price"])
                 exit_avg = Decimal(x_extra["avg_fill_price"])
-                size = min(
-                    Decimal(e_extra["filled_size"]),
-                    Decimal(x_extra["filled_size"]),
-                )
+                entry_size = _filled_size(entry)
+                exit_size = _filled_size(exit_trade)
+                if entry_size is None or exit_size is None:
+                    continue
+                size = min(entry_size, exit_size)
                 csize = Decimal(x_extra.get("contract_size", "1"))
                 pnl = realized_pnl(
                     entry_avg=entry_avg,
@@ -1426,6 +1427,25 @@ def _decimal_or_none(raw: object) -> Decimal | None:
         return Decimal(str(raw))
     except (ArithmeticError, ValueError):
         return None
+
+
+def _filled_size(trade: Trade) -> Decimal | None:
+    """How many units of ``trade`` actually traded, or None if unknowable.
+
+    Pass 1 stamps ``filled_size`` from the venue's fill book, but a synthetic
+    exit never carries one: it is written for a position that vanished from
+    the broker with no order of ours behind it (``synthetic_exit``), so there
+    are no fills to aggregate. Its ``quantity`` column IS the size — the
+    shortfall the reconciler measured.
+
+    Reading ``extra["filled_size"]`` directly used to raise KeyError on those
+    rows, and since the exception escaped the whole Pass 2 loop, ONE synthetic
+    exit silently zeroed realized P&L for every trade in the sweep.
+    """
+    size = _decimal_or_none((trade.extra or {}).get("filled_size"))
+    if size is None:
+        size = _decimal_or_none(trade.quantity)
+    return size if size is not None and size > 0 else None
 
 
 def _calendar_days(start: Any, end: Any) -> int:
