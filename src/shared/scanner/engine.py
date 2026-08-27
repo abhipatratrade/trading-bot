@@ -560,6 +560,43 @@ def entries_taken_today(bucket_id: str, day: date_type) -> int:
 # series every minute. A restart simply re-scans the current bin.
 _MEANREV_SCAN_CACHE: dict[str, tuple[str, ScanResult]] = {}
 
+# bucket_id → (bar_key, attempts, last_attempt) for a bin whose scan came back
+# with NO usable data. Such a bin is re-fetched inside its own window instead
+# of being cached as settled — see :func:`_blind_retry_due`.
+_MEANREV_BLIND_ATTEMPTS: dict[str, tuple[str, int, datetime]] = {}
+
+# A blind bin is re-fetched at most this many times, this far apart. Six tries
+# five minutes apart walk a 09:16 stub-bin scan out to ~09:41 — still well
+# inside the bin, and ~1,100 Dhan calls worst case, which the 5 req/s pacer
+# absorbs. Past that the data is genuinely not coming, and the SCANNER
+# DEGRADED notice is then the correct and wanted output.
+_BLIND_RETRY_MAX = 6
+_BLIND_RETRY_GAP = timedelta(minutes=5)
+
+
+def _blind_retry_due(bucket_id: str, key: str, now: datetime) -> bool:
+    """True when a bin that scanned blind has earned another fetch.
+
+    The cache is keyed on the bar key alone, so a pass that could evaluate
+    nothing used to pin that verdict for the whole bin. The 09:16 scan — the
+    ONLY one that ever reads the previous session's 15:15→15:30 stub — thus
+    got exactly one attempt, one minute after the open, and Dhan often has not
+    published the prior session's final 15m bar by then. Every symbol came
+    back ``data_bin_absent``, that result was cached, and the stub was never
+    looked at again before the bin rolled at 10:16.
+
+    Two things followed. The stub entry the backtest takes (3 of 214 trades)
+    almost never fired live, and the morning pass cried SCANNER DEGRADED on 8
+    of 10 sessions — training the reader to ignore the one check that watches
+    perception. On 2026-08-07 the single attempt happened to land after Dhan
+    had published, and all 94 symbols resolved the stub normally, which is the
+    proof that the bar is real and merely late.
+    """
+    seen_key, attempts, last = _MEANREV_BLIND_ATTEMPTS.get(bucket_id, ("", 0, now))
+    if seen_key != key or attempts >= _BLIND_RETRY_MAX:
+        return False
+    return (now - last) >= _BLIND_RETRY_GAP
+
 
 def run_meanrev_scan(
     *,
@@ -591,7 +628,11 @@ def run_meanrev_scan(
     cfg = MeanRevConfig.from_scanner_config(config)
     key = last_complete_bar_key(now)
     cached = _MEANREV_SCAN_CACHE.get(bucket_id)
-    if cached is not None and cached[0] == key:
+    if (
+        cached is not None
+        and cached[0] == key
+        and not _blind_retry_due(bucket_id, key, now)
+    ):
         return cached[1]
 
     # Named scanner sets namespace their snapshots as "<bucket>:<name>"; the
@@ -764,6 +805,20 @@ def run_meanrev_scan(
         evaluated_count=len(evaluated),
     )
     _MEANREV_SCAN_CACHE[bucket_id] = (key, result)
+    # A bin nobody could read is not a settled bin. Record the attempt so the
+    # next ticks re-fetch it (bounded by _BLIND_RETRY_MAX/_GAP) rather than
+    # serving the blind verdict back from cache until the bin rolls.
+    if not evaluated or len(unevaluable) >= len(evaluated):
+        seen_key, attempts, _ = _MEANREV_BLIND_ATTEMPTS.get(
+            bucket_id, ("", 0, now)
+        )
+        _MEANREV_BLIND_ATTEMPTS[bucket_id] = (
+            key,
+            attempts + 1 if seen_key == key else 1,
+            now,
+        )
+    else:
+        _MEANREV_BLIND_ATTEMPTS.pop(bucket_id, None)
     return result
 
 
