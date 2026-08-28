@@ -22,7 +22,9 @@ change.
     Measured 2026-08-28: 462 ambiguous names covering 2,236 NSE contracts.
     We therefore MINT our own symbol from the tuple the master *does*
     guarantee unique — ``(underlying, expiry, strike, option_type)`` — with
-    the expiry written in full: ``NIFTY-20260908-23150-CE``.
+    the expiry written in full: ``NIFTY-20260908-23150-CE``. That grammar
+    lives in ``src/shared/contracts.py``, not here, so the sizer's dedup and
+    the reconciler's matching read it from the same place this writes it.
 
 2.  **Futures carry sentinels, not nulls.** ``OPTION_TYPE`` is the literal
     ``"XX"`` and ``STRIKE_PRICE`` is ``-0.01``. Both normalise to None here so
@@ -58,6 +60,7 @@ import httpx
 
 from src.brokers.base import ContractSpec
 from src.core.logging import get_logger
+from src.shared.contracts import contract_symbol
 
 _log = get_logger("data_sources.dhan_fno")
 
@@ -208,40 +211,6 @@ class DerivativeContract:
             strike=Decimal(strike) if strike is not None else None,
             option_type=raw.get("option_type"),
         )
-
-
-def contract_symbol(
-    underlying: str,
-    expiry: date,
-    *,
-    strike: Decimal | None = None,
-    option_type: str | None = None,
-) -> str:
-    """Mint this system's canonical contract symbol.
-
-    ``NIFTY-20260908-23150-CE`` for an option, ``NIFTY-20260929-FUT`` for a
-    future. The expiry is written in full precisely because the master's own
-    ``SYMBOL_NAME`` writes only the month and therefore collides across
-    weeklies (see the module docstring).
-
-    The strike is rendered through ``Decimal.normalize()`` so ``23150.00000``
-    and ``42.50000`` become ``23150`` and ``42.5`` — stable across master
-    refreshes, and fraction-preserving for the 2,319 half-point strikes.
-    """
-    stem = f"{underlying}-{expiry:%Y%m%d}"
-    if option_type is None or strike is None:
-        return f"{stem}-FUT"
-    return f"{stem}-{_format_strike(strike)}-{option_type}"
-
-
-def _format_strike(strike: Decimal) -> str:
-    """``23150.00000`` -> ``23150``; ``42.50000`` -> ``42.5``.
-
-    ``normalize()`` on a whole number can yield exponent notation (``2.315E+4``),
-    so whole values are re-quantised to a plain integer string.
-    """
-    n = strike.normalize()
-    return str(n.quantize(Decimal("1")) if n == n.to_integral_value() else n)
 
 
 class FnoRegistry:

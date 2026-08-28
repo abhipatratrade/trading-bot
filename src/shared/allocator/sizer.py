@@ -33,6 +33,7 @@ audit (Decision 008's "audit every decision" rule).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -60,6 +61,7 @@ from src.shared.allocator.caps import apply_aggregate_cap, apply_per_symbol_cap
 from src.shared.allocator.kelly import fractional_kelly as scale_kelly
 from src.shared.allocator.kelly import kelly_fraction
 from src.shared.bucket import Bucket, Market
+from src.shared.contracts import underlying_of
 
 _log = get_logger("shared.allocator.sizer")
 
@@ -92,6 +94,22 @@ def dedup_window_hours_for_tf(tf: str) -> float:
     except (KeyError, ValueError, IndexError):
         return _DEDUP_TRADE_WINDOW_HOURS
     return tf_seconds / 3600 * 23 / 24
+
+
+def dedup_keys(symbols: Iterable[str]) -> set[str]:
+    """The set the dedup gate actually compares against (Decision 036).
+
+    A named function rather than an inline comprehension so the rule is
+    testable without a database — nothing in the suite calls ``size_positions``
+    itself, by design, and an untested inline set-build is exactly where this
+    would silently regress to comparing contract symbols.
+
+    For cash equity and crypto this is the identity mapping, so the gate is
+    unchanged. In F&O it collapses every strike and expiry of one underlying to
+    a single key, because two strikes on one index are one bet with two
+    spellings.
+    """
+    return {underlying_of(s) for s in symbols}
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +386,18 @@ def size_positions(
         ).all()
         recent_open_symbols = {r[0] for r in active_trade_rows}
 
-        held = held_positions | recent_open_symbols
+        # Decision 036 — dedup on the UNDERLYING, not the traded symbol.
+        #
+        # For every cash-equity and crypto bucket ``underlying_of`` is the
+        # identity function, so this is a no-op and the gate behaves exactly as
+        # it always has. It only bites in F&O, where it is load-bearing: the
+        # ledger holds contract symbols, the scanner offers underlyings, and a
+        # gate comparing the two would never match. A strategy already short
+        # ``NIFTY-20260908-23150-CE`` would read a signal on NIFTY as a fresh
+        # name and open a second strike — doubling exposure the per-symbol cap
+        # believes it has capped, because two strikes on one index are one bet
+        # with two spellings.
+        held = dedup_keys(held_positions | recent_open_symbols)
 
     def _regime_mult_for(sym: str) -> Decimal:
         """Per-symbol regime multiplier from the caller-supplied dict.
@@ -386,7 +415,10 @@ def size_positions(
     kelly_inputs: dict[str, KellySymbolStats] = {}
     per_symbol_regime_mult: dict[str, Decimal] = {}
     for sym in candidates:
-        if sym in held:
+        # Symmetric with how ``held`` was built: compare underlying to
+        # underlying, so the gate works whether a caller passes underlyings
+        # (the F&O path) or plain symbols (every existing bucket).
+        if underlying_of(sym) in held:
             continue  # dedup-gated; recorded later
         stats = config.stats.get(sym, config.default_for_unknown)
         if stats is None:
@@ -426,11 +458,14 @@ def size_positions(
     remaining_inr = budget_inr
 
     for sym in candidates:
-        if sym in held:
+        if underlying_of(sym) in held:
             results[sym] = SizingResult(
                 symbol=sym,
                 decision=SizingDecision.SKIPPED_DEDUP,
-                reason="position already open for this (bucket, strategy, symbol)",
+                reason=(
+                    "position already open for this "
+                    "(bucket, strategy, underlying)"
+                ),
             )
             continue
 

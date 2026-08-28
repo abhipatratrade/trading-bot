@@ -33,6 +33,12 @@ from src.data_sources.dhan_fno import (
     _SCRIP_MASTER_URL,
     FnoRegistry,
 )
+from src.shared.contract_selection import (
+    ContractSelectionConfig,
+    ContractSelector,
+    contract_hint,
+)
+from src.shared.contracts import underlying_of
 
 # The values recorded in the module docstring, as of the measurement date.
 # A drift here is not automatically a failure — the master genuinely changes
@@ -190,6 +196,89 @@ def main() -> int:
             f"tick=Rs {front.tick_size} freeze={front.freeze_qty:>6d} "
             f"front={front.expiry} expiries={len(reg.expiries(name))}"
         )
+
+
+    # 7. Phase B: the selector, driven by the REAL catalogue
+    print("\n7. Contract selection (Decision 036 Phase B)")
+    check(
+        "FnoRegistry satisfies the ContractSource protocol",
+        all(hasattr(reg, m) for m in ("expiries", "chain", "futures")),
+        "the selector is written against a Protocol, not against this class",
+    )
+
+    spot_by_name: dict[str, Decimal] = {}
+    for name in sorted(reg.underlyings()):
+        listed = reg.expiries(name)
+        if not listed:
+            continue
+        strikes = [c.strike for c in reg.chain(name, listed[0]) if c.strike]
+        if strikes:
+            # Mid of the listed ladder, standing in for spot. Enough to prove
+            # selection end to end; the live runner passes a real quote.
+            spot_by_name[name] = sorted(strikes)[len(strikes) // 2]
+
+    check(
+        "every underlying in scope has a usable strike ladder",
+        len(spot_by_name) == len(reg.underlyings()),
+        f"{len(spot_by_name)}/{len(reg.underlyings())} resolved a ladder",
+    )
+
+    rules = [
+        ("ATM weekly", {"instrument": "option", "strike_rule": "atm",
+                        "expiry_rule": "weekly", "min_days_to_expiry": 2}),
+        ("2% OTM monthly", {"instrument": "option", "strike_rule": "otm_pct",
+                            "strike_value": 2, "expiry_rule": "monthly"}),
+        ("front future", {"instrument": "future", "min_days_to_expiry": 2}),
+    ]
+    deterministic = True
+    round_trips = True
+    for label, raw in rules:
+        selector = ContractSelector(
+            reg, ContractSelectionConfig.model_validate(raw)
+        )
+        picked = []
+        for name, spot in sorted(spot_by_name.items()):
+            got = selector.select(name, spot=spot, side="buy", on=today)
+            if not got.ok:
+                picked.append(f"{name}=MISS")
+                continue
+            # Same call twice must agree.
+            again = selector.select(name, spot=spot, side="buy", on=today)
+            if again.contract.symbol != got.contract.symbol:
+                deterministic = False
+            # The minted symbol must resolve back, and keep its underlying.
+            if (
+                reg.get(got.contract.symbol) is None
+                or underlying_of(got.contract.symbol) != name
+            ):
+                round_trips = False
+            picked.append(got.contract.symbol)
+        print(f"       {label:16s} " + "  ".join(picked))
+
+    check(
+        "selection is deterministic",
+        deterministic,
+        "the same inputs twice yielded the same contract for every underlying",
+    )
+    check(
+        "selected symbols resolve back and keep their underlying",
+        round_trips,
+        "mint -> registry lookup -> underlying_of round trip holds",
+    )
+
+    atm = ContractSelector(
+        reg,
+        ContractSelectionConfig.model_validate(
+            {"instrument": "option", "strike_rule": "atm"}
+        ),
+    ).select(
+        "NIFTY",
+        spot=spot_by_name.get("NIFTY", Decimal("24500")),
+        side="buy",
+        on=today,
+    )
+    if atm.ok:
+        print(f"       audit payload: {contract_hint(atm.contract)}")
 
     print(
         f"\n{'AUDIT FAILED: ' + ', '.join(failures) if failures else 'AUDIT PASSED'}"

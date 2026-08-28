@@ -1619,7 +1619,7 @@ happened. Do not build this until that observation exists.
 
 ## 036 — Two Indian F&O buckets: futures-indian and options-indian
 Date: 2026-08-28
-Status: **Phase A landed. Nothing trades — neither bucket exists in buckets.yaml yet.**
+Status: **Phases A and B landed. Nothing trades — neither bucket exists in buckets.yaml yet, and no order path is wired.**
 Amends: 013 (the bucket set, again — this makes eight), 022 (stop semantics for
 short premium), and CLAUDE.md's "Options: deferred until all futures/spot phases live"
 Related house rules: #1, #2, #7, #8
@@ -1709,15 +1709,77 @@ REFUSED rather than clamped — a clamped entry silently opens a smaller positio
 than the allocator sized and than the stop was computed for, and a clamped exit
 leaves a remainder open while every ledger row says flat.
 
-### Still to build, in dependency order
+### What Phase B built (landed 2026-08-29)
 
-- **Phase B — the spot→derivative bridge.** A `ContractSelector` driven by a
-  `contract_selection:` block (strike rule, expiry rule, min DTE, min OI/volume),
-  shipping with ATM + nearest-expiry-past-min-DTE resolved from the registry
-  with no new API call. Scanner and regime keep operating on the UNDERLYING;
-  only sizing and orders see the contract. **Dedup must key on the underlying**,
-  or a strategy already short one NIFTY strike reads a second strike as an
-  unrelated name and doubles exposure the allocator believes it capped.
+The seam where the signal and the instrument stop being the same thing. Every
+bucket before these had one symbol flowing unchanged from scan to fill to exit;
+here the scanner reasons about NIFTY and the order goes to one strike of one
+expiry.
+
+`src/shared/contracts.py` holds the symbol grammar, and it is a separate module
+from the registry that mints symbols on purpose: the sizer dedups on it, the
+reconciler will match on it, and the backtester replays it. A grammar duplicated
+across four modules is a grammar that will disagree in three of them.
+
+**The bug that shaped it.** `underlying_of` is the dedup key, and the obvious
+implementation — `symbol.split("-")[0]` — is wrong on a name this system trades
+with real money today: swing-indian's universe contains `NAM-INDIA`, which that
+shortcut turns into `NAM`. The grammar therefore anchors on the 8-digit expiry
+and matches the underlying greedily, and returns any non-matching symbol
+unchanged. That last property is what lets every caller use it unconditionally:
+for cash equity and crypto it is the identity function, so there is no F&O
+branch anyone can forget.
+
+`src/shared/contract_selection.py` is the rule engine, configured by a
+`contracts.yaml` (or `contracts_<name>.yaml`, Decision 026 shaped) in the bucket
+folder. Strike rules: ATM, OTM%, ITM%, OTM-steps. Expiry rules: nearest, weekly,
+monthly, with min and max days-to-expiry. It needs **no new API call** —
+everything resolves against the scrip master the registry already holds plus a
+spot price the runner already fetches, which matters against a rate-limited
+single-session account.
+
+Four choices in it worth recording:
+
+- **`delta` is refused at config load, not silently downgraded to ATM.** Nothing
+  in this repo fetches greeks. A 0.30-delta short strangle sized as though it
+  were ATM is a different trade with a different loss profile, so a config
+  asking for it fails loudly.
+- **Weekly falls back to monthly where no weeklies list.** NSE now lists
+  weeklies for NIFTY only. Without the fallback a weekly-configured strategy
+  would trade nothing on 232 of 233 underlyings, and would do it silently.
+- **Every tie-break is total.** Nearest-strike ties go to the LOWER strike and
+  the chain is re-sorted rather than trusted, because index ladders are evenly
+  spaced so an exact midpoint is routine, and "whichever the sort yielded" would
+  make one signal pick different contracts on different runs. Determinism is not
+  a nicety here: without it a live fill cannot be compared against the backtest
+  that justified it.
+- **An off-ladder OTM-steps request is a MISS, not a clamp.** Clamping to the
+  last listed strike returns a contract at a completely different moneyness than
+  the config asked for.
+
+**Dedup now keys on the underlying** (`dedup_keys()` in the sizer), live for
+every bucket. This is the item that would have been quietly catastrophic: the
+ledger holds contract symbols and the scanner offers underlyings, so a gate
+comparing the two never matches, and a strategy already short one NIFTY strike
+reads a fresh NIFTY signal as an unrelated name and opens a second — doubling
+exposure `per_symbol_cap` believes it has capped. It is extracted as a named
+function rather than left inline because nothing in the suite calls
+`size_positions` (the tests deliberately keep the DB out), and an untested
+inline set-build is exactly where this regresses.
+
+`contract_hint()` builds the audit payload — contract, underlying, expiry,
+strike, leg, lot — riding the existing `hint` → `_entry_extra` → `Trade.extra`
+JSONB path that already carries `stop_distance` and `signal_price`. No migration.
+Without it, a fill on `NIFTY-20260908-23150-CE` cannot be traced back to the rule
+that chose it, and "why that strike?" becomes unanswerable after the fact.
+
+**Deferred to Phase C, deliberately:** threading the execution symbol through the
+runner (two price fetches per candidate — spot for the strike, premium for the
+size) and onto the order. It is inseparable from lot quantisation, and a runner
+that selects a contract but still sizes in shares would be worse than one that
+does neither.
+
+### Still to build, in dependency order
 - **Phase C — lots, margin, cost.** A lot is a hard MINIMUM, not a rounding
   step: under one lot skips as `SKIPPED_INSUFFICIENT` and never rounds up.
   `required_margin()` becomes mandatory rather than best-effort — in cash

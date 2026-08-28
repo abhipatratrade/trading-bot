@@ -176,6 +176,28 @@ class Bucket:
             else self.allocator_yaml_path
         )
 
+    # Decision 036 — how a signal on an underlying becomes one derivative
+    # contract. Follows the Decision 026 named-set pattern so a bucket running
+    # two scanner sets can give each its own strike/expiry rule.
+    #
+    # OPTIONAL, unlike the three above: absence means "this bucket trades the
+    # symbol the scanner produced", which is every cash-equity and crypto
+    # bucket. Callers check ``is_file()`` rather than assuming it exists.
+    @property
+    def contracts_yaml_path(self) -> Path:
+        return self.folder / "contracts.yaml"
+
+    def contracts_yaml_path_for(self, scanner: str = "") -> Path:
+        return (
+            self.folder / f"contracts_{scanner}.yaml"
+            if scanner
+            else self.contracts_yaml_path
+        )
+
+    def trades_derivatives(self, scanner: str = "") -> bool:
+        """True when this bucket routes signals into derivative contracts."""
+        return self.contracts_yaml_path_for(scanner).is_file()
+
     @property
     def strategy_master_csv_path(self) -> Path:
         return self.folder / "strategy_master.csv"

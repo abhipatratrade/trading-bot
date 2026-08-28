@@ -593,18 +593,41 @@ Gate: contract lookup returns correct lot / tick / expiry, re-verifiable on dema
       sentinels intact, 10,717 live index contracts parsed
 - [x] 31 registry tests + 7 broker contract-spec tests; 838 green, ruff clean
 
-### B — The spot → derivative bridge
+### B — The spot → derivative bridge ✅ 2026-08-29
 Gate: a spot signal resolves to one contract, deterministically and reproducibly.
+**Cleared** — the audit now drives the selector off the real catalogue and
+checks determinism plus a mint → lookup → `underlying_of` round trip.
 
-- [ ] `ContractSelector` + `contract_selection:` YAML block (strike rule,
-      expiry rule, min DTE, min OI/volume); ATM + nearest-expiry-past-min-DTE
-      default, resolved from the registry with no new API call
-- [ ] Signal symbol vs execution symbol: scanner + regime stay on the
-      underlying, only sizing and orders see the contract
-- [ ] **Dedup keys on the UNDERLYING** — otherwise a second strike on a name
-      already held reads as unrelated and doubles capped exposure
-- [ ] Contract metadata (expiry, strike, type, lot) into the existing `extra`
-      JSONB on Position/Trade — no migration needed
+- [x] `src/shared/contracts.py` — the symbol grammar in ONE place, so the
+      registry that mints, the sizer that dedups, the reconciler that matches
+      and the backtester that replays cannot drift apart. Dependency-free
+- [x] `underlying_of` handles the hyphenated cash ticker `NAM-INDIA`, which a
+      naive `split("-")[0]` turns into `NAM` — a live name in swing-indian
+- [x] `ContractSelector` + `contract_selection:` schema and loader — ATM /
+      OTM% / ITM% / OTM-steps, nearest / weekly / monthly expiry, min+max DTE.
+      No new API call: everything resolves off the registry plus a spot price
+- [x] `delta` strike rule REFUSED at config load rather than silently
+      downgraded to ATM — nothing here fetches greeks, and a 0.30-delta
+      strangle sized as ATM is a different trade
+- [x] Weekly rule falls back to monthly where no weeklies list — NSE now
+      lists them for NIFTY only, so without this a weekly-configured strategy
+      would silently trade nothing on 232 of 233 underlyings
+- [x] Deterministic tie-breaks: nearest strike ties to the LOWER strike, chain
+      re-sorted rather than trusted. An off-ladder OTM-steps request is a MISS,
+      never a clamp to the last listed strike
+- [x] **Dedup keys on the UNDERLYING** — `dedup_keys()` in the sizer, live for
+      every bucket. Identity for cash and crypto, collapsing for F&O
+- [x] `contract_hint()` builds the `extra` JSONB payload (contract, underlying,
+      expiry, strike, leg, lot) — rides the existing hint path, no migration
+- [x] `Bucket.contracts_yaml_path_for()` — optional, Decision 026 named-set
+      shaped; absence means "trade the symbol the scanner produced"
+- [x] 55 new tests; 893 green, ruff clean
+
+**Deferred to C, deliberately:** threading the execution symbol through the
+runner (two price fetches per candidate — spot for the strike, premium for the
+size) and onto the order. It is inseparable from lot quantisation, and a runner
+that selected a contract but still sized in shares would be worse than one that
+does neither.
 
 ### C — Lots, margin, cost
 Gate: margin preflight answers correctly against a live account (today unexercised).
@@ -650,6 +673,8 @@ Gate: **the user's backtest handoff.** Both buckets ship `enabled: false` until 
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-08-29 — **Decision 036 Phase B**: the spot→derivative seam. Still nothing trades. Three pieces. (1) `src/shared/contracts.py` — the contract symbol grammar in ONE dependency-free place, because a grammar duplicated across the registry, the sizer, the reconciler and the backtester is one that will disagree in three of them. THE TEST THAT EARNS ITS KEEP: `underlying_of("NAM-INDIA")` must return `NAM-INDIA`, and the obvious implementation — `symbol.split("-")[0]` — returns `NAM`, silently breaking the dedup gate for a name swing-indian trades with real money today. The regex anchors on the 8-digit expiry and matches the underlying greedily instead. (2) `ContractSelector` + a `contracts.yaml` block: ATM / OTM% / ITM% / OTM-steps strikes, nearest / weekly / monthly expiries, min+max DTE, all resolved off the registry and a spot price with NO new API call. The `delta` rule is REFUSED at config load rather than quietly downgraded to ATM — nothing here fetches greeks, and a 0.30-delta strangle sized as ATM is a different trade with a different loss profile. Weekly falls back to monthly where none list, which matters because NSE now lists weeklies for NIFTY ONLY: without the fallback a weekly-configured strategy trades nothing on 232 of 233 underlyings, silently. Tie-breaks are total (nearest strike ties LOW, chain re-sorted rather than trusted) and an off-ladder OTM-steps request is a MISS, never a clamp to the last listed strike. (3) DEDUP NOW KEYS ON THE UNDERLYING, live for every bucket — identity for cash and crypto, collapsing for F&O. Without it the ledger holds contract symbols while the scanner offers underlyings, the gate never matches, and a strategy already short one NIFTY strike opens a second: two strikes on one index are ONE bet with two spellings, and the per_symbol_cap would believe it had capped exposure it had doubled. Extracted as `dedup_keys()` so it is testable — nothing in the suite calls `size_positions`, by design, and an untested inline set-build is exactly where this regresses. The audit script now drives the selector off the REAL catalogue and checks determinism plus a mint→lookup→underlying round trip; **AUDIT PASSED 2026-08-29** across all 5 index underlyings and 3 rule sets. 55 new tests, 893 green, ruff clean. DEFERRED TO C on purpose: threading the execution symbol through the runner and onto the order — inseparable from lot quantisation, and a runner that picks a contract but sizes in shares is worse than one that does neither.
 
 - 2026-08-28 — **Decision 036 Phase A**: instrument foundations for the two Indian F&O buckets (`futures-indian`, `options-indian`, ₹5L each, NSE index + stock F&O, naked short premium in scope). Nothing trades — neither bucket exists in buckets.yaml yet. THE FINDING THAT SHAPED THE MODULE: Dhan's `SYMBOL_NAME` is NOT unique — it carries only the expiry MONTH, so `NIFTY-Sep2026-23150-CE` names FIVE different weeklies (462 ambiguous names over 2,236 NSE contracts), and keying on it would silently trade the wrong expiry and book cleanly while doing it. New `src/data_sources/dhan_fno.py` mints its own symbol from `(underlying, expiry, strike, option_type)`, verified unique across all 74,322 NSE rows, and LOGS a collision rather than shadowing one. Parse is CHUNKED, not a wider version of the equity full-frame read — the D segment is 74k of 197k rows and would have added ~60MB on the 958MB VM that OOM'd on 2026-08-21. Cache refreshes every 12h (expiries roll) with a scope-digest filename so a scoped catalogue can't truncate the full one. LATENT BUG FIXED: `_snap_tick` hardcoded ₹0.05, but tick is per-contract and index futures don't use it — NIFTY/FINNIFTY tick ₹0.10, BANKNIFTY/NIFTYNXT50 ₹0.20, 368 NSE contracts coarser than ₹0.05 (up to ₹5.00) — so this would have had orders REFUSED off-tick on the most liquid contracts in the market. Harmless in cash equity, which is why it survived. New `ContractSpec` on the broker contract carries lot/tick/freeze, injected like `resolve_symbol`, so the adapter still knows nothing about the scrip master and every cash-equity caller is byte-identical. Freeze-quantity guard REFUSES rather than clamps (a clamped entry opens a position the stop wasn't computed for). Also corrected my own earlier count: 1,654 genuine fractional strikes, not 2,319 — the higher figure wrongly counted the 665 futures `-0.01` sentinels. New `scripts/fno_registry_audit.py` re-measures every scrip-master claim against a fresh download and exits non-zero on drift; **AUDIT PASSED 2026-08-28** end to end, 10,717 live index contracts parsed. 38 new tests, 838 green, ruff clean on src/tests/. ONE INFERRED NUMBER, flagged: the per-contract tick VALUE is read, but the paise→rupee DIVISOR is calibrated off NSE cash equity's known ₹0.05 — wrong by exactly 100× if that calibration is wrong, which the first live order would reject loudly. STILL UNVERIFIED: `required_margin()` never run live, Super Order on F&O, the carry-forward product string, Dhan's F&O `tradingSymbol` format (mitigated by the `by_security_id` reverse index).
 
