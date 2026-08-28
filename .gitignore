@@ -70,3 +70,9 @@ data/exports/
 # the VM's ff-only deploy for 15 minutes — the box keeps its own copy as an
 # untracked file, and git refuses to overwrite one.
 data/dhan_universe.json
+# Same, for the F&O contract registry (Decision 036). Larger and far more
+# perishable than the equity one — several MB, refetched every 12 hours as
+# expiries roll — and the filename carries a digest of the underlying scope,
+# so committing one would seed the VM with a truncated catalogue AND trip the
+# same ff-only deploy break the line above records.
+data/dhan_fno_universe*.json

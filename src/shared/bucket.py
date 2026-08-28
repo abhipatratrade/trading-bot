@@ -45,6 +45,21 @@ class TradingType(StrEnum):
     # crypto high-leverage type) in that positions are opened and squared off
     # inside one NSE session.
     INTRADAY = "intraday"
+    # Decision 036 — the two Indian derivative buckets. These name an
+    # INSTRUMENT CLASS where every value above names a holding period, which
+    # is a real wart and was chosen with it understood: bucket ids parse as
+    # ``<type>-<market>``, so keeping derivatives inside this enum means
+    # ``futures-indian`` / ``options-indian`` need no change to id parsing,
+    # the ``bucket_id`` columns, the dashboard routes, or any existing
+    # bucket's identity. The alternative — a third (instrument) axis — is
+    # cleaner in the abstract and touches every one of those.
+    #
+    # The cost, recorded so it is not rediscovered: holding period is no
+    # longer expressible for a derivative bucket, so one options bucket holds
+    # both an intraday and a swing option strategy, separated only by their
+    # strategy_master rows and named scanner sets (Decision 026).
+    FUTURES = "futures"
+    OPTIONS = "options"
 
 
 class Market(StrEnum):

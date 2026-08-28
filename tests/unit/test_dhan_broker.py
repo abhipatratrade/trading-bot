@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.brokers.base import OrderRequest, OrderType
+from src.brokers.base import ContractSpec, OrderRequest, OrderType
 from src.brokers.dhan.auth import DhanTokenManager
 from src.brokers.dhan.client import (
     DhanAPIError,
@@ -505,3 +505,118 @@ def test_other_absent_id_spellings_are_not_ours() -> None:
 def test_a_plain_order_with_our_id_is_still_not_a_stop() -> None:
     http = _FakeHttp({"GET /v2/orders": [_Resp([_order_row("abc123", trig=0)])]})
     assert _client(http).get_open_orders()[0].reduce_only is False
+
+
+# ── Per-contract lot / tick / freeze (Decision 036) ──────────────────────
+_FNO_SYMBOL = "NIFTY-20260929-23150-CE"
+_FUT_SYMBOL = "SBIN-20260929-FUT"
+
+_SPECS = {
+    # NIFTY option: 65 per lot, Rs 0.05 grid, 1,756 freeze.
+    _FNO_SYMBOL: ContractSpec(
+        lot_size=Decimal("65"), tick_size=Decimal("0.05"),
+        freeze_qty=Decimal("1756"),
+    ),
+    # A stock future on the Rs 0.50 grid — 39 NSE contracts tick this coarsely,
+    # and the pre-036 hardcoded Rs 0.05 snap produces an off-tick refusal.
+    _FUT_SYMBOL: ContractSpec(
+        lot_size=Decimal("750"), tick_size=Decimal("0.50"),
+        freeze_qty=Decimal("15000"),
+    ),
+}
+
+
+def _fno_resolve(symbol: str) -> tuple[str, str]:
+    if symbol in _SPECS:
+        return ("9001", "NSE_FNO")
+    return _UNIVERSE[symbol]
+
+
+def _fno_client(http: _FakeHttp) -> DhanClient:
+    return DhanClient(
+        token_manager=DhanTokenManager(static_token="TOK"), client_id="C1",
+        resolve_symbol=_fno_resolve, base_url="https://sandbox.dhan.co",
+        product_type="MARGIN", mtf_fallback_cnc=False, http=http,
+        contract_spec=_SPECS.get,
+    )
+
+
+def test_stop_trigger_snaps_to_the_contracts_own_tick() -> None:
+    """The bug this fixes: Rs 0.05 is not a multiple of Rs 0.50, so the old
+    hardcoded snap produced a trigger the venue refuses outright."""
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"orderId": "1", "orderStatus": "TRANSIT"})]})
+    req = OrderRequest(symbol=_FUT_SYMBOL, side="sell", size=Decimal("750"),
+                       order_type=OrderType.MARKET, stop_price=Decimal("812.37"),
+                       reduce_only=True)
+    _fno_client(http).place_order(req)
+    trigger = Decimal(str(http.calls[0]["json"]["triggerPrice"]))
+    assert trigger % Decimal("0.50") == 0
+    assert trigger == Decimal("812.50")
+
+
+def test_cash_equity_tick_is_unchanged_without_a_spec() -> None:
+    """Every pre-036 caller passes no contract_spec and must behave identically."""
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"orderId": "1", "orderStatus": "TRANSIT"})]})
+    req = OrderRequest(symbol="SWIGGY", side="sell", size=Decimal("10"),
+                       order_type=OrderType.MARKET, stop_price=Decimal("412.37"),
+                       reduce_only=True)
+    _client(http).place_order(req)
+    assert http.calls[0]["json"]["triggerPrice"] == 412.35
+
+
+def test_contract_size_returns_the_lot_for_derivatives() -> None:
+    client = _fno_client(_FakeHttp({}))
+    assert client.contract_size(_FNO_SYMBOL) == Decimal("65")
+    # Cash equity stays one share per unit.
+    assert client.contract_size("SWIGGY") == Decimal("1")
+
+
+def test_freeze_quantity_refuses_an_oversized_order() -> None:
+    """Refusing beats clamping: a clamped entry opens a smaller position than
+    the allocator sized and the stop was computed for."""
+    http = _FakeHttp({})
+    req = OrderRequest(symbol=_FNO_SYMBOL, side="buy", size=Decimal("1820"),
+                       order_type=OrderType.MARKET)
+    with pytest.raises(DhanAPIError, match="freeze quantity"):
+        _fno_client(http).place_order(req)
+    assert not http.calls, "an over-freeze order must never reach the venue"
+
+
+def test_order_at_the_freeze_limit_is_allowed() -> None:
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"orderId": "1", "orderStatus": "TRANSIT"})]})
+    req = OrderRequest(symbol=_FNO_SYMBOL, side="buy", size=Decimal("1756"),
+                       order_type=OrderType.MARKET)
+    _fno_client(http).place_order(req)
+    assert http.calls[0]["json"]["quantity"] == 1756
+
+
+def test_cash_equity_has_no_freeze_cap() -> None:
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"orderId": "1", "orderStatus": "TRANSIT"})]})
+    req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("999999"),
+                       order_type=OrderType.MARKET)
+    _client(http).place_order(req)
+    assert http.calls[0]["json"]["quantity"] == 999999
+
+
+def test_a_failing_spec_lookup_degrades_to_the_cash_defaults() -> None:
+    """Fail-soft: a stale cache must not take down an order path that worked
+    on the fallback constants before this existed."""
+    def _boom(symbol: str) -> ContractSpec | None:
+        raise RuntimeError("registry unavailable")
+
+    http = _FakeHttp({"POST /v2/orders": [
+        _Resp({"orderId": "1", "orderStatus": "TRANSIT"})]})
+    client = DhanClient(
+        token_manager=DhanTokenManager(static_token="TOK"), client_id="C1",
+        resolve_symbol=_fno_resolve, base_url="https://sandbox.dhan.co",
+        http=http, contract_spec=_boom,
+    )
+    req = OrderRequest(symbol=_FUT_SYMBOL, side="sell", size=Decimal("750"),
+                       order_type=OrderType.MARKET, stop_price=Decimal("812.37"),
+                       reduce_only=True)
+    client.place_order(req)
+    assert http.calls[0]["json"]["triggerPrice"] == 812.35  # Rs 0.05 fallback

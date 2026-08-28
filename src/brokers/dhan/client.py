@@ -44,6 +44,7 @@ from src.brokers.base import (
     BalanceInfo,
     Broker,
     CancelResult,
+    ContractSpec,
     FillInfo,
     OpenOrder,
     OrderCharges,
@@ -56,7 +57,12 @@ from src.brokers.dhan.auth import DhanTokenManager
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
 
-# NSE/BSE cash tick size (₹0.05) — used to snap protective-stop triggers.
+# NSE/BSE cash tick size (₹0.05) — the fallback when no per-contract spec is
+# injected. Correct for every cash-equity scrip (the 1,463 NSE names that tick
+# at ₹0.01 accept a ₹0.05 price, since 0.05 is a multiple of 0.01) but NOT for
+# derivatives, where 39 NSE stock futures tick at ₹0.50, 23 at ₹1.00 and 12 at
+# ₹5.00 — snapping those to ₹0.05 produces an off-tick price the venue refuses.
+# F&O callers pass ``contract_spec`` so the real grid is used (Decision 036).
 _DEFAULT_TICK = Decimal("0.05")
 
 # Super Order endpoints (Decision 034). Entry + target + stop-loss in ONE
@@ -188,6 +194,7 @@ class DhanClient(Broker):
         mtf_fallback_cnc: bool = True,
         http: httpx.Client | None = None,
         owns_order_id: Callable[[str], bool] | None = None,
+        contract_spec: Callable[[str], ContractSpec | None] | None = None,
     ) -> None:
         self._token = token_manager
         self._client_id = client_id
@@ -197,6 +204,12 @@ class DhanClient(Broker):
         self._mtf_fallback_cnc = mtf_fallback_cnc
         self._http = http or httpx.Client(timeout=30.0)
         self._owns_http = http is None
+        # Per-contract lot / tick / freeze lookup (Decision 036). Injected the
+        # same way ``resolve_symbol`` is, so this adapter keeps knowing nothing
+        # about the scrip master. None — and any symbol it does not know —
+        # falls back to the cash-equity constants, which is exactly the
+        # behaviour every existing caller already has.
+        self._contract_spec = contract_spec
         # Ledger-backed ownership proof for super orders, injected because this
         # adapter stays DB-free (the backtester imports it). See
         # ``_owns_super_order`` for why correlationId alone is not enough.
@@ -325,6 +338,24 @@ class DhanClient(Broker):
         if request.reduce_only and request.stop_price is None and not is_super:
             self._retire_attached_stop(request.symbol)
 
+        # THE FREEZE-QUANTITY GUARD (Decision 036). NSE publishes a maximum
+        # quantity per ORDER on every derivative; an order above it is refused
+        # outright. Refusing here rather than clamping is deliberate — a
+        # clamped ENTRY silently opens a smaller position than the allocator
+        # sized and than the stop was computed for, whereas a clamped EXIT
+        # leaves a remainder open while every ledger row says flat. A size this
+        # large means a sizing bug, and the honest response is to not trade.
+        #
+        # Only reached when a contract spec is injected AND publishes a cap, so
+        # every cash-equity path is untouched.
+        freeze = self.freeze_qty(request.symbol)
+        if freeze is not None and request.size > freeze:
+            raise DhanAPIError(
+                "FREEZE_QTY",
+                f"{request.symbol}: size {request.size} exceeds the exchange "
+                f"freeze quantity {freeze}; split across orders",
+            )
+
         path = _SUPER_PATH if is_super else _PLAIN_PATH
         body = (
             self._super_order_body(request, security_id, exchange, product_type)
@@ -450,15 +481,41 @@ class DhanClient(Broker):
         else:
             body["price"] = 0
         if is_stop:
-            body["triggerPrice"] = float(self._snap_tick(request.stop_price))  # type: ignore[arg-type]
+            body["triggerPrice"] = float(
+                self._snap_tick(request.stop_price, request.symbol)  # type: ignore[arg-type]
+            )
         if request.client_order_id:
             body["correlationId"] = request.client_order_id[:25]  # Dhan cap
         return body
 
-    @staticmethod
-    def _snap_tick(price: Decimal) -> Decimal:
-        """Snap a price onto the ₹0.05 grid (Dhan rejects off-tick triggers)."""
-        return (price / _DEFAULT_TICK).quantize(Decimal("1")) * _DEFAULT_TICK
+    def _snap_tick(self, price: Decimal, symbol: str | None = None) -> Decimal:
+        """Snap a price onto the contract's own grid (Dhan refuses off-tick).
+
+        ``symbol`` is optional so the pre-Decision-036 call shape still works;
+        without it — or for a symbol the spec lookup doesn't know — this is the
+        historical ₹0.05 cash-equity grid.
+        """
+        tick = self._tick_for(symbol) if symbol else _DEFAULT_TICK
+        return (price / tick).quantize(Decimal("1")) * tick
+
+    def _tick_for(self, symbol: str) -> Decimal:
+        spec = self._spec_for(symbol)
+        return spec.tick_size if spec is not None else _DEFAULT_TICK
+
+    def _spec_for(self, symbol: str) -> ContractSpec | None:
+        """The venue's trading unit for a symbol, or None when unknown.
+
+        Fail-soft by design: a lookup that raises (stale cache, network) must
+        not take down an order path that was working fine on the fallback
+        constants before this existed.
+        """
+        if self._contract_spec is None:
+            return None
+        try:
+            return self._contract_spec(symbol)
+        except Exception:
+            self._log.warning("contract_spec_lookup_failed", symbol=symbol)
+            return None
 
     # ── Super orders (Decision 034) ─────────────────────────────────────
     def supports_attached_stop(self) -> bool:
@@ -511,8 +568,12 @@ class DhanClient(Broker):
                 and request.limit_price is not None
                 else 0
             ),
-            "targetPrice": float(self._snap_tick(request.attached_target_price)),
-            "stopLossPrice": float(self._snap_tick(request.attached_stop_price)),  # type: ignore[arg-type]
+            "targetPrice": float(
+                self._snap_tick(request.attached_target_price, request.symbol)
+            ),
+            "stopLossPrice": float(
+                self._snap_tick(request.attached_stop_price, request.symbol)  # type: ignore[arg-type]
+            ),
             # Explicitly no trailing: Dhan's spec says a jump of 0 cancels the
             # trailing behaviour. Our stops are fixed at entry by design
             # (Decision 032 — the distance the backtest validated).
@@ -1056,11 +1117,31 @@ class DhanClient(Broker):
     def contract_size(
         self, symbol: str, default: Decimal | None = Decimal("1")  # noqa: ARG002
     ) -> Decimal | None:
-        # One share per unit for cash equity.
-        return Decimal("1")
+        """Units per contract — one share for cash equity, the LOT for F&O.
 
-    def tick_size(self, symbol: str) -> Decimal | None:  # noqa: ARG002
-        return _DEFAULT_TICK
+        Note what this means downstream: the sizer's
+        ``notional_inr_to_contracts`` divides a target notional by
+        ``price × contract_size``, so returning the lot here makes it count
+        LOTS rather than shares, which is the only quantity Dhan accepts on a
+        derivative. Multiplying back up to a share count is the order path's
+        job, not this one's.
+        """
+        spec = self._spec_for(symbol)
+        return spec.lot_size if spec is not None else Decimal("1")
+
+    def tick_size(self, symbol: str) -> Decimal | None:
+        return self._tick_for(symbol)
+
+    def freeze_qty(self, symbol: str) -> Decimal | None:
+        """Exchange cap on a SINGLE order's quantity; None when uncapped.
+
+        Not part of the ``Broker`` contract because only the Indian derivative
+        segment has the concept. NIFTY's is 1,756 (27 lots) — far above
+        anything a ₹5L bucket sizes — so this is a guard against a sizing bug,
+        not a routine constraint.
+        """
+        spec = self._spec_for(symbol)
+        return spec.freeze_qty if spec is not None else None
 
     def _to_open_order(self, o: dict[str, Any]) -> OpenOrder:
         qty = Decimal(str(o.get("quantity", 0) or 0))

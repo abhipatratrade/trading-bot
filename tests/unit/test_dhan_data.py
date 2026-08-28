@@ -195,3 +195,53 @@ def test_quote_retry_after_401_keeps_the_client_id() -> None:
     assert [c["headers"]["client-id"] for c in http.calls] == [
         "1000000001", "1000000001"
     ]
+
+
+# ── F&O resolver fallback (Decision 036) ────────────────────────────────
+def test_resolve_falls_through_to_the_fno_registry() -> None:
+    from datetime import date, timedelta
+    from decimal import Decimal
+
+    from src.data_sources.dhan_fno import (
+        NSE_FNO,
+        DerivativeContract,
+        FnoRegistry,
+        contract_symbol,
+    )
+
+    expiry = date.today() + timedelta(days=7)
+    symbol = contract_symbol(
+        "NIFTY", expiry, strike=Decimal("23150"), option_type="CE"
+    )
+    registry = FnoRegistry([
+        DerivativeContract(
+            symbol=symbol, security_id="9001", exchange_segment=NSE_FNO,
+            underlying="NIFTY", instrument="OPTIDX", expiry=expiry,
+            lot_size=65, tick_size=Decimal("0.05"), freeze_qty=1756,
+            strike=Decimal("23150"), option_type="CE",
+        )
+    ])
+    data = DhanData(
+        token_manager=DhanTokenManager(static_token="TOK"),
+        universe=_UNIVERSE, http=_FakeHttp({}), client_id="1000000001",
+        fno=registry,
+    )
+    # Cash equity is unchanged and still wins the lookup.
+    assert data.resolve("SWIGGY") == ("1001", "NSE_EQ")
+    # A derivative resolves through the registry on the same callable.
+    assert data.resolve(symbol) == ("9001", NSE_FNO)
+    assert data.contract_spec(symbol).lot_size == Decimal("65")
+    # Cash equity gets no spec, so the client keeps its historical constants.
+    assert data.contract_spec("SWIGGY") is None
+
+
+def test_resolve_without_a_registry_is_unchanged() -> None:
+    """Every pre-036 deployment constructs DhanData with no fno registry."""
+    data = DhanData(
+        token_manager=DhanTokenManager(static_token="TOK"),
+        universe=_UNIVERSE, http=_FakeHttp({}), client_id="1000000001",
+    )
+    assert data.fno is None
+    assert data.contract_spec("SWIGGY") is None
+    with pytest.raises(ValueError, match="Unknown Dhan symbol"):
+        data.resolve("NIFTY-20260929-23150-CE")

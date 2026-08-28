@@ -200,6 +200,34 @@ class OrderCharges:
 
 
 @dataclass(frozen=True, slots=True)
+class ContractSpec:
+    """The venue's declared trading unit for ONE instrument (Decision 036).
+
+    Cash equity needs none of this — one share, a ₹0.05 grid, no cap — which
+    is why the adapters carried the values as constants until derivatives
+    arrived. In F&O all three are per-contract and all three are hard:
+
+    - ``lot_size``  — orders are placed in whole multiples of it. Unlike a
+      crypto contract size this is a MINIMUM, not just a rounding step: below
+      one lot there is no order to place.
+    - ``tick_size`` — the price grid. Verified against Dhan's scrip master
+      2026-08-28: most options tick at ₹0.05, but 39 NSE stock futures tick at
+      ₹0.50, 23 at ₹1.00 and 12 at ₹5.00. Snapping to a finer grid than the
+      contract's own gets the order rejected.
+    - ``freeze_qty`` — the exchange's maximum quantity in a SINGLE order
+      (NIFTY: 1,756, i.e. 27 lots). Larger sizes must be split across orders.
+      None ⇒ the venue publishes no cap.
+
+    A plain dataclass rather than an ORM row or a dict so the broker layer
+    stays importable without a DB or pandas — the backtester imports it.
+    """
+
+    lot_size: Decimal = Decimal("1")
+    tick_size: Decimal = Decimal("0.05")
+    freeze_qty: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class OpenOrder:
     exchange_order_id: str
     client_order_id: str | None

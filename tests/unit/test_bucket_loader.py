@@ -89,3 +89,27 @@ def test_missing_folder_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         load_buckets(buckets_yaml=yaml_path, strategies_root=tmp_path / "strategies")
+
+
+# ── Derivative bucket taxonomy (Decision 036) ───────────────────────────
+def test_derivative_trading_types_exist() -> None:
+    assert TradingType("futures") is TradingType.FUTURES
+    assert TradingType("options") is TradingType.OPTIONS
+
+
+@pytest.mark.parametrize(
+    ("bucket_id", "ttype"),
+    [
+        ("futures-indian", TradingType.FUTURES),
+        ("options-indian", TradingType.OPTIONS),
+    ],
+)
+def test_derivative_bucket_ids_parse(bucket_id: str, ttype: TradingType) -> None:
+    """The whole reason FUTURES/OPTIONS live in TradingType rather than on a
+    third axis: ``<type>-<market>`` parsing keeps working untouched, so no
+    bucket_id column, dashboard route, or existing bucket identity changes."""
+    from src.shared.bucket import _split_bucket_id
+
+    parsed_type, parsed_market = _split_bucket_id(bucket_id)
+    assert parsed_type is ttype
+    assert parsed_market is Market.INDIAN

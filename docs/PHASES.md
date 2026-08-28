@@ -557,14 +557,101 @@ FLATTEN stays with the deterministic breakers. Keeps House Rule #1 intact.
 - [ ] Exits carry no `signal_price` (`select_exits` returns bare symbols) —
       only execution slippage is measurable on the exit leg
 
-## Phase 8+ — Options
-*(Deferred per Goal_Setting.txt priority [10]/[11].)*
+## Phase 9 — Indian F&O: futures-indian + options-indian [Decision 036, started 2026-08-28]
+
+Supersedes the "Phase 8+ — Options" placeholder above. Capital ₹5L per bucket,
+NSE index (5) + NSE stock F&O (228), naked short premium in scope.
+
+Phases are a dependency chain, not a menu — each gate must hold before the next
+starts. **Nothing places an order before Phase D is complete.**
+
+### A — Instrument foundations ✅ 2026-08-28
+Gate: contract lookup returns correct lot / tick / expiry, re-verifiable on demand.
+
+- [x] `TradingType` += FUTURES, OPTIONS; `futures-indian` / `options-indian`
+      parse under the existing `<type>-<market>` scheme
+- [x] `src/data_sources/dhan_fno.py` — `DerivativeContract` + `FnoRegistry`,
+      minting a collision-free symbol from `(underlying, expiry, strike, type)`
+      because Dhan's own `SYMBOL_NAME` collides across weeklies
+- [x] Chunked scrip-master parse (peak bounded by chunk, not by the 74k-row
+      segment) — the 2026-08-21 OOM makes this non-negotiable
+- [x] Cache refreshes every 12h, not 30 days — expiries roll; scoped cache
+      filename per (underlyings, expiry-window, exchange) so a scoped
+      catalogue can never truncate the full one; gitignored
+- [x] `NSE_FNO` resolution via `DhanData.resolve` fallback — one
+      `resolve_symbol` callable serves cash equity and derivatives
+- [x] `ContractSpec` on the broker contract; `DhanClient` takes a
+      `contract_spec` lookup, injected like `resolve_symbol`
+- [x] Per-contract tick snapping — **fixed a live latent bug**: the hardcoded
+      ₹0.05 grid is wrong for 368 NSE contracts including NIFTY futures (₹0.10)
+      and BANKNIFTY futures (₹0.20)
+- [x] `contract_size()` returns the LOT for derivatives, 1 for cash equity
+- [x] Freeze-quantity guard — refuses, never clamps
+- [x] `scripts/fno_registry_audit.py` — re-measures every scrip-master claim
+      against a fresh download, exits non-zero on drift. **AUDIT PASSED
+      2026-08-28**: 74,322 NSE rows, 462 ambiguous names, key tuple unique,
+      sentinels intact, 10,717 live index contracts parsed
+- [x] 31 registry tests + 7 broker contract-spec tests; 838 green, ruff clean
+
+### B — The spot → derivative bridge
+Gate: a spot signal resolves to one contract, deterministically and reproducibly.
+
+- [ ] `ContractSelector` + `contract_selection:` YAML block (strike rule,
+      expiry rule, min DTE, min OI/volume); ATM + nearest-expiry-past-min-DTE
+      default, resolved from the registry with no new API call
+- [ ] Signal symbol vs execution symbol: scanner + regime stay on the
+      underlying, only sizing and orders see the contract
+- [ ] **Dedup keys on the UNDERLYING** — otherwise a second strike on a name
+      already held reads as unrelated and doubles capped exposure
+- [ ] Contract metadata (expiry, strike, type, lot) into the existing `extra`
+      JSONB on Position/Trade — no migration needed
+
+### C — Lots, margin, cost
+Gate: margin preflight answers correctly against a live account (today unexercised).
+
+- [ ] Whole-lot quantisation; under one lot → `SKIPPED_INSUFFICIENT`, never
+      rounded up
+- [ ] `required_margin()` mandatory — no margin answer means no order, because
+      unlike cash equity there is no 1× fallback in F&O
+- [ ] Pre-trade cost rate card with `source:` + `verified_on:` per line —
+      **user sign-off required before any estimate uses it**
+- [ ] Reconciler compares estimate vs `get_order_charges()` actuals and alerts
+      on drift, so a stale card announces itself
+
+### D — Risk: short premium and expiry
+Gate: every item here holds before any order path opens.
+
+- [ ] Dual stop, whichever fires first — exchange-resident premium stop plus a
+      bot-side underlying-level exit
+- [ ] **BLOCKER: mandatory pre-expiry square-off.** Stock derivatives are
+      physically settled; an ITM contract carried past expiry delivers shares
+      at full contract value (~₹6.7L median vs a ₹5L bucket). Enforced as a
+      session invariant, not left to a strategy
+- [ ] Ownership scoping under derivatives — four buckets now share one Dhan
+      account; the reconciler must not adopt or square off the user's own F&O
+- [ ] New session invariants: stop coverage on every derivative, nothing held
+      inside the expiry window, margin utilisation under a per-bucket cap
+- [ ] Position groups — multi-leg structures open/close/stop as one unit, so a
+      spread's short leg is never mistaken for a naked write
+
+### E — Buckets, strategies, dashboard, docs
+Gate: **the user's backtest handoff.** Both buckets ship `enabled: false` until then.
+
+- [ ] `buckets.yaml` blocks at ₹5,00,000 each, `enabled: false`
+- [ ] Per-bucket scanner/regime/allocator/strategy_master from the handoff
+- [ ] Migration seeding `bucket_state` for both, idempotent, disabled
+- [ ] Dashboard positions table gains expiry / strike / type / lots columns and
+      a margin-utilisation figure
+- [ ] Amend CLAUDE.md's "Options: deferred until all futures/spot phases live"
+
 
 ---
 
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-08-28 — **Decision 036 Phase A**: instrument foundations for the two Indian F&O buckets (`futures-indian`, `options-indian`, ₹5L each, NSE index + stock F&O, naked short premium in scope). Nothing trades — neither bucket exists in buckets.yaml yet. THE FINDING THAT SHAPED THE MODULE: Dhan's `SYMBOL_NAME` is NOT unique — it carries only the expiry MONTH, so `NIFTY-Sep2026-23150-CE` names FIVE different weeklies (462 ambiguous names over 2,236 NSE contracts), and keying on it would silently trade the wrong expiry and book cleanly while doing it. New `src/data_sources/dhan_fno.py` mints its own symbol from `(underlying, expiry, strike, option_type)`, verified unique across all 74,322 NSE rows, and LOGS a collision rather than shadowing one. Parse is CHUNKED, not a wider version of the equity full-frame read — the D segment is 74k of 197k rows and would have added ~60MB on the 958MB VM that OOM'd on 2026-08-21. Cache refreshes every 12h (expiries roll) with a scope-digest filename so a scoped catalogue can't truncate the full one. LATENT BUG FIXED: `_snap_tick` hardcoded ₹0.05, but tick is per-contract and index futures don't use it — NIFTY/FINNIFTY tick ₹0.10, BANKNIFTY/NIFTYNXT50 ₹0.20, 368 NSE contracts coarser than ₹0.05 (up to ₹5.00) — so this would have had orders REFUSED off-tick on the most liquid contracts in the market. Harmless in cash equity, which is why it survived. New `ContractSpec` on the broker contract carries lot/tick/freeze, injected like `resolve_symbol`, so the adapter still knows nothing about the scrip master and every cash-equity caller is byte-identical. Freeze-quantity guard REFUSES rather than clamps (a clamped entry opens a position the stop wasn't computed for). Also corrected my own earlier count: 1,654 genuine fractional strikes, not 2,319 — the higher figure wrongly counted the 665 futures `-0.01` sentinels. New `scripts/fno_registry_audit.py` re-measures every scrip-master claim against a fresh download and exits non-zero on drift; **AUDIT PASSED 2026-08-28** end to end, 10,717 live index contracts parsed. 38 new tests, 838 green, ruff clean on src/tests/. ONE INFERRED NUMBER, flagged: the per-contract tick VALUE is read, but the paise→rupee DIVISOR is calibrated off NSE cash equity's known ₹0.05 — wrong by exactly 100× if that calibration is wrong, which the first live order would reject loudly. STILL UNVERIFIED: `required_margin()` never run live, Super Order on F&O, the carry-forward product string, Dhan's F&O `tradingSymbol` format (mitigated by the `by_security_id` reverse index).
 
 - 2026-08-01 — Closed out Decision 033's rollout: invariants ENFORCING, baselines corrected, stale rows cleaned. (1) ALERT SPAM BUG I shipped 2026-07-28: `enforce_session_invariants` called `send_alert_dedup` every tick per violation, and that helper's window RE-ARMS HOURLY — right for a transient error that recurs, wrong for a permanently-true condition. `foreign_positions` is violated continuously while the user holds anything on the shared Dhan account, so it paged 3×/hour ≈ 72 msgs/day about positions the bot correctly ignores, and worse, buried the observe-only alerts the period existed to collect. Now keyed on a digest of what would be SAID: pages on appearance, again on content change, silent otherwise until it clears. Two subtleties the naive version got wrong — `would_halt` is IN the digest (so escalation from "seen once" to "would have HALTED" still pages), and a check whose detail moves on its own overrides via new `alert_signature` (bucket_liveness carries an age that grows every tick; without it a stalled bucket pages forever). (2) ENFORCING ON: `session_invariants_enforcing` defaults true after 4 clean sessions (28–31 Jul, user confirmed no observe-only alerts). Config comment records the evidence HONESTLY: those sessions carried ZERO positions and ZERO orders, so squareoff/stop_coverage/notional_ceiling/reject_rate were all vacuous — only bucket_liveness was genuinely exercised and foreign_positions fired as designed. FOUR OF SIX CHECKS WILL ACT FOR THE FIRST TIME on the first day the bot holds something; what bounds that is the authority ceiling (HALT only, exits+stops keep running, reversible), not the observe period. (3) BASELINES were MIXING FOLDS — my error. intraday had PF from holdout but trades/mean from the full run; swing had PF 2.31 from an unidentified fold paired with the full run's 214 trades. Read the backtest_ref JSONs (they live at `Backtesting Engine/results/scanners/`, NOT the `strategies/optimized/...` path the YAML comments claimed) and recomputed each fold end-to-end. THE 2.31 MYSTERY IS SOLVED: TRADING_BOT_HANDOFF.md §3 has a three-fold table and 2.31 is the TRAIN fold (2025-07→2026-07, calm, 82 trades) — reproduced exactly at PF 2.313 / win 73.17% / mean unlevered 0.015094. buckets.yaml's "holdout-validated … (train fold)" is loose wording, not a second number. Train is also the RIGHT baseline and deliberately not the highest: holdout is PF 3.04 because mean-reversion FEASTS on the Apr-2025 crash, so benchmarking against calm tape treats corrections as upside rather than base case. intraday likewise pinned to its holdout (PF 1.684 / win 51.43% / 35 trades) per scanner.yaml's "plan around the holdout grade". Both `win_rate` fields now filled from the same fold as everything else. (4) PROD DB WRITE (user-approved): rows 244/245 — the user's Jul-2026 NIFTY options orphan-imported 2026-07-22 before the scoping fix, contracts since expired — flattened with a guarded UPDATE (`and bucket_id is null and side <> 'FLAT'`, asserted rowcount==2); 0 non-FLAT remaining. Dashboard home route + HTMX partial now scope to `bucket_id IS NOT NULL` so an orphan row can never again render as the bot's. 528 green, ruff clean.
 

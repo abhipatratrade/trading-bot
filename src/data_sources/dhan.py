@@ -26,11 +26,13 @@ from typing import Any
 
 import httpx
 
+from src.brokers.base import ContractSpec
 from src.brokers.dhan.auth import DEFAULT_TOKEN_CACHE_PATH, DhanTokenManager
 from src.brokers.dhan.token_store import PostgresTokenStore
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
 from src.data_sources.base import FundingRate, MarketData, OHLCVBar, Ticker
+from src.data_sources.dhan_fno import FnoRegistry
 
 _log = get_logger("data_sources.dhan")
 
@@ -102,6 +104,7 @@ class DhanData(MarketData):
         universe_cache_path: Path | None = None,
         request_delay_seconds: float = 0.0,
         client_id: str | None = None,
+        fno: FnoRegistry | None = None,
     ) -> None:
         self._token = token_manager
         # Required by /v2/marketfeed/*, which authenticates on access-token AND
@@ -114,6 +117,10 @@ class DhanData(MarketData):
         self._universe = universe  # None ⇒ lazy-load on first resolve
         self._universe_cache = universe_cache_path or _DEFAULT_UNIVERSE_CACHE
         self._req_delay = request_delay_seconds
+        # Decision 036 — derivative contracts, when this deployment trades them.
+        # Lazy inside the registry, so attaching one costs nothing until a
+        # derivative symbol is actually resolved.
+        self._fno = fno
 
     @classmethod
     def from_settings(
@@ -121,6 +128,7 @@ class DhanData(MarketData):
         settings: Settings | None = None,
         *,
         request_delay_seconds: float = 0.0,
+        fno: FnoRegistry | None = None,
     ) -> DhanData:
         """Build a DhanData from settings.
 
@@ -157,6 +165,7 @@ class DhanData(MarketData):
             data_base_url=acct.data_base_url,
             request_delay_seconds=request_delay_seconds,
             client_id=acct.data_client_id,
+            fno=fno,
         )
 
     @property
@@ -176,16 +185,49 @@ class DhanData(MarketData):
         """All tradeable NSE+BSE equity tickers in the resolved universe."""
         return list(self.universe.keys())
 
+    @property
+    def fno(self) -> FnoRegistry | None:
+        """The attached F&O contract registry, when one was supplied.
+
+        None for a cash-equity-only deployment, which is every bucket before
+        Decision 036 — those must keep resolving exactly as they did.
+        """
+        return self._fno
+
     def resolve(self, symbol: str) -> tuple[str, str]:
         """Public ticker → ``(security_id, exchange_segment)`` resolver.
 
         Shared with the Dhan broker client (``DhanClient`` takes this as its
         ``resolve_symbol`` callable) so both sides agree on the universe.
+
+        Cash equity is tried FIRST and the F&O registry only as a fallback
+        (Decision 036). The order matters and is not arbitrary: the two
+        namespaces cannot collide — a derivative symbol always carries a
+        ``-YYYYMMDD-`` expiry segment that no NSE ticker contains — but
+        checking equity first keeps the hot path for the three cash buckets
+        free of a second dict lookup, and means an F&O registry that fails to
+        load can never degrade cash-equity resolution.
         """
         info = self.universe.get(symbol)
-        if info is None:
-            raise ValueError(f"Unknown Dhan symbol: {symbol!r}")
-        return info["security_id"], info["exchange"]
+        if info is not None:
+            return info["security_id"], info["exchange"]
+        if self._fno is not None:
+            try:
+                return self._fno.resolve(symbol)
+            except ValueError:
+                pass
+        raise ValueError(f"Unknown Dhan symbol: {symbol!r}")
+
+    def contract_spec(self, symbol: str) -> ContractSpec | None:
+        """Per-contract lot / tick / freeze, for the broker adapter.
+
+        Returns None for cash equity so ``DhanClient`` keeps its historical
+        constants (1 share, ₹0.05 grid, no freeze cap) rather than being told
+        a spec that would merely restate them.
+        """
+        if self._fno is None:
+            return None
+        return self._fno.spec(symbol)
 
     # Back-compat internal alias (data adapter's own callers).
     _resolve = resolve

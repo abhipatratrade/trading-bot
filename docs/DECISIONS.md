@@ -1616,3 +1616,145 @@ happened. Do not build this until that observation exists.
 - **`_detect_unrecorded_exits` already covers the settlement side** — a GTT that
   fires while the bot is down writes no Trade row, and that mechanism records it
   from the position shortfall without needing to ask the venue.
+
+## 036 — Two Indian F&O buckets: futures-indian and options-indian
+Date: 2026-08-28
+Status: **Phase A landed. Nothing trades — neither bucket exists in buckets.yaml yet.**
+Amends: 013 (the bucket set, again — this makes eight), 022 (stop semantics for
+short premium), and CLAUDE.md's "Options: deferred until all futures/spot phases live"
+Related house rules: #1, #2, #7, #8
+
+Two new buckets on the existing Dhan account: `futures-indian` and
+`options-indian`, built to crypto-longterm parity and shipping disabled.
+
+### The four decisions taken up front (user, 2026-08-28)
+
+1. **Capital: ₹5,00,000 each.** Not the ₹50k house standard, and the reason is
+   arithmetic rather than ambition. SEBI's ₹15 lakh minimum contract value for
+   index derivatives means one NIFTY lot (65) is ~₹15.8L of notional and
+   ~₹1.9L of SPAN+exposure margin; BANKNIFTY (30) is ~₹2.1L. A ₹50k bucket
+   cannot hold ONE futures lot or sell ONE option — only buy premium. At ₹2.5L
+   a single short index lot is 76% of the bucket, which makes the scanner and
+   both allocator caps inert. ₹5L is the smallest figure at which a ranked
+   book means anything and a margin spike on a short leg has somewhere to go.
+2. **`TradingType` gains FUTURES and OPTIONS.** These name an INSTRUMENT CLASS
+   where every other value names a HOLDING PERIOD, and that wart was chosen
+   with it understood: bucket ids parse as `<type>-<market>`, so this needs no
+   change to id parsing, the `bucket_id` columns, the dashboard routes, or any
+   existing bucket's identity. The alternative — a third (instrument) axis —
+   is cleaner in the abstract and touches every one of those. The cost is that
+   holding period is no longer expressible for a derivative bucket: one
+   options bucket holds both intraday and swing option strategies, separated
+   by their strategy_master rows and named scanner sets (Decision 026).
+3. **Options: the full range, naked short premium included.** This is what
+   forces a position-GROUP model, a mandatory SPAN margin preflight, and the
+   dual-stop design below. It is the single largest driver of scope here.
+4. **Universe: NSE index (5) + NSE stock F&O (228).** BSE (SENSEX, BANKEX) is
+   explicitly out of v1 — a second exchange segment and a second expiry
+   calendar, for underlyings we have no strategy for yet.
+
+### What Phase A built (landed 2026-08-28)
+
+`src/data_sources/dhan_fno.py` — an NSE derivative contract registry, separate
+from `DhanData`'s equity universe so the memory-tuned equity parse is untouched.
+Every number in it is read from Dhan's own scrip master;
+`scripts/fno_registry_audit.py` re-measures all of them against a fresh
+download and exits non-zero on drift, so "no guesswork in lot sizing" stays a
+property of the system rather than a note about one afternoon.
+
+**The finding that justifies the whole module: `SYMBOL_NAME` is not unique.**
+It carries only the expiry MONTH, so `NIFTY-Sep2026-23150-CE` names FIVE
+different weekly contracts (2026-09-01/08/15/22/29), each with its own
+`SECURITY_ID` — 462 ambiguous names covering 2,236 NSE contracts. Keying on it
+would silently trade the wrong expiry, which for a strategy with a
+days-to-expiry rule is the worst available failure: it fills, it books, and
+nothing downstream disagrees. The registry therefore mints its own symbol from
+`(underlying, expiry, strike, option_type)` — verified unique across all 74,322
+NSE rows — written as `NIFTY-20260908-23150-CE`. A collision in that map is
+logged rather than silently shadowed, because a silent shadow is the exact bug
+being avoided.
+
+Three more measured properties the parse has to respect:
+
+- **Futures carry sentinels, not nulls** — `OPTION_TYPE` is the literal `"XX"`
+  and `STRIKE_PRICE` is `-0.01`. Both normalise to None.
+- **Strikes are not always integers** — 1,654 NSE strikes are half-points, so
+  the symbol renders the strike through `Decimal.normalize()`, never an int cast.
+- **The segment is big** — NSE D is 74,322 of 197,254 rows, so widening the
+  existing full-frame equity parse would add ~60MB on a 958MB VM that has
+  already OOM'd once (2026-08-21). The F&O parse reads in chunks and filters
+  per chunk, so peak is bounded by the chunk, not the segment.
+
+**A latent bug this surfaced, now fixed.** `DhanClient._snap_tick` hardcoded a
+₹0.05 grid. Tick size is per-contract and quoted in paise, and index futures do
+NOT tick at ₹0.05: NIFTY and FINNIFTY read 10 (₹0.10), BANKNIFTY and NIFTYNXT50
+read 20 (₹0.20), and 368 NSE contracts tick coarser than ₹0.05 — up to ₹5.00 on
+12 stock futures. A ₹0.05-snapped price on a ₹0.10 grid is off-tick and refused,
+so this would have rejected orders on the most liquid contracts in the market.
+Harmless in cash equity (₹0.05 is a valid multiple of the ₹0.01 grid 1,463 NSE
+names use), which is why it survived this long. `ContractSpec` on the broker
+contract now carries lot / tick / freeze per instrument, injected the same way
+`resolve_symbol` is, so the adapter still knows nothing about the scrip master
+and every existing cash-equity caller behaves exactly as before.
+
+One honest caveat, recorded because it is the only inferred number here: the
+per-contract tick VALUE is read from the master, but the paise→rupee DIVISOR is
+calibrated against NSE cash equity's known ₹0.05 reading as `5.0000`. If that
+calibration is wrong every tick is wrong by exactly 100×, which the first live
+order rejects loudly rather than filling badly.
+
+Also landed: a freeze-quantity guard. NSE publishes a maximum quantity per
+ORDER on every derivative (NIFTY: 1,756 = 27 lots). An oversized order is
+REFUSED rather than clamped — a clamped entry silently opens a smaller position
+than the allocator sized and than the stop was computed for, and a clamped exit
+leaves a remainder open while every ledger row says flat.
+
+### Still to build, in dependency order
+
+- **Phase B — the spot→derivative bridge.** A `ContractSelector` driven by a
+  `contract_selection:` block (strike rule, expiry rule, min DTE, min OI/volume),
+  shipping with ATM + nearest-expiry-past-min-DTE resolved from the registry
+  with no new API call. Scanner and regime keep operating on the UNDERLYING;
+  only sizing and orders see the contract. **Dedup must key on the underlying**,
+  or a strategy already short one NIFTY strike reads a second strike as an
+  unrelated name and doubles exposure the allocator believes it capped.
+- **Phase C — lots, margin, cost.** A lot is a hard MINIMUM, not a rounding
+  step: under one lot skips as `SKIPPED_INSUFFICIENT` and never rounds up.
+  `required_margin()` becomes mandatory rather than best-effort — in cash
+  equity it degrades to a 1× fallback, and in F&O *there is no 1×*, so no
+  margin answer must mean no order. Pre-trade cost estimates come from a rate
+  card carrying `source:` and `verified_on:` per line; `get_order_charges()`
+  actuals stay the booked truth, and the reconciler alerts on drift between
+  them so a stale card announces itself.
+- **Phase D — risk.** Dual stop, whichever fires first: an exchange-resident
+  buy-to-close stop at N× entry premium (Decision 034 semantics), plus a
+  bot-side underlying-level exit that normally fires earlier. The exchange leg
+  is the only one that still bounds the loss when the VM is dead — a state this
+  system has been in for three days (2026-08-21). Plus the blocker below.
+- **Phase E — buckets, configs, dashboard, docs.** Gated on the user's backtest
+  handoff; both buckets ship `enabled: false` until then.
+
+### The blocker Phase D must clear: physical settlement
+
+Stock derivatives are physically settled. An ITM stock option or future carried
+past expiry delivers SHARES at full contract value — a ₹6.7L median obligation
+against a ₹5L bucket, i.e. margin shortfall and auction. Index derivatives are
+cash settled and carry no such risk. `DerivativeContract.physically_settled`
+already carries the distinction because it is a property of the instrument, not
+of a strategy; Phase D turns it into a mandatory pre-expiry square-off enforced
+as a session invariant (Decision 033), never left to a strategy to remember.
+
+### Unverified, and to be verified rather than assumed
+
+- `required_margin()` has still never run against a live account.
+- Super Order (Decision 034) is proven on cash equity only. If F&O refuses an
+  attached stop, the Decision 022 sweep is the fallback and the dual-stop
+  design changes shape.
+- The carry-forward product string is probably `MARGIN`, but the adapter passes
+  the string through untouched, so it gets confirmed against Dhan's docs and a
+  sandbox order.
+- Dhan's F&O `tradingSymbol` format is unknown, which is why the registry keeps
+  a `by_security_id` reverse index — `securityId` is on every payload and is
+  unique, so the reconciler can match whatever the string turns out to be.
+- `NSE_FNO` as the order-side segment name comes from Dhan's API docs, not from
+  the master. It is a module constant, so it is one edit if wrong.
