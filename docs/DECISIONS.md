@@ -1619,7 +1619,7 @@ happened. Do not build this until that observation exists.
 
 ## 036 — Two Indian F&O buckets: futures-indian and options-indian
 Date: 2026-08-28
-Status: **Phases A, B and C built. Nothing trades — neither bucket exists in buckets.yaml yet. Phase C's gate is NOT cleared: the margin preflight has still never run against a live account, and the fee card is unsigned.**
+Status: **Phases A–D built. Nothing trades — neither bucket exists in buckets.yaml yet. Two gates remain open: the margin preflight has still never run against a live account, and the fee card is unsigned. Multi-leg structures are NOT supported; naked shorts and single legs are.**
 Amends: 013 (the bucket set, again — this makes eight), 022 (stop semantics for
 short premium), and CLAUDE.md's "Options: deferred until all futures/spot phases live"
 Related house rules: #1, #2, #7, #8
@@ -1852,12 +1852,86 @@ guessed from the bucket — and that guess is wrong precisely when the Decision
 alert that is both inert (the card is unsigned) and unvalidated (STT is
 unexplained) would be worse than none. It lands with sign-off.
 
+### What Phase D built (landed 2026-08-29)
+
+Two hazards turned up in code that has been live on real money for months. Both
+were invisible while every Indian position was long, and both would have bitten
+on the first F&O order.
+
+**A naked short was not recognised as the bot's own.** `net_owned` counts BUY as
+positive and SELL as negative and keeps only positive nets — correct for a
+long-only world, and exactly wrong for a bucket that OPENS with a sell. A sold
+option nets negative, drops out of ownership, and every safety path then reads
+it as the user's position: the stop sweep skips it, the reconciler declines to
+adopt it, the breaker flatten passes over it. A position with unbounded loss
+that nothing believes it owns is the worst thing this system could hold.
+
+`net_owned_signed` is the fix, with `net_owned` derived from it rather than
+computed separately — two implementations of "what do we own" is precisely how
+`_load_attribution` and `_load_stop_distances` drifted apart and cost a live
+position its stop. The DB wrapper gained `signed=`, which mattered more than it
+looks: without threading it through, the signed function would have existed and
+every caller would still have used the blind view.
+
+**The stop-coverage invariant hardcoded that a protective stop is a SELL.** True
+of every Indian position until now. A short is protected by a BUY, and a resting
+SELL against a short *adds to it*. The check now keys on the sign of the holding.
+
+A third, subtler one surfaced from a failing test rather than from reading:
+`reduce_only` was stamped only when True, so an opening SELL was
+indistinguishable from a row written before the flag existed, and fell back to
+the long-only rule that a SELL closes. The bot would have been blind to its own
+naked short in the window between placement and fill — which is the exact window
+the early-recognition rule exists to cover. It is now stamped on every order,
+both values.
+
+### The expiry window — the blocker this phase existed to clear
+
+`check_expiry_window` refuses to let any derivative be held into its expiry
+window. Stock F&O is PHYSICALLY SETTLED: an in-the-money contract carried past
+expiry does not settle in cash, it delivers shares at the full contract value —
+roughly ₹6.7 lakh for a median NSE lot against a ₹5 lakh bucket — and the
+shortfall goes to auction. Index F&O settles in rupees and gets a looser floor.
+
+**Anything not declared cash-settled is treated as physically settled.** The
+fail-safe direction is deliberate: an underlying missing from the index set
+costs an early square-off, while the opposite mistake costs a delivery
+obligation the bucket cannot fund.
+
+Like every invariant it can only HALT (Decision 033). Engaging the kill switch
+stops the bucket adding to the problem; closing the position is a trading
+decision and stays with the strategy or a human, and the alert says so.
+
+`check_margin_utilisation` covers the other way a short bucket dies quietly. A
+derivative's margin is the exchange's risk model re-evaluated continuously, and
+on a short option it GROWS as the position moves against you. Unwatched, the
+first the system hears is the broker squaring off at the worst available price.
+The balance call it needs is made only when a bucket on that account actually
+trades derivatives, so cash-equity accounts add no request to a rate-limited
+API.
+
+One config change, small but load-bearing: `stop_loss_pct` was bounded `lt=100`.
+That is right for a long — a price cannot fall more than 100% — and wrong for a
+short, where the same field is a PREMIUM MULTIPLE and 100 means "close when the
+premium doubles". The existing stop arithmetic already places a short's trigger
+above entry, so no new mechanism was needed; the bound and the documentation
+were the whole gap.
+
+### What Phase D deliberately did NOT build
+
+**Position groups.** Multi-leg structures need a strategy to shape the
+interface — how legs pair, which is the risk leg, what a partial fill on one leg
+implies for the other. Building that against no strategy would be guessing.
+Naked shorts and single legs are fully handled; **a spread is not, and must not
+be traded until this lands.**
+
+**The bot-side underlying-level exit.** The exchange-resident half of the dual
+stop works today: a premium-multiple stop resting at the venue, which is the
+half that still bounds the loss when the VM is dead. The underlying-level half
+belongs in a strategy's `select_exits` (Decision 021), and there is no strategy
+yet.
+
 ### Still to build, in dependency order
-- **Phase D — risk.** Dual stop, whichever fires first: an exchange-resident
-  buy-to-close stop at N× entry premium (Decision 034 semantics), plus a
-  bot-side underlying-level exit that normally fires earlier. The exchange leg
-  is the only one that still bounds the loss when the VM is dead — a state this
-  system has been in for three days (2026-08-21). Plus the blocker below.
 - **Phase E — buckets, configs, dashboard, docs.** Gated on the user's backtest
   handoff; both buckets ship `enabled: false` until then.
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import date as date_
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -60,6 +61,7 @@ from src.core.models import (
 )
 from src.order_manager.ownership import bot_owned_quantities
 from src.safety import kill_switch
+from src.shared.contracts import parse_contract_symbol
 from src.shared.market_calendar import IST, is_trading_day
 
 _log = get_logger("safety.session_invariants")
@@ -100,6 +102,18 @@ class BucketWatch:
     # in USD, so qty × entry_price is neither a base-unit size nor rupees. The
     # caller owns that conversion; the check only compares like with like.
     notional_budget_inr: Decimal | None = None
+    # Decision 036 — this bucket trades derivative contracts, so it may hold
+    # SHORTS and its positions expire. Off for every pre-036 bucket, which is
+    # what keeps their checks byte-identical.
+    derivatives: bool = False
+    # Index underlyings, which settle in CASH. Anything not named here is
+    # treated as physically settled, so a name missing from the set costs an
+    # early square-off rather than a delivery obligation — see
+    # ``check_expiry_window``.
+    cash_settled_underlyings: frozenset[str] = frozenset()
+    # The bucket's own allocation, for the margin-utilisation ceiling. None
+    # skips that check.
+    capital_inr: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +142,8 @@ class InvariantResult:
 def effective_holdings(
     positions: list[PositionInfo],
     owned: dict[str, Decimal] | None,
+    *,
+    include_shorts: bool = False,
 ) -> dict[str, Decimal]:
     """``{symbol: qty}`` the bot actually holds RIGHT NOW on the exchange. PURE.
 
@@ -140,14 +156,35 @@ def effective_holdings(
 
     ``owned=None`` means an exclusive account (every crypto sub-account,
     Decision 019): the whole position is the bot's.
+
+    ``include_shorts`` (Decision 036) returns SIGNED quantities — negative for
+    a short — and is required for any bucket that can sell to open. Default
+    False reproduces the long-only behaviour every pre-036 caller was written
+    against. It is off by default rather than on because the callers that would
+    silently mis-read a negative quantity (the notional ceiling sums them; the
+    square-off check prints them) are live on real money today.
     """
     out: dict[str, Decimal] = {}
     for pos in positions:
-        if pos.side != "long" or pos.size <= 0:
+        if pos.size <= 0:
             continue
-        qty = pos.size if owned is None else min(pos.size, owned.get(pos.symbol, Decimal("0")))
-        if qty > 0:
-            out[pos.symbol] = qty
+        if pos.side == "long":
+            qty = (
+                pos.size
+                if owned is None
+                else min(pos.size, owned.get(pos.symbol, Decimal("0")))
+            )
+            if qty > 0:
+                out[pos.symbol] = qty
+        elif include_shorts and pos.side == "short":
+            # Ownership of a short is carried as a NEGATIVE net, so compare
+            # magnitudes and hand back a negative quantity.
+            owned_qty = (
+                pos.size if owned is None else -owned.get(pos.symbol, Decimal("0"))
+            )
+            qty = min(pos.size, owned_qty) if owned is not None else pos.size
+            if qty > 0:
+                out[pos.symbol] = -qty
     return out
 
 
@@ -210,6 +247,11 @@ def check_stop_coverage(
 ) -> InvariantResult:
     """Every bot-held position needs a resting reduce-only stop (Decision 022).
 
+    ``holdings`` may be SIGNED (Decision 036): a negative quantity is a short,
+    which is protected by a BUY stop rather than a SELL one. A naked short with
+    no stop is the single worst position this system can hold — its loss is
+    unbounded — so it must never read as covered.
+
     Runs AFTER the sweep, so a gap here means the sweep tried and failed (or
     never planned one) — not that it hasn't got to it yet.
 
@@ -237,14 +279,21 @@ def check_stop_coverage(
         # placed the order. Without this branch a hand-placed stop leaves the
         # bucket halting every tick while the position is in fact protected.
         #
-        # Two conditions keep it honest. SELL, because a resting BUY stop is an
-        # entry trigger, not protection for a long (Indian equity is long-only;
-        # crypto sub-accounts are exclusive, so no foreign order exists there).
-        # And big enough to cover OUR holding, because on a shared account the
-        # user may hold the same scrip — a stop sized for their 100 shares says
-        # nothing about the bot's 15.
+        # Two conditions keep it honest. The stop must be on the side that
+        # actually CLOSES the position — a resting BUY stop is an entry
+        # trigger against a long, but it is the only thing that protects a
+        # SHORT (Decision 036; before the options bucket every Indian position
+        # was long, and this branch hardcoded "sell"). And it must be big
+        # enough to cover OUR holding, because on a shared account the user may
+        # hold the same scrip — a stop sized for their 100 shares says nothing
+        # about the bot's 15.
         held = holdings.get(o.symbol, Decimal("0"))
-        if str(o.side).lower() == "sell" and held > 0 and o.unfilled_size >= held:
+        protective_side = "sell" if held > 0 else "buy"
+        if (
+            str(o.side).lower() == protective_side
+            and held != 0
+            and o.unfilled_size >= abs(held)
+        ):
             covered.add(o.symbol)
     uncovered = sorted(set(holdings) - covered)
     if not uncovered:
@@ -568,10 +617,14 @@ def check_foreign_positions(
     if owned is None:
         return InvariantResult(name, account_ref, ok=True)
 
+    # MAGNITUDES on both sides. ``PositionInfo.size`` is always positive with
+    # the direction in ``side``, while signed ownership carries a short as a
+    # NEGATIVE net (Decision 036) — so a raw comparison reads every short the
+    # bot owns as the user's, and pages about it every tick.
     foreign = [
         p.symbol
         for p in positions
-        if p.size > 0 and p.size > owned.get(p.symbol, Decimal("0"))
+        if p.size > 0 and p.size > abs(owned.get(p.symbol, Decimal("0")))
     ]
     if not foreign:
         return InvariantResult(name, account_ref, ok=True)
@@ -592,6 +645,138 @@ def check_foreign_positions(
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+# Days to expiry a position must still have, by settlement style.
+#
+# PHYSICAL (stock F&O): flat by T-1 close. An in-the-money stock derivative
+# carried through expiry does not settle in cash — it DELIVERS SHARES at full
+# contract value, a ~Rs 6.7 lakh median obligation against a Rs 5L bucket, and
+# the shortfall goes to auction. Two days of room, not one, because the check
+# can only alert: closing is a human action and needs a session to happen in.
+#
+# CASH (index F&O): settles in rupees, so holding to expiry is legitimate. The
+# floor is 0 — a violation here means a contract is still on the books AFTER it
+# expired, which is a reconciliation fault rather than a delivery risk.
+DEFAULT_PHYSICAL_MIN_DTE = 2
+DEFAULT_CASH_MIN_DTE = 0
+
+
+def check_expiry_window(
+    *,
+    bucket_id: str,
+    holdings: dict[str, Decimal],
+    today: date_,
+    cash_settled_underlyings: frozenset[str] = frozenset(),
+    physical_min_dte: int = DEFAULT_PHYSICAL_MIN_DTE,
+    cash_min_dte: int = DEFAULT_CASH_MIN_DTE,
+) -> InvariantResult:
+    """No derivative may be held into its expiry window. PURE.
+
+    The largest loss vector in the F&O buckets, and the one Phase D exists to
+    close. Stock derivatives are PHYSICALLY SETTLED: an ITM contract carried
+    past expiry creates a delivery obligation at the full contract value, which
+    for a median NSE stock lot is roughly Rs 6.7 lakh against a Rs 5 lakh
+    bucket — margin shortfall, then auction.
+
+    ``cash_settled_underlyings`` names the index underlyings that settle in
+    rupees. **Anything not in that set is treated as physically settled**, and
+    the fail-safe direction is deliberate: an unknown underlying gets the
+    stricter deadline, so a name missing from the set costs an early square-off
+    rather than a delivery obligation.
+
+    Like every other invariant this can only HALT (Decision 033) — engaging the
+    kill switch stops the bucket adding to the problem, but closing the
+    position is a trading decision and stays with the strategy or a human. The
+    message says so.
+    """
+    name = "expiry_window"
+    at_risk: dict[str, dict[str, object]] = {}
+    for symbol, qty in holdings.items():
+        if qty == 0:
+            continue
+        key = parse_contract_symbol(symbol)
+        if key is None:
+            continue  # cash equity or crypto — no expiry to run out of
+        dte = (key.expiry - today).days
+        cash = key.underlying in cash_settled_underlyings
+        floor = cash_min_dte if cash else physical_min_dte
+        if dte >= floor:
+            continue
+        at_risk[symbol] = {
+            "days_to_expiry": dte,
+            "expiry": key.expiry.isoformat(),
+            "settlement": "cash" if cash else "PHYSICAL",
+            "quantity": str(qty),
+        }
+
+    if not at_risk:
+        return InvariantResult(name, bucket_id, ok=True)
+
+    physical = [s for s, d in at_risk.items() if d["settlement"] == "PHYSICAL"]
+    listing = ", ".join(
+        f"{s} ({d['days_to_expiry']}d, {d['settlement']})"
+        for s, d in sorted(at_risk.items())
+    )
+    tail = (
+        " PHYSICALLY SETTLED — if in the money at expiry these DELIVER SHARES "
+        "at full contract value, which this bucket cannot fund. CLOSE BY HAND."
+        if physical
+        else " Cash settled, but past its expiry floor — close or reconcile."
+    )
+    return InvariantResult(
+        name,
+        bucket_id,
+        ok=False,
+        severity=Severity.HALT,
+        message=f"EXPIRY WINDOW on {bucket_id}: {listing}.{tail}",
+        detail={"at_risk": at_risk},
+    )
+
+
+def check_margin_utilisation(
+    *,
+    bucket_id: str,
+    used_margin_inr: Decimal | None,
+    capital_inr: Decimal,
+    max_utilisation: Decimal,
+) -> InvariantResult:
+    """Margin used must stay under a fraction of the bucket's capital. PURE.
+
+    Cash equity does not need this: margin there is a fixed multiple of a
+    notional we chose, so it cannot move once the position is open. A
+    derivative's margin is the exchange's risk model re-evaluated continuously,
+    and on a short option it GROWS as the position moves against you. Left
+    unwatched, the first the system hears of it is the broker squaring the
+    position off at the worst available moment.
+
+    ``used_margin_inr`` None ⇒ the venue did not report it, and this passes.
+    That is not a soft failure being hidden: on a shared Dhan account the
+    reported margin covers the user's positions too, so an absent figure is
+    better than a wrong one, and the notional ceiling still bounds the book.
+    """
+    name = "margin_utilisation"
+    if used_margin_inr is None or capital_inr <= 0:
+        return InvariantResult(name, bucket_id, ok=True)
+    used = used_margin_inr / capital_inr
+    if used <= max_utilisation:
+        return InvariantResult(name, bucket_id, ok=True)
+    return InvariantResult(
+        name,
+        bucket_id,
+        ok=False,
+        severity=Severity.HALT,
+        message=(
+            f"MARGIN UTILISATION on {bucket_id}: {used:.0%} of capital in use "
+            f"(ceiling {max_utilisation:.0%}). A short option's margin grows as "
+            f"it moves against you; at 100% the broker squares off, not us."
+        ),
+        detail={
+            "used_margin_inr": str(used_margin_inr),
+            "capital_inr": str(capital_inr),
+            "utilisation": str(used),
+        },
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class InvariantThresholds:
     """Tunables, all sourced from ``Settings`` by the caller."""
@@ -612,6 +797,18 @@ class InvariantThresholds:
     # failure. Comfortably wider than one swing-indian 1h bin, so a miss stays
     # visible for the rest of the bin it happened in rather than for one tick.
     signal_lost_window_minutes: int = 90
+    # Decision 036 — the F&O ceilings.
+    #
+    # A derivative's margin is re-evaluated continuously by the exchange and
+    # GROWS on a short option as it moves against you, so a bucket sitting at
+    # 100% is one adverse move from a broker square-off at the worst available
+    # price. 0.80 leaves room for that move to be survived rather than closed
+    # for us.
+    max_margin_utilisation: Decimal = Decimal("0.80")
+    # Days to expiry a physically-settled contract must still have. See
+    # DEFAULT_PHYSICAL_MIN_DTE.
+    physical_min_dte: int = DEFAULT_PHYSICAL_MIN_DTE
+    cash_min_dte: int = DEFAULT_CASH_MIN_DTE
 
 
 def count_recent_rejects(
@@ -784,6 +981,20 @@ def run_session_invariants(
         except Exception:
             _log.warning("invariant_attached_stop_lookup_failed", exc_info=True)
 
+    # Margin utilisation needs the account's own figure, and it is an EXTRA
+    # call on a rate-limited account — so it is fetched only when some bucket
+    # on this account actually trades derivatives. Cash-equity accounts add no
+    # request at all.
+    used_margin_inr: Decimal | None = None
+    if any(w.derivatives for w in watches):
+        try:
+            used_margin_inr = sum(
+                (b.position_margin + b.order_margin for b in broker.get_balances()),
+                Decimal("0"),
+            )
+        except Exception:
+            _log.warning("invariant_margin_lookup_failed", exc_info=True)
+
     account_owned: dict[str, Decimal] | None = None
     if shared_account:
         with session_scope() as session:
@@ -792,6 +1003,10 @@ def run_session_invariants(
                 broker_name=broker_name,
                 bucket_ids=[w.bucket_id for w in watches],
                 now=now,
+                # Signed as soon as ANY bucket on this account can hold a
+                # short, or the account-level view would file the bot's own
+                # short under the user's positions.
+                signed=any(w.derivatives for w in watches),
             )
 
     results.append(
@@ -808,12 +1023,17 @@ def run_session_invariants(
                     broker_name=broker_name,
                     bucket_ids=[watch.bucket_id],
                     now=now,
+                    signed=watch.derivatives,
                 )
         else:
             # Exclusive sub-account (Decision 019): one bucket, all of it ours.
             owned = None
 
-        holdings = effective_holdings(positions, owned)
+        # SIGNED for a derivative bucket (negative = short), long-only for
+        # every other, which is what keeps the pre-036 checks unchanged.
+        holdings = effective_holdings(
+            positions, owned, include_shorts=watch.derivatives
+        )
 
         results.append(
             check_squareoff(
@@ -835,9 +1055,30 @@ def run_session_invariants(
         results.append(
             check_notional_ceiling(
                 bucket=watch,
-                holdings=holdings,
+                # ABSOLUTE: exposure is exposure whichever way it points, and
+                # summing signed quantities would let a short net off a long
+                # and report a book far smaller than the one being carried.
+                holdings={sym: abs(q) for sym, q in holdings.items()},
                 entry_prices=entry_prices,
                 tolerance=thresholds.notional_tolerance,
+            )
+        )
+        results.append(
+            check_expiry_window(
+                bucket_id=watch.bucket_id,
+                holdings=holdings,
+                today=now.astimezone(IST).date(),
+                cash_settled_underlyings=watch.cash_settled_underlyings,
+                physical_min_dte=thresholds.physical_min_dte,
+                cash_min_dte=thresholds.cash_min_dte,
+            )
+        )
+        results.append(
+            check_margin_utilisation(
+                bucket_id=watch.bucket_id,
+                used_margin_inr=used_margin_inr if watch.derivatives else None,
+                capital_inr=watch.capital_inr or Decimal("0"),
+                max_utilisation=thresholds.max_margin_utilisation,
             )
         )
         results.append(

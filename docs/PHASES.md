@@ -672,21 +672,65 @@ snapshot, so it will not appear in the EOD report's "signals seen but not
 taken". `SizingDecision` is a Postgres enum and a new value needs a migration;
 folded into Phase E with the buckets and their reporting.
 
-### D — Risk: short premium and expiry
-Gate: every item here holds before any order path opens.
+### D — Risk: short premium and expiry — BUILT 2026-08-29
+Gate: every item holds before any order path opens.
 
-- [ ] Dual stop, whichever fires first — exchange-resident premium stop plus a
-      bot-side underlying-level exit
-- [ ] **BLOCKER: mandatory pre-expiry square-off.** Stock derivatives are
-      physically settled; an ITM contract carried past expiry delivers shares
-      at full contract value (~₹6.7L median vs a ₹5L bucket). Enforced as a
-      session invariant, not left to a strategy
-- [ ] Ownership scoping under derivatives — four buckets now share one Dhan
-      account; the reconciler must not adopt or square off the user's own F&O
-- [ ] New session invariants: stop coverage on every derivative, nothing held
-      inside the expiry window, margin utilisation under a per-bucket cap
-- [ ] Position groups — multi-leg structures open/close/stop as one unit, so a
-      spread's short leg is never mistaken for a naked write
+**Two hazards found in code already live on real money.** Both would have gone
+unnoticed until an F&O bucket was switched on, and both are fixed:
+
+- [x] **A naked short was not recognised as ours.** `net_owned` is long-only,
+      so a sold-to-open option nets negative and is dropped as "not the bot's"
+      — the stop sweep skips it, the reconciler files it as the user's, the
+      breaker flatten passes over it. An unbounded-loss position no safety path
+      believes it owns. New `net_owned_signed`; `net_owned` is now derived from
+      it so the two cannot disagree, and `bot_owned_quantities(signed=)` threads
+      it through the invariants
+- [x] **The stop-coverage check hardcoded "a protective stop is a SELL"** —
+      true of every Indian position until the options bucket. A short is
+      protected by a BUY; the check now keys on the sign of the holding
+- [x] `reduce_only` is stamped on EVERY order, True and False. An absent key
+      cannot tell "this opens exposure" from "this row predates the flag", and
+      a sell-to-open would fall back to the long-only rule — leaving the bot
+      blind to its own short between placement and fill
+- [x] `check_foreign_positions` compares MAGNITUDES; a raw comparison filed
+      every short the bot owns under the user's positions
+
+Then the new machinery:
+
+- [x] **`check_expiry_window` — the blocker.** No derivative may be held into
+      its expiry window. Stock F&O is physically settled: an ITM contract
+      carried past expiry DELIVERS SHARES at full contract value (~₹6.7L median
+      against a ₹5L bucket), then auction. Index F&O settles in cash and gets a
+      looser floor. **Anything not declared cash-settled is treated as
+      physical** — fail-safe, so a name missing from the index set costs an
+      early square-off rather than a delivery obligation
+- [x] `check_margin_utilisation` — a derivative's margin is re-evaluated
+      continuously and GROWS on a short option as it moves against you. At 100%
+      the broker squares off, not us. Ceiling 80%. The balance call is made
+      only when a bucket on the account actually trades derivatives, so
+      cash-equity accounts add no request
+- [x] `effective_holdings(include_shorts=)` — signed quantities, off by default
+      because the live callers that would mis-read a negative are on real money
+- [x] The notional ceiling sums ABSOLUTE quantities, so a short cannot net off
+      a long and report a book smaller than the one carried
+- [x] `stop_loss_pct` ceiling raised from `lt=100` to `lt=1000`. For a SHORT
+      the field is a PREMIUM MULTIPLE and 100 means "close when the premium
+      doubles" — inexpressible under the old bound. The existing stop
+      arithmetic already places a short's trigger above entry, so no new
+      mechanism was needed, only a config range and the documentation to say so
+- [x] 31 new tests; 943 green, ruff clean
+
+**Deferred, deliberately:**
+
+- [ ] **Position groups.** Multi-leg structures need a strategy to shape them —
+      how legs pair, which is the risk leg, what a partial fill on one leg
+      means. Building that against no strategy would be guessing at an
+      interface. Naked shorts and single legs are fully handled; a spread is
+      not, and must not be traded until this lands
+- [ ] **The bot-side underlying-level exit.** The exchange-resident half of the
+      dual stop works today (premium multiple, resting at the venue, survives a
+      dead VM). The underlying-level half belongs in a strategy's
+      `select_exits` per Decision 021, and there is no strategy yet
 
 ### E — Buckets, strategies, dashboard, docs
 Gate: **the user's backtest handoff.** Both buckets ship `enabled: false` until then.
@@ -704,6 +748,8 @@ Gate: **the user's backtest handoff.** Both buckets ship `enabled: false` until 
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-08-29 (cont. 2) — **Decision 036 Phase D**: short-premium and expiry risk. TWO HAZARDS FOUND IN CODE ALREADY LIVE ON REAL MONEY, both invisible until an F&O bucket switches on. (1) `net_owned` is LONG-ONLY — it counts BUY as + and SELL as - and drops anything netting <= 0 as "not the bot's". The options bucket OPENS WITH A SELL, so a naked short nets negative and every safety path would have read it as the user's position: no stop from the sweep, no adoption by the reconciler, skipped by the breaker flatten. An unbounded-loss position that nothing believes it owns. New `net_owned_signed`, with `net_owned` DERIVED from it (two implementations of "what do we own" is exactly how `_load_attribution` and `_load_stop_distances` drifted apart and cost a live position its stop), plus `bot_owned_quantities(signed=)` threaded through the invariants — without that last step the whole change would have been inert, since the DB wrapper still returned the long-only view. (2) `check_stop_coverage` hardcoded that a protective stop is a SELL, true of every Indian position until now; a SHORT is protected by a BUY, and the check now keys on the sign of the holding. Also: `reduce_only` is stamped on EVERY order rather than only when True, because an absent key cannot distinguish "opens exposure" from "predates the flag" and a sell-to-open would fall back to the long-only rule — a test caught this, my first cut had the bot blind to its own short between placement and fill. And `check_foreign_positions` now compares MAGNITUDES, or it files every short the bot owns under the user's positions and pages every tick. NEW MACHINERY: `check_expiry_window` (THE blocker — stock F&O is physically settled, so an ITM contract carried past expiry DELIVERS SHARES at full contract value, ~Rs 6.7L median against a Rs 5L bucket, then auction; anything not declared cash-settled is treated as PHYSICAL, fail-safe, so a missing index name costs an early square-off rather than a delivery obligation) and `check_margin_utilisation` (a short option's margin GROWS as it moves against you; at 100% the broker squares off, not us — ceiling 80%, and the balance call is skipped entirely on accounts with no derivative bucket). `stop_loss_pct` raised from lt=100 to lt=1000: for a SHORT the field is a PREMIUM MULTIPLE and 100 means "close when the premium doubles", which the old bound made inexpressible — the existing arithmetic already places a short's trigger above entry, so no new mechanism, just a range and the docs to say so. 31 new tests, 943 green, ruff clean. DEFERRED ON PURPOSE: position groups (multi-leg needs a strategy to shape the interface — naked shorts and single legs are fully handled, a spread is NOT and must not trade until this lands) and the bot-side underlying-level exit (belongs in a strategy's select_exits per Decision 021; the exchange-resident half works today).
 
 - 2026-08-29 (cont.) — **Decision 036 Phase C**: lots, margin, cost. Still nothing trades. (1) LOT QUANTISATION never rounds UP — one NIFTY lot is ~Rs 15.8L of notional against a Rs 5L bucket, so "round up to the minimum" would place an order 3x the size the allocator approved; below one lot the answer is zero and the runner skips. Applied AFTER _fit_to_margin because a margin-scaled quantity lands off the grid nearly every time. The sizer counts LOTS (contract_size = lot), so the pre-existing `size < 1` guard becomes "less than one lot" for free. (2) MARGIN PREFLIGHT IS NOW MANDATORY FOR A DERIVATIVE: no answer means no order. Cash equity keeps its 1x fallback because margin there IS a leverage multiple of notional; F&O has no 1x at all — SPAN is the exchange's risk model against the underlying's notional, and sizing off a leverage guess would put in an order the venue prices at multiples of the budget, with no bounded loss behind the mistake on a short option. (3) The execution symbol now flows END TO END (deferred from B): `ExecutionPlan` keys contract, premium and lot by UNDERLYING, so scanner/regime/dedup keep seeing the underlying while the order goes to the contract; pass-through for every non-F&O bucket, so there is no second code path. (4) FEE RATE CARD, and this is the part that earned its keep. Every line carries `source` + `verified_on`; `estimate_charges` REFUSES an unsigned card rather than returning zero (a silent zero reads downstream as "this trade is free"). Rates fetched from Dhan/Zerodha/Angel One and CROSS-CHECKED: F&O STT moved on 1 April 2026 (futures 0.02->0.05%, options 0.10->0.15% on premium, sell side), and the two sources DISAGREE on futures stamp duty (0.002% vs 0.0001%) — recorded in the line's note rather than smoothed over. THEN reconciled the card against real billed Dhan charges: 4 of 6 lines land at ~0% drift, but STT does NOT. Two buy legs were billed Rs 12 on ~Rs 50k (~0.024%), matching neither intraday (0.025% sell-only) nor delivery (0.1% both sides), while the one clean same-day round trip was billed Rs 0 exactly as predicted. I could not explain it from the sources and did not invent an explanation — the card ships UNSIGNED with the finding in its header. Also found: the entire SELL side is unvalidated (all three billed orders were buys) and stamp-duty actuals look rounded to whole rupees. (5) `Trade.extra["product"]` is now recorded, because its absence made cost attribution a guess exactly where the Decision 031 CNC fallback fires. 19 new tests, 912 green, ruff clean. GATE NOT CLEARED: `required_margin()` still has never run against a live account.
 

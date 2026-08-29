@@ -82,7 +82,17 @@ class BucketConfig(BaseModel):
     # entry price. Every open position gets an exchange-resident reduce-only
     # stop-market order at this distance, so a max loss holds even when the
     # bot/VM is down. None ⇒ no broker-side stop for this bucket.
-    stop_loss_pct: Decimal | None = Field(default=None, gt=0, lt=100)
+    #
+    # The ceiling was `lt=100`, which is right for a LONG — a price cannot fall
+    # more than 100% — and wrong for a SHORT, where the same field expresses a
+    # PREMIUM MULTIPLE and values at or above 100 are the normal case
+    # (Decision 036). A short option's stop sits ABOVE entry, so 100 means
+    # "close when the premium doubles" and 200 means "when it triples"; there
+    # is no arithmetic ceiling at all, since a premium can rise without bound.
+    # 1000 is a sanity bound, not a risk statement: on a long anything ≥ 100
+    # is degenerate (the trigger lands at or below zero and never fires), so a
+    # value that large is a config error worth catching, just not here.
+    stop_loss_pct: Decimal | None = Field(default=None, gt=0, lt=1000)
     # Decision 034 — carry the protective stop ON the entry order (Dhan Super
     # Order) instead of resting it separately after the fill. Per-BUCKET, not
     # just per-process: the whole rollout plan is "enable for one bucket, watch

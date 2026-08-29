@@ -189,8 +189,19 @@ class OrderManager:
         # the point is to stop guessing the starting point too.
         if product:
             extra["product"] = product
-        if reduce_only:
-            extra["reduce_only"] = True
+        # Decision 036 — stamped ALWAYS, both True and False, not only when
+        # True. Ownership needs to tell "this order opens exposure" from "this
+        # row predates the flag", and an absent key cannot say which. With only
+        # the True case stamped, a sell-to-OPEN (the options bucket's entry) is
+        # indistinguishable from a legacy row and falls back to the long-only
+        # rule "a SELL closes" — so the bot would not recognise its own naked
+        # short between placement and fill, which is exactly the window the
+        # early-recognition rule exists to cover.
+        #
+        # Safe for every existing path: entries are BUYs (False, which the side
+        # rule already concluded) and every SELL in this repo today is
+        # reduce_only=True, so no live behaviour changes.
+        extra["reduce_only"] = bool(reduce_only)
         if attached_stop_price is not None:
             # The ledger must record that this entry carries its OWN protection,
             # so the sweep does not plan a second stop for it and the invariant
