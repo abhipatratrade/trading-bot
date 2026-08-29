@@ -53,6 +53,9 @@ _PRODUCT_SEGMENT = {
     # MTF is NOT carded: its brokerage follows intraday but its STT follows
     # delivery, and that blend was never sourced. Skipped rather than guessed.
     "MTF": None,
+    # MCX carry-forward. Dhan's product for a commodity futures position.
+    "MARGIN": "mcx_futures",
+    "NRML": "mcx_futures",
 }
 
 # Fallback when the order predates product recording (Decision 036 added it).

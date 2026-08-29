@@ -580,6 +580,10 @@ class BucketRunner:
             self._clock.now(),
             entry_start=parse_ist_time(self.bucket.config.entry_start),
             entry_end=parse_ist_time(self.bucket.config.entry_end),
+            # Decision 037 — MCX runs 09:00-23:30 against NSE's 09:15-15:30.
+            # Without this a commodity bucket goes dark at 15:30 and never sees
+            # the 18:00 IST NYMEX open.
+            exchange=self.bucket.config.exchange,
         )
 
     def _run_exits(self, om: OrderManager) -> int:

@@ -218,6 +218,24 @@ class DhanData(MarketData):
                 pass
         raise ValueError(f"Unknown Dhan symbol: {symbol!r}")
 
+    def _instrument_for(self, symbol: str) -> str:
+        """Dhan's charts ``instrument`` for a symbol (Decision 037).
+
+        Hardcoded ``"EQUITY"`` until now, which is correct for every cash bucket
+        and WRONG for a derivative — the charts endpoint keys on it, so an MCX
+        futures request tagged EQUITY does not return that contract's bars. It
+        would have been the first thing to fail on a live commodity bucket, and
+        it would have failed as "no data" rather than as an error.
+
+        The value is the scrip master's own ``INSTRUMENT`` column (FUTCOM,
+        FUTIDX, OPTIDX, ...), so the registry already holds it and no new
+        vocabulary is introduced.
+        """
+        if self._fno is None:
+            return "EQUITY"
+        contract = self._fno.get(symbol)
+        return contract.instrument if contract is not None else "EQUITY"
+
     def contract_spec(self, symbol: str) -> ContractSpec | None:
         """Per-contract lot / tick / freeze, for the broker adapter.
 
@@ -392,15 +410,17 @@ class DhanData(MarketData):
         self, symbol: str, interval: str, limit: int = 500
     ) -> list[OHLCVBar]:
         security_id, exchange = self._resolve(symbol)
+        instrument = self._instrument_for(symbol)
         if interval == "1d":
-            return self._daily(security_id, exchange, limit)
+            return self._daily(security_id, exchange, limit, instrument)
         minutes = _INTRADAY_MINUTES.get(interval)
         if minutes is None:
             raise ValueError(
                 f"Unsupported Dhan interval {interval!r}; "
                 f"valid: 1d, {list(_INTRADAY_MINUTES)}"
             )
-        return self._intraday(security_id, exchange, minutes)
+        return self._intraday(security_id, exchange, minutes,
+                              instrument=instrument)
 
     def get_ohlcv_history(
         self, symbol: str, interval: str, *, days: int
@@ -425,28 +445,33 @@ class DhanData(MarketData):
                 f"valid: {list(_INTRADAY_MINUTES)}"
             )
         return self._intraday(
-            security_id, exchange, minutes, days=min(days, _INTRADAY_MAX_DAYS)
+            security_id, exchange, minutes, days=min(days, _INTRADAY_MAX_DAYS),
+            instrument=self._instrument_for(symbol),
         )
 
-    def _daily(self, security_id: str, exchange: str, limit: int) -> list[OHLCVBar]:
+    def _daily(
+        self, security_id: str, exchange: str, limit: int,
+        instrument: str = "EQUITY",
+    ) -> list[OHLCVBar]:
         to_d = datetime.now(UTC).date()
         # ~1.5 calendar days per trading day covers weekends/holidays.
         from_d = to_d - timedelta(days=math.ceil(limit * 1.5) + 5)
         payload = {
             "securityId": security_id, "exchangeSegment": exchange,
-            "instrument": "EQUITY", "expiryCode": 0,
+            "instrument": instrument, "expiryCode": 0,
             "fromDate": str(from_d), "toDate": str(to_d),
         }
         data = self._charts("historical", payload)
         return self._parse_candles(data)[-limit:]
 
     def _intraday(
-        self, security_id: str, exchange: str, minutes: str, days: int = 5
+        self, security_id: str, exchange: str, minutes: str, days: int = 5,
+        instrument: str = "EQUITY",
     ) -> list[OHLCVBar]:
         today = datetime.now(UTC).date()
         payload = {
             "securityId": security_id, "exchangeSegment": exchange,
-            "instrument": "EQUITY", "interval": minutes,
+            "instrument": instrument, "interval": minutes,
             "fromDate": str(today - timedelta(days=days)), "toDate": str(today),
         }
         return self._parse_candles(self._charts("intraday", payload))

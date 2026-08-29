@@ -36,7 +36,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from src.core.logging import get_logger
-from src.shared.contracts import format_strike
+from src.shared.contracts import format_strike, parse_contract_symbol
 
 _log = get_logger("shared.contract_selection")
 
@@ -381,6 +381,79 @@ class ContractSelector:
         if cfg.max_days_to_expiry is not None:
             window += f" and <= {cfg.max_days_to_expiry}d"
         return f"no {cfg.expiry_rule.value} expiry in window ({window} to expiry)"
+
+
+@dataclass(frozen=True, slots=True)
+class RollDecision:
+    """Whether an OPEN position should move to a later contract."""
+
+    should_roll: bool
+    from_symbol: str
+    to_contract: ContractLike | None = None
+    reason: str = ""
+
+
+def plan_roll(
+    *,
+    held_symbol: str,
+    underlying: str,
+    source: ContractSource,
+    config: ContractSelectionConfig,
+    on: date,
+) -> RollDecision:
+    """Carry an open futures position forward into the next contract.
+
+    Decision 037, user instruction 2026-08-29: positions are CARRIED FORWARD
+    rather than squared off at expiry, and a contract inside the
+    ``min_days_to_expiry`` floor is no longer the one to hold.
+
+    The rule is deliberately the SAME one that selects a contract for a new
+    entry — ``select`` with the same config — so a rolled position lands on
+    exactly the contract a fresh signal would have chosen. Two different rules
+    for "which contract" is how a book ends up holding one month while the
+    strategy signals on another.
+
+    A roll is TWO orders, not one: close the near leg, open the far leg. The
+    caller sequences them, and the spread between the two contracts is a real
+    cost the backtest never modelled — it traded a continuous series that
+    splices that cost away.
+
+    Returns ``should_roll=False`` when the held contract is still the selected
+    one, when the symbol is not a derivative, or when no later contract
+    qualifies (in which case the position must be closed rather than rolled —
+    the caller decides, this only reports).
+    """
+    key = parse_contract_symbol(held_symbol)
+    if key is None:
+        return RollDecision(False, held_symbol, reason="not a derivative")
+
+    dte = (key.expiry - on).days
+    if dte >= config.min_days_to_expiry:
+        return RollDecision(
+            False, held_symbol, reason=f"{dte}d to expiry, floor is "
+            f"{config.min_days_to_expiry}d"
+        )
+
+    # Same selector the entry path uses. Spot is irrelevant for a future, and
+    # the side only matters for an option's leg, so neither changes the answer
+    # for the futures case this was written for.
+    selector = ContractSelector(source, config)
+    chosen = selector.select(underlying, spot=Decimal("1"), side="buy", on=on)
+    if not chosen.ok or chosen.contract is None:
+        return RollDecision(
+            False, held_symbol,
+            reason=f"inside the {config.min_days_to_expiry}d floor with no "
+                   f"later contract to roll into — CLOSE, do not carry",
+        )
+    if chosen.contract.symbol == held_symbol:
+        return RollDecision(
+            False, held_symbol, reason="already on the selected contract"
+        )
+    return RollDecision(
+        True, held_symbol, chosen.contract,
+        reason=f"{dte}d to expiry (floor {config.min_days_to_expiry}d) -> "
+               f"{chosen.contract.symbol}",
+    )
 
 
 def _strike_of(contract: ContractLike) -> Decimal:

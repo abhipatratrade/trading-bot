@@ -270,3 +270,61 @@ segments:
     gst_rate: 0.18
     gst_source: https://dhan.co/pricing/
     gst_verified_on: 2026-08-29
+
+  # ── MCX commodity futures (Decision 037) ─────────────────────────────────
+  # PROVENANCE IS WEAKER THAN EVERY SEGMENT ABOVE, and that is recorded rather
+  # than smoothed over. These rates come from the Backtesting Engine handoff's
+  # own cost note, not from a source I fetched and cross-checked myself. They
+  # are internally consistent (the handoff's ~0.088% of notional round trip
+  # reproduces from them) but they have NOT been verified against MCX or a
+  # broker page, and the fee-card reconciler has no billed MCX trade to check
+  # them against because this bucket has never traded.
+  #
+  # THE STRUCTURAL DIFFERENCE FROM NSE, which is why the NSE card must never be
+  # applied here: commodities pay CTT (Commodities Transaction Tax), NOT STT.
+  # It is carried in the `stt` field because the mechanic is identical — a
+  # sell-side transaction tax on turnover — and adding a parallel field would
+  # mean every consumer learning a second name for one thing. The rate differs
+  # by 5x from NSE futures STT, so applying the wrong card is not a rounding
+  # error.
+  mcx_futures:
+    label: MCX commodity futures (FUTCOM) — UNVERIFIED, see note
+    brokerage:
+      flat_per_order: 20
+      pct_of_turnover: 0.0003
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: >-
+        "Rs 20 per executed order for equity & commodity F&O" from Dhan's own
+        page; the handoff models it as min(0.03%, Rs 20) per leg, hence both
+        fields. This is the one MCX line with a first-hand source.
+    stt:
+      rate: 0.0001          # CTT 0.01%, sell side
+      side: sell
+      source: backtest-handoff:cci_gas_15m/handoff.yaml#execution.cost_note
+      verified_on: 2026-08-29
+      note: >-
+        COMMODITIES TRANSACTION TAX, not STT — 0.01% on the sell leg of a
+        non-agri futures trade. NOT independently verified. Confirm against a
+        real MCX contract note before trusting any P&L that subtracts it.
+    exchange_txn:
+      rate: 0.000026        # 0.0026%
+      side: both
+      source: backtest-handoff:cci_gas_15m/handoff.yaml#execution.cost_note
+      verified_on: 2026-08-29
+      note: MCX Group A rate per the handoff. NOT independently verified.
+    sebi:
+      rate: 0.000001        # Rs 10 / crore
+      side: both
+      source: backtest-handoff:cci_gas_15m/handoff.yaml#execution.cost_note
+      verified_on: 2026-08-29
+      note: Same Rs 10/crore as the NSE segments, which is at least consistent.
+    stamp_duty:
+      rate: 0.00002         # 0.002%, buy side
+      side: buy
+      source: backtest-handoff:cci_gas_15m/handoff.yaml#execution.cost_note
+      verified_on: 2026-08-29
+      note: NOT independently verified.
+    gst_rate: 0.18
+    gst_source: backtest-handoff:cci_gas_15m/handoff.yaml#execution.cost_note
+    gst_verified_on: 2026-08-29

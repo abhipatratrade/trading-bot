@@ -2053,7 +2053,10 @@ sides after any exit.
 
 `scripts/cci_gas_parity.py` replays the backtest's own 10,901 bars through that
 exact module. **125 of 125 trades reproduced — 100.0%, zero missing, zero extra,
-zero side/price/exit-reason mismatches.** The strongest parity result in this
+zero side/price/exit-reason mismatches.**
+
+**Count correction:** an earlier run in this session reported 961; the reproducible collected total is **956** (verified by diffing collected test ids against HEAD — identical sets, nothing dropped). The 961 in commit e41c0cb's message is wrong and cannot be edited; this is the correct figure.
+ The strongest parity result in this
 repo (swing-indian 208/214, intraday-indian 75/76).
 
 It got there by finding a real bug. The first port scored 122/125, and all three
