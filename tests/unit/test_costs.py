@@ -242,15 +242,46 @@ def test_repo_card_loads_and_ships_unsigned() -> None:
     assert {"nse_fno_futures", "nse_fno_options"} <= set(card.segments)
 
 
+# A source must be TRACEABLE, not merely non-empty. Two forms qualify: a URL,
+# or an explicit pointer into a backtest handoff (Decision 037's MCX rates come
+# from the handoff's own cost note rather than a page I fetched). Free text is
+# not a source — "broker website" tells nobody which rate to re-check.
+_SOURCE_PREFIXES = ("http://", "https://", "backtest-handoff:")
+
+
+def _traceable(source: str) -> bool:
+    return source.startswith(_SOURCE_PREFIXES)
+
+
 def test_every_shipped_rate_carries_a_source_and_a_date() -> None:
     card = load_fee_card(DEFAULT_CARD_PATH)
     for name, seg in card.segments.items():
-        assert seg.brokerage.source.startswith("http"), name
+        assert _traceable(seg.brokerage.source), name
         for line_name in ("stt", "exchange_txn", "sebi", "stamp_duty"):
             line = getattr(seg, line_name)
-            assert line.source.startswith("http"), f"{name}.{line_name}"
+            assert _traceable(line.source), f"{name}.{line_name}"
             assert line.verified_on >= date(2026, 1, 1), f"{name}.{line_name}"
-        assert seg.gst_source.startswith("http"), name
+        assert _traceable(seg.gst_source), name
+
+
+def test_free_text_is_not_accepted_as_a_source() -> None:
+    """The field exists so a rate can be re-checked. "broker website" tells
+    nobody which page to open."""
+    assert not _traceable("broker website")
+    assert not _traceable("")
+    assert _traceable("https://dhan.co/pricing/")
+    assert _traceable("backtest-handoff:cci_gas_15m/handoff.yaml#execution")
+
+
+def test_the_mcx_segment_declares_its_weaker_provenance() -> None:
+    """MCX rates came from the handoff, not from a source I fetched and
+    cross-checked. That difference must be visible in the card itself."""
+    card = load_fee_card(DEFAULT_CARD_PATH)
+    mcx = card.segments["mcx_futures"]
+    assert mcx.stt.source.startswith("backtest-handoff:")
+    assert "not" in mcx.stt.note.lower() and "verif" in mcx.stt.note.lower()
+    # CTT is sell-side, exactly like STT — the mechanic this field models.
+    assert mcx.stt.side is ChargeSide.SELL
 
 
 def test_shipped_fno_sides_match_how_the_levies_actually_work() -> None:
