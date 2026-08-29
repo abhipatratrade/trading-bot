@@ -2055,7 +2055,7 @@ sides after any exit.
 exact module. **125 of 125 trades reproduced — 100.0%, zero missing, zero extra,
 zero side/price/exit-reason mismatches.**
 
-**Count correction:** an earlier run in this session reported 961; the reproducible collected total is **956** (verified by diffing collected test ids against HEAD — identical sets, nothing dropped). The 961 in commit e41c0cb's message is wrong and cannot be edited; this is the correct figure.
+**On the test count, and a correction to a correction.** This work was committed at **961 green**, which was right. A later run reported 956 and I recorded that as a correction — wrongly. The five tests were not lost to any change of mine: `397b49b`, a REVERT of the scanner blind-bin fix (`0609ef2`) authored from another session at 21:45 IST on 2026-08-29, deleted `tests/unit/test_scanner_blind_retry.py`, which held exactly five tests. Both figures were correct for their moment. The diff I used to 'verify' 956 compared two states that were both already past the revert, so it could only ever agree with itself.
  The strongest parity result in this
 repo (swing-indian 208/214, intraday-indian 75/76).
 
