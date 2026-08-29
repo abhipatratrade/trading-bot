@@ -1959,3 +1959,137 @@ as a session invariant (Decision 033), never left to a strategy to remember.
   unique, so the reconciler can match whatever the string turns out to be.
 - `NSE_FNO` as the order-side segment name comes from Dhan's API docs, not from
   the master. It is a module constant, so it is one edit if wrong.
+
+## 037 — MCX commodity venue, and the CCI gas strategy that arrived instead of an NSE one
+Date: 2026-08-29
+Status: **Venue support + strategy port built and at 100% parity. Nothing trades.
+No MCX bucket exists in buckets.yaml yet. The strategy has NOT cleared this
+repo's evidence bar and is not recommended for live money.**
+Extends: 036 (the derivative machinery this reuses)
+Related house rules: #1, #2, #7, #8
+
+Decision 036 built NSE F&O rails and Phase E waited on a backtest handoff. The
+handoff arrived (`Backtesting Engine/results/handoff/cci_gas_15m/`) and it is
+**MCX natural gas mini futures**, not NSE anything.
+
+The handoff itself was exemplary — it followed the schema, left blanks rather
+than inventing numbers, and opened with the three reasons it does not fit:
+wrong exchange, no out-of-sample fold, and a stop that cannot cover the risk.
+Recording those three here because they are the decision, not the footnote.
+
+### What the handoff says against itself
+
+1. **Wrong exchange.** MCX, not NSE: different segment (`M`), different
+   instrument codes (`FUTCOM`/`OPTFUT`), different tax (CTT, not STT),
+   different hours (09:00–23:30 IST). `buckets.yaml` has no MCX bucket.
+2. **No out-of-sample validation, and structurally so.** TradingView holds
+   ~12k intraday bars, so 15m gas history *starts* 2025-12-01 and the entire
+   sample is the backtest. The same configuration is **negative on 30m and 1H
+   over the same months, and negative in 3 of 4 years on 1H**. Its consistency
+   screen scores 66.7% across cells that are not independent, against a coin
+   flip's 50%.
+3. **The edge IS the unprotected exposure.** 81 of 125 trades are held across a
+   session close and net **+₹122,021**; the 44 intraday-only trades net
+   **−₹25,584**. MCX gas is shut 23:30–09:00 nightly and up to 81.8 hours over a
+   weekend, and an exchange-resident stop cannot fire while it is shut. Four
+   trades already gapped through it in-sample, and the series contains real
+   session gaps of +16.0% and −10.8% against a 4.5% stop.
+
+Point 3 is not an engineering problem. Adding a square-off removes the edge;
+keeping it means the stop is decorative on exactly the exposure that earns.
+
+**User decision, 2026-08-29:** build MCX venue support properly, ship the bucket
+disabled, and add a forward dry-run to accumulate the out-of-sample evidence
+that is the one thing missing. Nothing risks money; evidence accumulates.
+
+### The finding: the scrip master does not carry the contract multiplier
+
+On NSE, `LOT_SIZE` is both the order-quantity unit and the number of underlying
+units a lot controls — NIFTY reads 65, an order for one lot is quantity 65, and
+the notional is 65 × price. They coincide, so nothing ever had to tell them
+apart.
+
+**On MCX they do not.** `LOT_SIZE` reads **1** for every commodity contract —
+that is the order-quantity unit — while the units a lot actually controls (250
+mmBtu for Natural Gas Mini) appear **nowhere in the file**. Phase A's registry
+would have read 1 and computed a notional 250× too small, and every margin and
+Kelly figure derived from it would be wrong by the same factor.
+
+So `DerivativeContract` now carries `multiplier` beside `lot_size`: **order
+quantity is `lots × lot_size`; notional is `lots × multiplier × price`.** The
+runner threads them separately, and the sizer is given the multiplier. Identical
+on NSE, 250× apart on MCX.
+
+The multiplier table is cited (MCX's own product page refuses automated fetch;
+Zerodha's contract bulletin and broker spec pages corroborate) and **`MCX_VENUE`
+refuses to load a contract whose multiplier is unknown** rather than defaulting
+to `lot_size`, because on that venue the default is known-wrong. One
+cross-check reconciles against the authoritative file: the ₹0.10 tick those
+sources give matches the master's own `TICK_SIZE` of 10 paise.
+
+It also reconciles against the backtest. Loading NATGASMINI from the live master
+gives a notional of **₹42,975 at ₹171.9** — the figure `trades.json` uses, to
+the rupee, derived independently.
+
+### Taxonomy: `TradingType.COMMODITY`, not `Market.COMMODITY`
+
+Ten sites compare against `Market.INDIAN`, and a commodity bucket needs the
+INDIAN behaviour at seven of them — the Decision 027 sizing cap, the margin fit,
+ledger-based P&L. It is the same Dhan account, the same rupees, the same
+shared-account hazard. Adding `Market.COMMODITY` would mean rewriting those
+seven to `in (INDIAN, COMMODITY)`, which is the signal that the distinction was
+never a market difference.
+
+So the venue lives in a new `BucketConfig.exchange` field, and the bucket is
+`commodity-indian`. This makes `TradingType` hold a third kind of value — a
+holding period, an instrument class, and now a venue family — which is a wart,
+recorded rather than hidden.
+
+### The port, and what parity caught
+
+`src/shared/scanner/cci.py` is a pure CCI(20) state machine: two-stage
+arm/fire, 4.5% stop checked intrabar, ±250 signal exit, arms cleared on both
+sides after any exit.
+
+`scripts/cci_gas_parity.py` replays the backtest's own 10,901 bars through that
+exact module. **125 of 125 trades reproduced — 100.0%, zero missing, zero extra,
+zero side/price/exit-reason mismatches.** The strongest parity result in this
+repo (swing-indian 208/214, intraday-indian 75/76).
+
+It got there by finding a real bug. The first port scored 122/125, and all three
+misses were the same rule: **a stop-exit bar still arms.** The stop path
+returned before the arming test ran, so a bar where the stop fired *and* CCI had
+travelled beyond the arm level never registered the setup, and the entry one bar
+later never fired. Reading the rules would not have found it; replaying the
+trades did.
+
+### What parity cannot check
+
+Contract selection. Every row's `contract` and `expiry` are blank because the
+run used a continuous front-month series and TradingView publishes no historical
+roll dates. The handoff explains why it refused to back-fill them: authoritative
+MCX expiries exist only for Jul–Dec 2026 while the sample starts Dec-2025, and
+the six known dates follow no derivable rule. **A label that cannot be checked
+against the series it describes would tell the harness contract selection is
+verified when it is not.** That was the right call.
+
+So: entry/exit timing, prices and exit reasons validate. Which contract those
+prices belonged to does not, and cannot from this data.
+
+### Still to build
+
+- MCX session calendar (09:00–23:30 IST; `nse_session` hardcodes 15:30)
+- MCX cost card — CTT 0.01% sell-side, no STT, MCX exchange rate. The NSE card
+  will not reconcile against it and must not be applied to it
+- A roll / pre-expiry rule. The backtest has none — it never modelled expiry —
+  and MCX gas being cash-settled removes delivery risk but not expiry itself
+- The `commodity-indian` bucket, its configs, and a `bucket_state` migration
+- The forward dry-run
+
+### The standing caution
+
+None of the engineering above changes points 2 and 3. When the dry-run has
+accumulated forward evidence, the question to ask is whether the strategy is
+positive out-of-sample **and** whether its overnight gap exposure is acceptable
+at the size Kelly wants — which on the supplied μ/σ is 5 lots at ₹5L, a 23%
+drawdown on the in-sample path and ~7% of the bucket on a single 16% gap.

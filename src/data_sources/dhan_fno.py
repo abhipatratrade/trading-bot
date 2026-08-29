@@ -83,6 +83,10 @@ NSE_FNO = "NSE_FNO"
 # Segment code for derivatives in the master's own ``SEGMENT`` column.
 _DERIVATIVE_SEGMENT = "D"
 
+# Dhan's exchange-segment enum value for MCX commodity derivatives. Same
+# caveat as NSE_FNO: it comes from Dhan's API docs, not from the master.
+MCX_COMM = "MCX_COMM"
+
 # Only the columns actually consumed. Same discipline as the equity parse:
 # every extra column is ~10MB of Python strings across the full file.
 _FNO_COLUMNS = [
@@ -111,14 +115,96 @@ _CHUNK_ROWS = 25_000
 # merely on the 39 obscure stock futures that first surfaced this.
 _PAISE = Decimal("100")
 
-# Instrument codes in the master's ``INSTRUMENT`` column.
-_FUTURES = frozenset({"FUTIDX", "FUTSTK"})
-_OPTIONS = frozenset({"OPTIDX", "OPTSTK"})
+# Instrument codes in the master's ``INSTRUMENT`` column, per venue.
+_FUTURES = frozenset({"FUTIDX", "FUTSTK", "FUTCOM"})
+_OPTIONS = frozenset({"OPTIDX", "OPTSTK", "OPTFUT"})
 # Stock derivatives are PHYSICALLY SETTLED — an in-the-money contract carried
 # past expiry delivers shares at full contract value. Index derivatives are
 # cash settled. The distinction is enforced in Phase D; it is surfaced here
 # because it is a property of the instrument, not of a strategy.
+#
+# MCX commodities are NOT listed here and therefore default to "not physically
+# settled by instrument code" — which is the wrong default to rely on, because
+# several MCX contracts (the metals especially) ARE compulsory-delivery. The
+# real gate is the bucket's ``cash_settled_underlyings`` set, which is fail-safe
+# in the other direction: anything not explicitly named as cash-settled is
+# treated as delivery-risky by ``check_expiry_window``. Instrument code alone
+# must never be the thing that decides.
 _PHYSICALLY_SETTLED = frozenset({"FUTSTK", "OPTSTK"})
+
+
+# ── Contract multipliers ────────────────────────────────────────────────
+#
+# THE FIELD THE SCRIP MASTER DOES NOT CARRY, and the reason this table exists.
+#
+# On NSE, ``LOT_SIZE`` is both the order-quantity unit AND the number of
+# underlying units a lot controls — NIFTY reads 65, an order for one lot is
+# quantity 65, and the notional is 65 x price. The two coincide, so nothing
+# ever had to tell them apart.
+#
+# On MCX they do NOT. ``LOT_SIZE`` reads **1** for every commodity contract:
+# that is the order-quantity unit (you order quantity=1 for one lot), while the
+# units a lot actually controls — 250 mmBtu for Natural Gas Mini — appear
+# NOWHERE in the file. Sizing off ``LOT_SIZE`` there computes a notional 250x
+# too small, and every margin and Kelly figure derived from it is wrong by the
+# same factor.
+#
+# So the multiplier is carried here, cited, per underlying. An underlying with
+# no entry gets ``lot_size`` (the NSE-correct behaviour), which is safe for NSE
+# and WRONG for MCX — hence ``MCX_VENUE.require_multiplier``, which refuses to
+# load an MCX contract whose multiplier is unknown rather than silently sizing
+# it 250x small.
+#
+# Sources: MCX's own product page (mcxindia.com/products/energy/natural-gas)
+# refuses automated fetch, so these are from Zerodha's contract bulletin
+# ("Natural Gas Mini 250 mmBtu futures as underlying") corroborated by broker
+# contract-spec pages, all read 2026-08-29. CROSS-CHECK AVAILABLE: the tick
+# size these sources give (Rs 0.10) matches the master's own TICK_SIZE of 10
+# paise for NATGASMINI, so at least one number from the same specification
+# reconciles against the authoritative file.
+#
+# CONFIRM AGAINST A REAL CONTRACT NOTE before this sizes real money. A wrong
+# multiplier is not a rounding error; it is a 250x position.
+_MCX_MULTIPLIERS: dict[str, Decimal] = {
+    "NATGASMINI": Decimal("250"),    # 250 mmBtu
+    "NATURALGAS": Decimal("1250"),   # 1,250 mmBtu (the full-size contract)
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Venue:
+    """One exchange's shape in the scrip master.
+
+    Exists because the master is not uniform: the same columns mean different
+    things on NSE and MCX, and the difference is silent rather than an error.
+    """
+
+    exchange: str          # EXCH_ID
+    segment: str           # SEGMENT
+    order_segment: str     # Dhan's exchangeSegment enum value
+    multipliers: dict[str, Decimal]
+    # When True, an underlying with no multiplier entry is REFUSED rather than
+    # defaulted to lot_size. True for MCX, where the default is known-wrong.
+    require_multiplier: bool = False
+
+
+NSE_VENUE = Venue(
+    exchange="NSE",
+    segment=_DERIVATIVE_SEGMENT,
+    order_segment=NSE_FNO,
+    multipliers={},
+    require_multiplier=False,
+)
+
+MCX_VENUE = Venue(
+    exchange="MCX",
+    segment="M",
+    order_segment=MCX_COMM,
+    multipliers=_MCX_MULTIPLIERS,
+    require_multiplier=True,
+)
+
+VENUES = {"NSE": NSE_VENUE, "MCX": MCX_VENUE}
 
 # Sentinels the master uses in place of nulls on futures rows.
 _NO_OPTION_TYPE = "XX"
@@ -145,6 +231,19 @@ class DerivativeContract:
     freeze_qty: int
     strike: Decimal | None = None
     option_type: str | None = None  # "CE" | "PE"; None on futures
+    # Underlying units ONE LOT controls, for notional and margin arithmetic.
+    # Equal to ``lot_size`` on NSE, where the master's LOT_SIZE is both the
+    # order unit and the contract size. NOT equal on MCX, where LOT_SIZE is 1
+    # and the real figure (250 mmBtu for NATGASMINI) is absent from the file —
+    # see ``_MCX_MULTIPLIERS``.
+    #
+    # The distinction is the whole reason this field exists: ORDER QUANTITY is
+    # ``lots x lot_size``, while NOTIONAL is ``lots x multiplier x price``.
+    multiplier: Decimal = Decimal("0")  # 0 ⇒ fall back to lot_size
+
+    def __post_init__(self) -> None:
+        if self.multiplier <= 0:
+            object.__setattr__(self, "multiplier", Decimal(self.lot_size))
 
     @property
     def is_option(self) -> bool:
@@ -191,6 +290,7 @@ class DerivativeContract:
             "lot_size": self.lot_size,
             "tick_size": str(self.tick_size),
             "freeze_qty": self.freeze_qty,
+            "multiplier": str(self.multiplier),
             "strike": str(self.strike) if self.strike is not None else None,
             "option_type": self.option_type,
         }
@@ -208,6 +308,7 @@ class DerivativeContract:
             lot_size=int(raw["lot_size"]),
             tick_size=Decimal(raw["tick_size"]),
             freeze_qty=int(raw["freeze_qty"]),
+            multiplier=Decimal(raw.get("multiplier") or 0),
             strike=Decimal(strike) if strike is not None else None,
             option_type=raw.get("option_type"),
         )
@@ -238,6 +339,7 @@ class FnoRegistry:
         self._underlyings = frozenset(underlyings) if underlyings else None
         self._max_expiries = max_expiries_per_underlying
         self._exchange = exchange
+        self._venue = VENUES.get(exchange, NSE_VENUE)
         self._cache_path = cache_path or _scoped_cache_path(
             self._underlyings, self._max_expiries, exchange
         )
@@ -348,8 +450,8 @@ class FnoRegistry:
         )
         for chunk in reader:
             rows = chunk[
-                (chunk["SEGMENT"] == _DERIVATIVE_SEGMENT)
-                & (chunk["EXCH_ID"] == self._exchange)
+                (chunk["SEGMENT"] == self._venue.segment)
+                & (chunk["EXCH_ID"] == self._venue.exchange)
             ]
             if self._underlyings is not None:
                 rows = rows[rows["UNDERLYING_SYMBOL"].isin(self._underlyings)]
@@ -376,6 +478,7 @@ class FnoRegistry:
         a sudden jump is visible.
         """
         skipped = 0
+        unknown_multipliers: set[str] = set()
         for r in rows.itertuples(index=False):
             try:
                 expiry = date.fromisoformat(str(r.SM_EXPIRY_DATE).strip()[:10])
@@ -413,12 +516,24 @@ class FnoRegistry:
                     continue
                 freeze = int(Decimal(str(r.SM_FREEZE_QTY or 0)))
 
+                venue = self._venue
+                multiplier = venue.multipliers.get(underlying)
+                if multiplier is None:
+                    if venue.require_multiplier:
+                        # REFUSE rather than default. On MCX the default is
+                        # known-wrong by the contract size (250x for gas), and
+                        # a silently 250x-small notional would size a position
+                        # 250x too large once margin is fitted to it.
+                        unknown_multipliers.add(underlying)
+                        continue
+                    multiplier = Decimal(lot_size)
+
                 yield DerivativeContract(
                     symbol=contract_symbol(
                         underlying, expiry, strike=strike, option_type=option_type
                     ),
                     security_id=str(r.SECURITY_ID).strip(),
-                    exchange_segment=NSE_FNO,
+                    exchange_segment=venue.order_segment,
                     underlying=underlying,
                     instrument=instrument,
                     expiry=expiry,
@@ -427,11 +542,21 @@ class FnoRegistry:
                     freeze_qty=max(freeze, 0),
                     strike=strike,
                     option_type=option_type,
+                    multiplier=multiplier,
                 )
             except (ArithmeticError, TypeError, ValueError):
                 skipped += 1
         if skipped:
             _log.warning("fno_rows_skipped", count=skipped)
+        if unknown_multipliers:
+            # ERROR, not warning: on a venue where the multiplier is required,
+            # every contract of that underlying is unusable, and a quiet skip
+            # would look exactly like "that commodity is not listed".
+            _log.error(
+                "contract_multiplier_unknown_underlying_refused",
+                exchange=self._venue.exchange,
+                underlyings=sorted(unknown_multipliers),
+            )
 
     # ── lookup ──────────────────────────────────────────────────────────
     def get(self, symbol: str) -> DerivativeContract | None:

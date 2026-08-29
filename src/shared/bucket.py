@@ -60,6 +60,17 @@ class TradingType(StrEnum):
     # strategy_master rows and named scanner sets (Decision 026).
     FUTURES = "futures"
     OPTIONS = "options"
+    # MCX commodity futures. A THIRD kind of value in this enum — after a
+    # holding period and an instrument class, now a venue family — and it is
+    # here rather than on ``Market`` for a measured reason: ten sites compare
+    # against ``Market.INDIAN``, and a commodity bucket needs the INDIAN
+    # behaviour at seven of them (the Decision 027 sizing cap, the margin fit,
+    # ledger-based P&L — it is the same Dhan account, the same rupees, the same
+    # shared-account hazard). Adding ``Market.COMMODITY`` would mean rewriting
+    # those seven to ``in (INDIAN, COMMODITY)``, which is the signal that the
+    # distinction was never a market difference. The venue lives in
+    # ``BucketConfig.exchange`` instead, where it is one field to read.
+    COMMODITY = "commodity"
 
 
 class Market(StrEnum):
@@ -78,6 +89,14 @@ class BucketConfig(BaseModel):
     # buckets each get their own Delta India sub-account so positions,
     # leverage, and margin are isolated. ``default`` reuses the original keys.
     account_ref: str = "default"
+    # Which EXCHANGE within the market. NSE for every equity bucket; MCX for a
+    # commodity one. Read by the contract registry (different segment code and
+    # instrument classes), the cost card (MCX charges CTT, not STT) and the
+    # session calendar (MCX trades to 23:30 IST, NSE to 15:30).
+    #
+    # Not derivable from ``market``: both are Indian, both are Dhan, both are
+    # INR. It is genuinely a second axis and is carried as one.
+    exchange: str = "NSE"
     # Decision 022 — broker-side protective stop distance as a percent of
     # entry price. Every open position gets an exchange-resident reduce-only
     # stop-market order at this distance, so a max loss holds even when the

@@ -145,7 +145,15 @@ class ExecutionPlan:
     symbols: list[str]
     exec_symbols: dict[str, str]
     exec_prices: dict[str, Decimal]
+    # ORDER QUANTITY per lot — what goes in the order's quantity field.
     lot_sizes: dict[str, Decimal]
+    # UNDERLYING UNITS per lot — what notional and margin are computed on.
+    #
+    # Equal to lot_size on NSE and NOT equal on MCX, where the master reports
+    # LOT_SIZE 1 while a Natural Gas Mini lot controls 250 mmBtu. Conflating
+    # them sizes an MCX position 250x wrong, so the two are carried separately
+    # even though every NSE bucket has them identical.
+    multipliers: dict[str, Decimal]
     contract_hints: dict[str, dict[str, object]]
 
 
@@ -426,7 +434,11 @@ class BucketRunner:
             # counts LOTS and the existing ``size < 1`` guard downstream
             # becomes "less than one lot" for free. Keyed by UNDERLYING
             # because that is what the sizer iterates.
-            live_contract_sizes: dict[str, Decimal] = dict(plan.lot_sizes)
+            # The sizer divides a target notional by ``price x contract_size``
+            # to count LOTS, so the value it needs is the MULTIPLIER (underlying
+            # units per lot), not the order-quantity unit. Identical on NSE;
+            # 250x apart on MCX gas.
+            live_contract_sizes: dict[str, Decimal] = dict(plan.multipliers)
             for sym in symbols:
                 if sym in live_contract_sizes:
                     continue
@@ -471,8 +483,9 @@ class BucketRunner:
                     exec_symbol = plan.exec_symbols.get(sym, sym)
                     exec_price = plan.exec_prices.get(sym)
                     lot_size = plan.lot_sizes.get(sym, Decimal("1"))
-                    # The sizer counted LOTS (contract_size = lot); the venue
-                    # counts units.
+                    # The sizer counted LOTS; the venue's order field counts
+                    # ORDER UNITS, which is lots x lot_size (and lot_size is 1
+                    # on MCX, where one lot IS one unit of order quantity).
                     size = res.contracts * lot_size
                     size = self._fit_to_margin(
                         broker=broker,
@@ -831,6 +844,7 @@ class BucketRunner:
                 exec_symbols={},
                 exec_prices=spot_prices,
                 lot_sizes={},
+                multipliers={},
                 contract_hints={},
             )
 
@@ -841,7 +855,7 @@ class BucketRunner:
                 bucket_id=self.bucket.id,
                 scanner=scanner,
             )
-            return ExecutionPlan([], {}, {}, {}, {})
+            return ExecutionPlan([], {}, {}, {}, {}, {})
 
         selector = ContractSelector(registry, config)
         today = self._clock.now().date()
@@ -849,6 +863,7 @@ class BucketRunner:
         exec_symbols: dict[str, str] = {}
         exec_prices: dict[str, Decimal] = {}
         lot_sizes: dict[str, Decimal] = {}
+        multipliers: dict[str, Decimal] = {}
         hints: dict[str, dict[str, object]] = {}
 
         for sym in symbols:
@@ -885,9 +900,14 @@ class BucketRunner:
             exec_symbols[sym] = contract.symbol
             exec_prices[sym] = premium
             lot_sizes[sym] = Decimal(contract.lot_size)
+            multipliers[sym] = Decimal(
+                getattr(contract, "multiplier", 0) or contract.lot_size
+            )
             hints[sym] = contract_hint(contract)
 
-        return ExecutionPlan(kept, exec_symbols, exec_prices, lot_sizes, hints)
+        return ExecutionPlan(
+            kept, exec_symbols, exec_prices, lot_sizes, multipliers, hints
+        )
 
     def _contract_price(self, symbol: str) -> Decimal | None:
         """Last traded price of one contract, or None.
