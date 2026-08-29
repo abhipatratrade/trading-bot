@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from src.shared.allocator.sizer import dedup_window_hours_for_tf
@@ -54,3 +56,37 @@ def test_dedup_key_collapses_every_strike_of_one_underlying() -> None:
     assert keys == {"NIFTY", "SBIN"}
     # A fresh NIFTY signal from the scanner is correctly gated out.
     assert "NIFTY" in keys
+
+
+# ── Lot quantisation (Decision 036, Phase C) ────────────────────────────
+def test_lot_quantisation_floors_onto_the_grid() -> None:
+    """NSE refuses an order for 70 NIFTY units; the lot is 65."""
+    from src.shared.allocator.sizer import quantize_to_lots
+
+    assert quantize_to_lots(Decimal("70"), Decimal("65")) == Decimal("65")
+    assert quantize_to_lots(Decimal("130"), Decimal("65")) == Decimal("130")
+    assert quantize_to_lots(Decimal("194"), Decimal("65")) == Decimal("130")
+
+
+def test_lot_quantisation_never_rounds_up() -> None:
+    """One NIFTY lot is ~Rs 15.8L of notional against a Rs 5L bucket, so
+    "round up to the minimum" would place an order three times the size the
+    allocator approved. Below one lot the answer is zero."""
+    from src.shared.allocator.sizer import quantize_to_lots
+
+    assert quantize_to_lots(Decimal("64"), Decimal("65")) == Decimal("0")
+    assert quantize_to_lots(Decimal("1"), Decimal("65")) == Decimal("0")
+
+
+def test_lot_quantisation_is_the_identity_for_cash_equity() -> None:
+    """lot_size 1 must pass through floored, so callers need no branch."""
+    from src.shared.allocator.sizer import quantize_to_lots
+
+    assert quantize_to_lots(Decimal("37.9"), Decimal("1")) == Decimal("37")
+
+
+def test_lot_quantisation_rejects_nonsense_inputs() -> None:
+    from src.shared.allocator.sizer import quantize_to_lots
+
+    assert quantize_to_lots(Decimal("-5"), Decimal("65")) == Decimal("0")
+    assert quantize_to_lots(Decimal("100"), Decimal("0")) == Decimal("0")

@@ -629,17 +629,48 @@ size) and onto the order. It is inseparable from lot quantisation, and a runner
 that selected a contract but still sized in shares would be worse than one that
 does neither.
 
-### C — Lots, margin, cost
-Gate: margin preflight answers correctly against a live account (today unexercised).
+### C — Lots, margin, cost — BUILT 2026-08-29, gate NOT yet cleared
+Gate: margin preflight answers correctly against a live account. **Still
+unexercised** — no Dhan account has ever answered `/v2/margincalculator`, so
+this stays open until the first sandbox soak. Everything else in the phase is
+built and green.
 
-- [ ] Whole-lot quantisation; under one lot → `SKIPPED_INSUFFICIENT`, never
-      rounded up
-- [ ] `required_margin()` mandatory — no margin answer means no order, because
-      unlike cash equity there is no 1× fallback in F&O
-- [ ] Pre-trade cost rate card with `source:` + `verified_on:` per line —
-      **user sign-off required before any estimate uses it**
-- [ ] Reconciler compares estimate vs `get_order_charges()` actuals and alerts
-      on drift, so a stale card announces itself
+- [x] `quantize_to_lots()` — floors onto the venue's lot grid and **never
+      rounds up**: one NIFTY lot is ~₹15.8L of notional against a ₹5L bucket,
+      so rounding up would place an order 3× the size the allocator approved.
+      Applied AFTER `_fit_to_margin`, because a margin-scaled quantity lands
+      off the grid nearly every time
+- [x] Sizer counts LOTS for a derivative (contract_size = lot), so the existing
+      `size < 1` guard becomes "less than one lot" with no new branch
+- [x] `required_margin()` MANDATORY for a derivative — no answer means no
+      order. Cash equity keeps its 1× fallback; F&O has no 1× at all, because
+      SPAN margin is the exchange's risk model, not a leverage multiple
+- [x] The execution symbol now flows end to end (deferred from Phase B):
+      `ExecutionPlan` carries contract, premium and lot keyed by UNDERLYING, so
+      the scanner, regime and dedup keep seeing the underlying while the order
+      goes to the contract. Pass-through for every non-F&O bucket
+- [x] `Trade.extra["product"]` now recorded — its absence made cost
+      attribution a guess exactly where the Decision 031 CNC fallback fires
+- [x] `fee_rates.yaml` — every line carries `source` + `verified_on`, and
+      `estimate_charges` REFUSES to run against an unsigned card rather than
+      returning a zero (a silent zero reads as "this trade is free")
+- [x] `scripts/fee_card_reconcile.py` — replays the card against REAL billed
+      charges already in the ledger, so sign-off rests on evidence
+- [ ] **AWAITING USER SIGN-OFF** — and the reconciliation found something.
+      Four of six lines reconcile to ~0% (brokerage, exchange txn, SEBI, GST).
+      STT does NOT: two buy legs were billed ₹12 on ~₹50k (~0.024%), matching
+      neither the intraday rate (0.025% sell-only) nor delivery (0.1% both
+      sides), while a clean same-day round trip was billed ₹0 exactly as
+      predicted. Unexplained from the sources; not invented. Details in the
+      card's header
+- [ ] Automated drift alert in the reconciler — DEFERRED on purpose. Wiring an
+      alert that is both inert (unsigned card) and unvalidated (STT unexplained)
+      would be worse than none. It lands with sign-off
+
+**Known gap:** a contract-selection miss is logged, not filed as a sizing
+snapshot, so it will not appear in the EOD report's "signals seen but not
+taken". `SizingDecision` is a Postgres enum and a new value needs a migration;
+folded into Phase E with the buckets and their reporting.
 
 ### D — Risk: short premium and expiry
 Gate: every item here holds before any order path opens.
@@ -673,6 +704,8 @@ Gate: **the user's backtest handoff.** Both buckets ship `enabled: false` until 
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-08-29 (cont.) — **Decision 036 Phase C**: lots, margin, cost. Still nothing trades. (1) LOT QUANTISATION never rounds UP — one NIFTY lot is ~Rs 15.8L of notional against a Rs 5L bucket, so "round up to the minimum" would place an order 3x the size the allocator approved; below one lot the answer is zero and the runner skips. Applied AFTER _fit_to_margin because a margin-scaled quantity lands off the grid nearly every time. The sizer counts LOTS (contract_size = lot), so the pre-existing `size < 1` guard becomes "less than one lot" for free. (2) MARGIN PREFLIGHT IS NOW MANDATORY FOR A DERIVATIVE: no answer means no order. Cash equity keeps its 1x fallback because margin there IS a leverage multiple of notional; F&O has no 1x at all — SPAN is the exchange's risk model against the underlying's notional, and sizing off a leverage guess would put in an order the venue prices at multiples of the budget, with no bounded loss behind the mistake on a short option. (3) The execution symbol now flows END TO END (deferred from B): `ExecutionPlan` keys contract, premium and lot by UNDERLYING, so scanner/regime/dedup keep seeing the underlying while the order goes to the contract; pass-through for every non-F&O bucket, so there is no second code path. (4) FEE RATE CARD, and this is the part that earned its keep. Every line carries `source` + `verified_on`; `estimate_charges` REFUSES an unsigned card rather than returning zero (a silent zero reads downstream as "this trade is free"). Rates fetched from Dhan/Zerodha/Angel One and CROSS-CHECKED: F&O STT moved on 1 April 2026 (futures 0.02->0.05%, options 0.10->0.15% on premium, sell side), and the two sources DISAGREE on futures stamp duty (0.002% vs 0.0001%) — recorded in the line's note rather than smoothed over. THEN reconciled the card against real billed Dhan charges: 4 of 6 lines land at ~0% drift, but STT does NOT. Two buy legs were billed Rs 12 on ~Rs 50k (~0.024%), matching neither intraday (0.025% sell-only) nor delivery (0.1% both sides), while the one clean same-day round trip was billed Rs 0 exactly as predicted. I could not explain it from the sources and did not invent an explanation — the card ships UNSIGNED with the finding in its header. Also found: the entire SELL side is unvalidated (all three billed orders were buys) and stamp-duty actuals look rounded to whole rupees. (5) `Trade.extra["product"]` is now recorded, because its absence made cost attribution a guess exactly where the Decision 031 CNC fallback fires. 19 new tests, 912 green, ruff clean. GATE NOT CLEARED: `required_margin()` still has never run against a live account.
 
 - 2026-08-29 — **Decision 036 Phase B**: the spot→derivative seam. Still nothing trades. Three pieces. (1) `src/shared/contracts.py` — the contract symbol grammar in ONE dependency-free place, because a grammar duplicated across the registry, the sizer, the reconciler and the backtester is one that will disagree in three of them. THE TEST THAT EARNS ITS KEEP: `underlying_of("NAM-INDIA")` must return `NAM-INDIA`, and the obvious implementation — `symbol.split("-")[0]` — returns `NAM`, silently breaking the dedup gate for a name swing-indian trades with real money today. The regex anchors on the 8-digit expiry and matches the underlying greedily instead. (2) `ContractSelector` + a `contracts.yaml` block: ATM / OTM% / ITM% / OTM-steps strikes, nearest / weekly / monthly expiries, min+max DTE, all resolved off the registry and a spot price with NO new API call. The `delta` rule is REFUSED at config load rather than quietly downgraded to ATM — nothing here fetches greeks, and a 0.30-delta strangle sized as ATM is a different trade with a different loss profile. Weekly falls back to monthly where none list, which matters because NSE now lists weeklies for NIFTY ONLY: without the fallback a weekly-configured strategy trades nothing on 232 of 233 underlyings, silently. Tie-breaks are total (nearest strike ties LOW, chain re-sorted rather than trusted) and an off-ladder OTM-steps request is a MISS, never a clamp to the last listed strike. (3) DEDUP NOW KEYS ON THE UNDERLYING, live for every bucket — identity for cash and crypto, collapsing for F&O. Without it the ledger holds contract symbols while the scanner offers underlyings, the gate never matches, and a strategy already short one NIFTY strike opens a second: two strikes on one index are ONE bet with two spellings, and the per_symbol_cap would believe it had capped exposure it had doubled. Extracted as `dedup_keys()` so it is testable — nothing in the suite calls `size_positions`, by design, and an untested inline set-build is exactly where this regresses. The audit script now drives the selector off the REAL catalogue and checks determinism plus a mint→lookup→underlying round trip; **AUDIT PASSED 2026-08-29** across all 5 index underlyings and 3 rule sets. 55 new tests, 893 green, ruff clean. DEFERRED TO C on purpose: threading the execution symbol through the runner and onto the order — inseparable from lot quantisation, and a runner that picks a contract but sizes in shares is worse than one that does neither.
 

@@ -224,6 +224,33 @@ def notional_inr_to_contracts(
     )
 
 
+def quantize_to_lots(units: Decimal, lot_size: Decimal) -> Decimal:
+    """Floor a raw quantity onto the venue's lot grid (Decision 036, Phase C).
+
+    NSE derivatives trade in whole lots and nothing else — an order for 70
+    NIFTY units is refused, because the lot is 65. This exists as a separate
+    step from ``notional_inr_to_contracts`` because a size can shrink AFTER it
+    was first computed: ``BucketRunner._fit_to_margin`` scales an order down to
+    the margin the venue actually grants, and a scaled quantity lands off the
+    grid nearly every time.
+
+    **It never rounds UP.** Below one lot the answer is zero, not one lot: one
+    NIFTY lot is roughly ₹15.8 lakh of notional against a ₹5L bucket, so
+    "round up to the minimum" would silently place an order three times the
+    size the allocator approved. Skipping is the only safe direction, and the
+    runner turns a zero into ``SKIPPED_INSUFFICIENT``.
+
+    ``lot_size <= 1`` is the cash-equity identity case and passes through
+    floored, so callers need no branch.
+    """
+    if units <= 0 or lot_size <= 0:
+        return Decimal("0")
+    if lot_size <= 1:
+        return units.to_integral_value(rounding=ROUND_DOWN)
+    lots = (units / lot_size).to_integral_value(rounding=ROUND_DOWN)
+    return lots * lot_size
+
+
 def sizing_equity(
     *,
     market: Market,

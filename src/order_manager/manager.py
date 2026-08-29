@@ -175,6 +175,20 @@ class OrderManager:
         # the sizer allotted (read by the MTF carry-interest charge). Never
         # secrets; this row is dashboard-visible.
         extra: dict[str, Any] = dict(extra_payload or {})
+        # Decision 036 — WHICH PRODUCT this order was sent as. Not recorded
+        # before, and its absence is a real hole rather than a nicety: charges
+        # differ per product (delivery STT is 0.1% both sides, intraday 0.025%
+        # sell-only, F&O different again), so without it the fee-card drift
+        # check has to GUESS a trade's segment from its bucket. That guess is
+        # wrong precisely when the Decision 031 CNC fallback fires — a bucket
+        # configured INTRADAY whose order actually went as CNC — which is the
+        # case a cost check most needs to get right.
+        #
+        # Records what was ASKED for. An adapter-side fallback can still change
+        # it at the venue, which the reconciler sees in the charges themselves;
+        # the point is to stop guessing the starting point too.
+        if product:
+            extra["product"] = product
         if reduce_only:
             extra["reduce_only"] = True
         if attached_stop_price is not None:

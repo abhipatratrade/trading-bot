@@ -63,10 +63,19 @@ from src.shared.allocator.sizer import (
     AllocatorConfig,
     dedup_window_hours_for_tf,
     load_allocator_config,
+    quantize_to_lots,
     size_positions,
 )
 from src.shared.base_strategy import Strategy
 from src.shared.bucket import Bucket, Market
+from src.shared.contract_selection import (
+    ContractSelectionConfig,
+    ContractSelector,
+    Selection,
+    contract_hint,
+    load_contract_selection,
+)
+from src.shared.contracts import is_derivative
 from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
@@ -122,6 +131,24 @@ class RunSummary:
     exited: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionPlan:
+    """What each candidate underlying actually trades (Decision 036, Phase C).
+
+    Every mapping is keyed by the UNDERLYING, because that is what the scanner
+    produced, what the regime model labelled, and what the sizer dedups on. The
+    values carry the CONTRACT. For a bucket with no ``contracts.yaml`` the two
+    are the same symbol and this is a pass-through, which is why the runner has
+    no F&O branch in its hot loop.
+    """
+
+    symbols: list[str]
+    exec_symbols: dict[str, str]
+    exec_prices: dict[str, Decimal]
+    lot_sizes: dict[str, Decimal]
+    contract_hints: dict[str, dict[str, object]]
+
+
 class BucketRunner:
     """One pipeline per bucket. Configs loaded eagerly on construction."""
 
@@ -159,6 +186,18 @@ class BucketRunner:
         }
         self.allocator_configs: dict[str, AllocatorConfig] = {
             name: load_allocator_config(bucket.allocator_yaml_path_for(name))
+            for name in scanner_names
+        }
+        # Decision 036 — how a signal on an underlying becomes one contract.
+        # OPTIONAL: absent for every cash-equity and crypto bucket, which trade
+        # the symbol the scanner produced. Loaded eagerly like everything else
+        # so a malformed rule fails the boot rather than the tick.
+        self.contract_configs: dict[str, ContractSelectionConfig | None] = {
+            name: (
+                load_contract_selection(bucket.contracts_yaml_path_for(name))
+                if bucket.contracts_yaml_path_for(name).is_file()
+                else None
+            )
             for name in scanner_names
         }
         # Default-pair aliases kept for external readers (run_bot fx map,
@@ -361,12 +400,36 @@ class BucketRunner:
                 )
                 regimes[sym] = pred.regime if pred else None
 
+            # Decision 036 — the signal and the instrument stop being the
+            # same thing. For a bucket with a contracts.yaml, each underlying
+            # resolves to one contract here; ``exec_*`` then carries the
+            # CONTRACT while ``symbols`` and ``mark_prices`` keep carrying the
+            # UNDERLYING, which is what the sizer's dedup and the regime model
+            # reason about. For every other bucket these are the same objects,
+            # so there is no second code path to keep in step.
+            plan = self._resolve_contracts(
+                scanner=row.scanner,
+                symbols=symbols,
+                sides=sides,
+                spot_prices=mark_prices,
+            )
+            symbols = plan.symbols
+            if not symbols:
+                continue
+
             # Live contract sizes from the broker's product catalogue
             # (None ⇒ symbol unknown, YAML table applies). FX stays the
             # fixed allocator.yaml rate — user decision 2026-07-07:
             # 1 USD = 85 INR for Delta India, no live feed.
-            live_contract_sizes: dict[str, Decimal] = {}
+            #
+            # For a derivative the lot IS the contract size, so the sizer
+            # counts LOTS and the existing ``size < 1`` guard downstream
+            # becomes "less than one lot" for free. Keyed by UNDERLYING
+            # because that is what the sizer iterates.
+            live_contract_sizes: dict[str, Decimal] = dict(plan.lot_sizes)
             for sym in symbols:
+                if sym in live_contract_sizes:
+                    continue
                 cs = broker.contract_size(sym, default=None)
                 if cs is not None:
                     live_contract_sizes[sym] = cs
@@ -375,7 +438,10 @@ class BucketRunner:
                 bucket=self.bucket,
                 strategy_name=strat_name,
                 candidates=symbols,
-                mark_prices_inr=mark_prices,
+                # The price the position is actually taken at — a contract's
+                # premium for F&O, the spot for everything else. Keyed by
+                # underlying so the sizer's dedup keeps working unchanged.
+                mark_prices_inr=plan.exec_prices,
                 regimes=regimes,
                 # Decision 026: the strategy's scanner set carries its own
                 # allocation logic (μ/σ, Kelly fraction, caps, regime
@@ -400,19 +466,34 @@ class BucketRunner:
             for sym, res in results.items():
                 if res.decision == SizingDecision.PLACED:
                     committed_margin += res.required_margin_inr
+                    # The symbol the ORDER goes to. Same as ``sym`` for every
+                    # bucket without a contracts.yaml.
+                    exec_symbol = plan.exec_symbols.get(sym, sym)
+                    exec_price = plan.exec_prices.get(sym)
+                    lot_size = plan.lot_sizes.get(sym, Decimal("1"))
+                    # The sizer counted LOTS (contract_size = lot); the venue
+                    # counts units.
+                    size = res.contracts * lot_size
                     size = self._fit_to_margin(
                         broker=broker,
-                        symbol=sym,
+                        symbol=exec_symbol,
                         side=sides.get(sym, "buy"),
-                        size=res.contracts,
-                        price=mark_prices.get(sym),
+                        size=size,
+                        price=exec_price,
                         margin_budget=res.required_margin_inr,
                     )
+                    # Re-quantise: _fit_to_margin scales to the margin actually
+                    # granted, and a scaled quantity lands off the lot grid
+                    # nearly every time. Never rounds UP — one NIFTY lot is
+                    # ~Rs 15.8L of notional against a Rs 5L bucket.
+                    size = quantize_to_lots(size, lot_size)
                     if size < 1:
                         _log.warning(
                             "open_skipped_margin_unaffordable",
                             bucket_id=self.bucket.id,
-                            symbol=sym,
+                            symbol=exec_symbol,
+                            underlying=sym,
+                            lot_size=str(lot_size),
                             margin_budget=str(res.required_margin_inr),
                         )
                         continue
@@ -420,22 +501,28 @@ class BucketRunner:
                         broker=broker,
                         om=order_manager,
                         strat_name=strat_name,
-                        symbol=sym,
+                        symbol=exec_symbol,
                         side=sides.get(sym, "buy"),
                         size=size,
                         fallback_max_size=self._one_x_size(
-                            price=mark_prices.get(sym),
+                            price=exec_price,
                             margin_budget=res.required_margin_inr,
+                            lot_size=lot_size,
                         ),
                         extra_payload=_entry_extra(
                             hint=hints.get(sym, {}),
                             margin_inr=res.required_margin_inr,
-                            decision_price=mark_prices.get(sym),
+                            decision_price=exec_price,
+                            # Which contract, and the spot that chose it —
+                            # without both, "why that strike?" is unanswerable
+                            # after the fact.
+                            contract=plan.contract_hints.get(sym),
+                            underlying_price=mark_prices.get(sym),
                         ),
                         # Decision 034: the same two numbers the sweep would
                         # have used AFTER the fill, supplied BEFORE it so the
                         # stop can ride on the entry order itself.
-                        mark_price=mark_prices.get(sym),
+                        mark_price=exec_price,
                         stop_distance=_hint_decimal(
                             hints.get(sym, {}), "stop_distance"
                         ),
@@ -715,6 +802,112 @@ class BucketRunner:
                 out[s] = price
         return out
 
+    def _resolve_contracts(
+        self,
+        *,
+        scanner: str,
+        symbols: list[str],
+        sides: dict[str, str],
+        spot_prices: dict[str, Decimal],
+    ) -> ExecutionPlan:
+        """Map each candidate underlying onto the contract it will trade.
+
+        Pass-through when the bucket declares no contract selection — the
+        overwhelming majority of buckets — so this costs one dict lookup on the
+        cash path and nothing else.
+
+        A candidate is DROPPED when no contract qualifies (no expiry in the DTE
+        window, no strike on the ladder) or when its premium cannot be fetched.
+        Dropping rather than passing it on with a missing price is deliberate:
+        the sizer's vocabulary for a missing price is "mark price unavailable",
+        which would file an instrument-availability fact under an execution
+        failure and mislead whoever reads it back.
+        """
+        config = self.contract_configs.get(scanner)
+        if config is None:
+            # No selection configured: the scanned symbol IS the traded symbol.
+            return ExecutionPlan(
+                symbols=symbols,
+                exec_symbols={},
+                exec_prices=spot_prices,
+                lot_sizes={},
+                contract_hints={},
+            )
+
+        registry = getattr(self._data, "fno", None)
+        if registry is None:
+            _log.error(
+                "contract_selection_no_registry",
+                bucket_id=self.bucket.id,
+                scanner=scanner,
+            )
+            return ExecutionPlan([], {}, {}, {}, {})
+
+        selector = ContractSelector(registry, config)
+        today = self._clock.now().date()
+        kept: list[str] = []
+        exec_symbols: dict[str, str] = {}
+        exec_prices: dict[str, Decimal] = {}
+        lot_sizes: dict[str, Decimal] = {}
+        hints: dict[str, dict[str, object]] = {}
+
+        for sym in symbols:
+            spot = spot_prices.get(sym)
+            if spot is None or spot <= 0:
+                _log.warning(
+                    "contract_selection_no_spot",
+                    bucket_id=self.bucket.id,
+                    underlying=sym,
+                )
+                continue
+            chosen: Selection = selector.select(
+                sym, spot=spot, side=sides.get(sym, "buy"), on=today
+            )
+            if not chosen.ok or chosen.contract is None:
+                _log.warning(
+                    "contract_selection_miss",
+                    bucket_id=self.bucket.id,
+                    underlying=sym,
+                    reason=chosen.reason,
+                )
+                continue
+            contract = chosen.contract
+            premium = self._contract_price(contract.symbol)
+            if premium is None or premium <= 0:
+                _log.warning(
+                    "contract_price_unavailable",
+                    bucket_id=self.bucket.id,
+                    underlying=sym,
+                    contract=contract.symbol,
+                )
+                continue
+            kept.append(sym)
+            exec_symbols[sym] = contract.symbol
+            exec_prices[sym] = premium
+            lot_sizes[sym] = Decimal(contract.lot_size)
+            hints[sym] = contract_hint(contract)
+
+        return ExecutionPlan(kept, exec_symbols, exec_prices, lot_sizes, hints)
+
+    def _contract_price(self, symbol: str) -> Decimal | None:
+        """Last traded price of one contract, or None.
+
+        Its own method so a venue hiccup on ONE contract drops ONE candidate
+        rather than the whole strategy's tick.
+        """
+        try:
+            ticker = self._data.get_ticker(symbol)
+        except Exception:
+            _log.warning(
+                "contract_ticker_failed",
+                bucket_id=self.bucket.id,
+                symbol=symbol,
+                exc_info=True,
+            )
+            return None
+        price = getattr(ticker, "last_price", None)
+        return price if price is not None and price > 0 else None
+
     def _fit_to_margin(
         self,
         *,
@@ -764,6 +957,29 @@ class BucketRunner:
         needed = broker.required_margin(
             symbol, side, size, price, product=self.bucket.config.product
         )
+        # Decision 036 — THERE IS NO 1x IN F&O.
+        #
+        # For cash equity the fallback below is sound: margin is a leverage
+        # multiple of notional, so 1x is a quantity we can always afford. A
+        # derivative's margin is SPAN + exposure, set by the exchange's risk
+        # model against the UNDERLYING's notional — one NIFTY lot is ~Rs 15.8L
+        # of exposure whose margin is ~Rs 1.9L, and no fraction of that is
+        # "unleveraged". Sizing a derivative off a leverage guess would put an
+        # order in that the venue prices at multiples of the budget, and on a
+        # short option there is no bounded loss behind the mistake.
+        #
+        # So: no margin answer means no order. This is what makes the preflight
+        # LOAD-BEARING rather than best-effort for these two buckets, and it is
+        # the reason Phase C's gate is "required_margin answers correctly
+        # against a live account" — a method never yet exercised on one.
+        if needed is None and is_derivative(symbol):
+            _log.error(
+                "derivative_margin_preflight_unavailable_order_refused",
+                bucket_id=self.bucket.id,
+                symbol=symbol,
+                wanted=str(size),
+            )
+            return Decimal("0")
         if needed is None:
             # Fall back to the scrip's own ceiling, capped by the bucket's.
             scrip_lev = None
@@ -804,7 +1020,11 @@ class BucketRunner:
         return scaled
 
     def _one_x_size(
-        self, *, price: Decimal | None, margin_budget: Decimal
+        self,
+        *,
+        price: Decimal | None,
+        margin_budget: Decimal,
+        lot_size: Decimal = Decimal("1"),
     ) -> Decimal | None:
         """Largest whole quantity affordable with NO leverage, or None.
 
@@ -822,7 +1042,11 @@ class BucketRunner:
             return None
         if price is None or price <= 0:
             return None
-        return (margin_budget / price).to_integral_value(rounding="ROUND_DOWN")
+        # Decision 036 — a derivative has no cash equivalent to fall back to.
+        # There is no CNC for a futures contract, so a "1x size" here would be
+        # a quantity for a product that does not exist. The lot grid still
+        # applies to whatever we do return.
+        return quantize_to_lots(margin_budget / price, lot_size)
 
     def _place_order(
         self,
@@ -1004,6 +1228,8 @@ def _entry_extra(
     hint: dict[str, object],
     margin_inr: Decimal,
     decision_price: Decimal | None = None,
+    contract: dict[str, object] | None = None,
+    underlying_price: Decimal | None = None,
 ) -> dict[str, object]:
     """Facts stamped on the entry Trade for downstream stages to read back.
 
@@ -1035,6 +1261,15 @@ def _entry_extra(
         out["signal_price"] = str(signal_price)
     if decision_price is not None:
         out["decision_price"] = str(decision_price)
+    # Decision 036 — which contract this signal resolved to, and the spot that
+    # chose it. Both are unrecoverable afterwards: the exchange knows neither
+    # the rule nor the spot we read, so without them a fill on
+    # NIFTY-20260908-23150-CE cannot be traced back to the decision that
+    # produced it, and "why that strike?" has no answer.
+    if contract:
+        out.update(contract)
+    if underlying_price is not None:
+        out["underlying_price"] = str(underlying_price)
     return out
 
 

@@ -1619,7 +1619,7 @@ happened. Do not build this until that observation exists.
 
 ## 036 — Two Indian F&O buckets: futures-indian and options-indian
 Date: 2026-08-28
-Status: **Phases A and B landed. Nothing trades — neither bucket exists in buckets.yaml yet, and no order path is wired.**
+Status: **Phases A, B and C built. Nothing trades — neither bucket exists in buckets.yaml yet. Phase C's gate is NOT cleared: the margin preflight has still never run against a live account, and the fee card is unsigned.**
 Amends: 013 (the bucket set, again — this makes eight), 022 (stop semantics for
 short premium), and CLAUDE.md's "Options: deferred until all futures/spot phases live"
 Related house rules: #1, #2, #7, #8
@@ -1779,15 +1779,80 @@ size) and onto the order. It is inseparable from lot quantisation, and a runner
 that selects a contract but still sizes in shares would be worse than one that
 does neither.
 
+### What Phase C built (landed 2026-08-29)
+
+**A lot is a minimum, not a rounding step.** `quantize_to_lots` floors onto the
+venue's grid and never rounds up. The asymmetry is the point: one NIFTY lot is
+~₹15.8 lakh of notional against a ₹5L bucket, so rounding a short size up to
+"the minimum tradeable" would place an order three times what the allocator
+approved. It runs AFTER `_fit_to_margin`, because a quantity scaled to the
+margin actually granted lands off the grid nearly every time. The sizer counts
+LOTS (contract_size = lot size), which makes the pre-existing `size < 1` guard
+mean "less than one lot" without a new branch.
+
+**The margin preflight is now mandatory for a derivative.** For cash equity,
+`required_margin()` returning None degrades to a 1× fallback, and that is
+sound: margin there is a leverage multiple of notional, so 1× is a quantity we
+can always afford. A derivative has no 1×. SPAN plus exposure is the exchange's
+risk model applied to the UNDERLYING's notional — one NIFTY lot is ~₹15.8L of
+exposure carrying ~₹1.9L of margin, and no fraction of that is "unleveraged".
+Sizing off a leverage guess would submit an order the venue prices at multiples
+of the budget, and on a short option there is no bounded loss behind the
+mistake. So no margin answer means no order, which is what makes Phase C's gate
+"the preflight answers correctly against a live account" — a method this repo
+has never once exercised on one.
+
+**The execution symbol flows end to end** (the piece deliberately deferred from
+Phase B). `ExecutionPlan` carries contract symbol, premium and lot size keyed by
+UNDERLYING, so the scanner, the regime model and the dedup gate keep seeing the
+underlying while the order goes to the contract. For a bucket with no
+`contracts.yaml` it is a pass-through of the same objects, so there is no second
+code path to keep in step.
+
+### The fee card, and what reconciling it found
+
+Rates were fetched and CROSS-CHECKED against two independent sources per F&O
+line, not recalled. Two things that would have been wrong from memory:
+
+- **F&O STT moved on 1 April 2026** (Budget 2026-27): futures 0.02% → 0.05%,
+  options 0.10% → 0.15% on premium, both sell-side. Anyone working from a
+  pre-April figure understates an option round trip by a third.
+- **The sources disagree on futures stamp duty** — 0.002% vs 0.0001%. Recorded
+  in that line's note rather than smoothed over, with the more authoritative
+  figure used and flagged as the first line to check.
+
+`estimate_charges` REFUSES to run against an unsigned card. Not a warning and
+not a zero: an estimate silently returning zero reads downstream as "this trade
+is free", which is worse than having no estimate.
+
+Then the card was replayed against charges Dhan has ALREADY billed —
+`scripts/fee_card_reconcile.py`. That is possible before either F&O bucket
+exists because the cash buckets have been trading this same account for months.
+**Four of six lines reconcile to ~0%: brokerage, exchange transaction, SEBI,
+GST. STT does not.** Two buy legs were billed ₹12 on ~₹50k turnover (~0.024%),
+which matches neither the intraday rate (0.025%, sell side only) nor delivery
+(0.1%, both sides), while the one clean same-day round trip in the sample was
+billed ₹0 exactly as the card predicts. I could not account for it from the
+cited sources and did not construct an explanation; the card ships unsigned with
+the finding in its own header.
+
+Two further limits worth stating plainly: every reconciled order was a BUY, so
+the sell-side STT lines — the largest cost in an F&O round trip — have never
+been checked against a real bill; and stamp-duty actuals arrive as whole rupees
+against fractional estimates, which looks like a rounding convention rather than
+a wrong rate.
+
+That reconciliation also exposed a hole worth fixing on its own account: the
+product an order was sent as was never recorded, so cost attribution had to be
+guessed from the bucket — and that guess is wrong precisely when the Decision
+031 CNC fallback fires, which is the case a cost check most needs to get right.
+`Trade.extra["product"]` now records it.
+
+**Deferred on purpose:** the automated drift alert inside the reconciler. An
+alert that is both inert (the card is unsigned) and unvalidated (STT is
+unexplained) would be worse than none. It lands with sign-off.
+
 ### Still to build, in dependency order
-- **Phase C — lots, margin, cost.** A lot is a hard MINIMUM, not a rounding
-  step: under one lot skips as `SKIPPED_INSUFFICIENT` and never rounds up.
-  `required_margin()` becomes mandatory rather than best-effort — in cash
-  equity it degrades to a 1× fallback, and in F&O *there is no 1×*, so no
-  margin answer must mean no order. Pre-trade cost estimates come from a rate
-  card carrying `source:` and `verified_on:` per line; `get_order_charges()`
-  actuals stay the booked truth, and the reconciler alerts on drift between
-  them so a stale card announces itself.
 - **Phase D — risk.** Dual stop, whichever fires first: an exchange-resident
   buy-to-close stop at N× entry premium (Decision 034 semantics), plus a
   bot-side underlying-level exit that normally fires earlier. The exchange leg

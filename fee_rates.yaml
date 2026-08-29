@@ -1,0 +1,272 @@
+# Pre-trade cost rate card — Dhan / NSE (Decision 036, Phase C).
+#
+# READ THIS BEFORE SIGNING.
+#
+# Nothing here is used until `signed_off: true`. `estimate_charges` REFUSES to
+# run against an unsigned card rather than returning a zero, because a silent
+# zero reads downstream as "this trade is free".
+#
+# These rates do NOT book anything. Actual charges come from Dhan's own trade
+# history via `DhanClient.get_order_charges` and remain the truth stamped on
+# `Trade.fees`. This card exists only to answer "what will this cost?" BEFORE
+# placing, and to let the reconciler notice when the two diverge.
+#
+# ── How to check it ────────────────────────────────────────────────────────
+# Every line carries its own `source` and `verified_on`, so you can verify one
+# rate without re-verifying all of them. Then run:
+#
+#     python -m scripts.fee_card_reconcile
+#
+# which replays this card against the REAL billed charges already in the
+# ledger from swing-indian and intraday-indian. The cash-equity segments can
+# therefore be validated against months of actual Dhan bills before the F&O
+# segments are ever trusted. Sign off on evidence, not on assertion.
+#
+# ── Verification status, honestly ──────────────────────────────────────────
+# Fetched 2026-08-29 from the sources cited per line. Two independent sources
+# were compared for every F&O line. Where they agreed, the rate is below.
+# Where they did NOT, the disagreement is recorded in that line's `note` and
+# the more authoritative figure used — those are the lines to check first:
+#
+#   1. futures stamp duty  — Zerodha 0.002%, Angel One 0.0001%. Used 0.002%
+#      (the Indian Stamp Act 2019 rate for futures). CHECK THIS ONE.
+#   2. F&O STT             — moved on 1 April 2026 (Budget 2026-27): futures
+#      0.02% -> 0.05%, options 0.10% -> 0.15%. Two sources agree on the new
+#      figures. If you last looked before April, your memory is stale.
+#   3. NSE transaction charges — a March 2026 revision was reported, but both
+#      sources still publish the figures below. They may already BE the
+#      revised ones. Low value at our size; verify if precision matters.
+#   4. IPFT — Dhan's page lists 0.0000001%, which is implausible (NSE's IPFT
+#      is per-crore, not per-ten-billion). Omitted rather than guessed; it is
+#      a rounding error at any size this system trades.
+#   5. MTF — NOT CARDED. swing-indian trades MTF, whose brokerage follows
+#      intraday but whose STT follows delivery. Rather than infer that blend,
+#      it is left out and the drift check skips MTF trades. Add it when you
+#      have a source.
+#
+# ── What the reconciliation actually found (2026-08-29) ────────────────────
+# Ran against every billed Dhan trade in the last 120 days. Only THREE orders
+# had final charges, and all three were BUYS on intraday-indian at ~Rs 50k
+# turnover, so read this as a first sighting rather than a validation.
+#
+#   line            estimated   actual   drift
+#   brokerage           44.90    44.92    0.0%   <- reconciles
+#   exchange_txn         4.59     4.60    0.0%   <- reconciles
+#   sebi                 0.15     0.15    0.7%   <- reconciles
+#   gst                  8.94     8.94    0.0%   <- reconciles
+#   stamp_duty           4.49     5.00   10.2%   <- see (b)
+#   stt                  0.00    24.00  100.0%   <- see (a)
+#
+# (a) STT — UNEXPLAINED, and the reason this card is not signed.
+#     IIFL (bought and sold the same day, a true intraday round trip) was
+#     billed Rs 0 STT on the buy leg, exactly as the card predicts for a
+#     sell-side-only levy. But CASTROLIND and PPLPHARMA were each billed
+#     Rs 12.00 on their BUY leg. Both were bought and then not closed until
+#     days later, so both left the intraday product — yet Rs 12 on ~Rs 50k is
+#     ~0.024%, which matches NEITHER the intraday rate (0.025%, sell only) NOR
+#     the delivery rate (0.1%, both sides).
+#     I could not account for this from the cited sources and did not invent an
+#     explanation. Check a real contract note for either trade before signing.
+#
+# (b) STAMP DUTY — the actuals are whole rupees (2.00, 1.00, 2.00) against
+#     estimates near 1.50, so this looks like a ROUNDING convention rather than
+#     a wrong rate. Not modelled, because the rule is not sourced. It is small.
+#
+# (c) THE ENTIRE SELL SIDE IS UNVALIDATED. Every reconciled order was a buy,
+#     so the sell-side STT lines — the largest cost in an F&O round trip —
+#     have never been checked against a real bill.
+#
+# (d) The three orders had no recorded product, so their segment was INFERRED
+#     from the bucket, and the Decision 031 CNC fallback means that inference
+#     is wrong exactly when it matters. Orders placed from 2026-08-29 record
+#     `product` on the Trade row, so this ambiguity is self-resolving; re-run
+#     the reconciliation after a few more fills.
+#
+# ── Sign-off ───────────────────────────────────────────────────────────────
+signed_off: false
+signed_off_by: ""
+signed_off_on: null
+note: >-
+  Assembled 2026-08-29 from the per-line sources and reconciled against the
+  three billed orders available. Four of six lines reconcile to ~0%; STT does
+  not, and is unexplained (see the note above). Unsigned: no pre-trade estimate
+  may use it until the user has read the sources, resolved the STT finding, and
+  set signed_off: true.
+
+segments:
+
+  # ── NSE equity futures ───────────────────────────────────────────────────
+  nse_fno_futures:
+    label: NSE equity futures (FUTIDX / FUTSTK)
+    brokerage:
+      flat_per_order: 20
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: >-
+        "Rs 20 per executed order for equity & commodity F&O". Flat — unlike
+        equity intraday there is no percentage alternative, which is why a
+        small option lot is proportionally so much more expensive.
+    stt:
+      rate: 0.0005          # 0.05%
+      side: sell
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: >-
+        "0.05% on the sell side". RAISED from 0.02% effective 1 April 2026
+        (Budget 2026-27) — a 150% increase, corroborated independently by
+        cleartax/ICICI Direct coverage of the same budget.
+    exchange_txn:
+      rate: 0.000018299     # 0.0018299%
+      side: both
+      source: https://www.angelone.in/exchange-transaction-charges
+      verified_on: 2026-08-29
+      note: >-
+        On futures turnover. Zerodha publishes the same figure rounded to
+        0.00183%, so two independent sources agree.
+    sebi:
+      rate: 0.000001        # 0.0001% = Rs 10 / crore
+      side: both
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: Rs 10 per crore. Angel One publishes the same figure.
+    stamp_duty:
+      rate: 0.00002         # 0.002% = Rs 200 / crore
+      side: buy
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: >-
+        DISAGREEMENT: Zerodha says 0.002% (Rs 200/crore) buy side; Angel One
+        says 0.0001%. Used Zerodha's, which matches the Indian Stamp Act 2019
+        rate for futures. Worth confirming against a real contract note — it
+        is the only line where the two sources conflict.
+    gst_rate: 0.18
+    gst_source: https://zerodha.com/charges/
+    gst_verified_on: 2026-08-29
+
+  # ── NSE equity options ───────────────────────────────────────────────────
+  nse_fno_options:
+    label: NSE equity options (OPTIDX / OPTSTK)
+    brokerage:
+      flat_per_order: 20
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: >-
+        Flat Rs 20/order. On a Rs 13,000 NIFTY option lot that is ~0.15%
+        round-trip, against ~0.05% on a Rs 50,000 equity slot — the single
+        largest reason an equity cost intuition understates an option trade.
+    stt:
+      rate: 0.0015          # 0.15%
+      side: sell
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: >-
+        "0.15% on sell side (on premium)". RAISED from 0.10% effective
+        1 April 2026. Charged on PREMIUM, not on the underlying notional.
+        SEPARATELY, an option bought and EXERCISED attracts 0.15% of intrinsic
+        value — not modelled here, because intrinsic value is unknowable at
+        entry. Phase D's pre-expiry square-off is what keeps that from
+        arising, and it is the cost of failing to square off.
+    exchange_txn:
+      rate: 0.000355299     # 0.0355299%
+      side: both
+      source: https://www.angelone.in/exchange-transaction-charges
+      verified_on: 2026-08-29
+      note: >-
+        On PREMIUM value. Zerodha publishes 0.03553% — same figure, rounded.
+        Note it is ~19x the futures rate, so option turnover is expensive in a
+        way futures turnover is not.
+    sebi:
+      rate: 0.000001        # 0.0001% = Rs 10 / crore
+      side: both
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: Rs 10 per crore of premium. Angel One publishes the same figure.
+    stamp_duty:
+      rate: 0.00003         # 0.003% = Rs 300 / crore
+      side: buy
+      source: https://zerodha.com/charges/
+      verified_on: 2026-08-29
+      note: >-
+        0.003% on premium, buy side. Zerodha and Angel One AGREE here, unlike
+        the futures line above.
+    gst_rate: 0.18
+    gst_source: https://zerodha.com/charges/
+    gst_verified_on: 2026-08-29
+
+  # ── NSE cash equity, delivery (CNC) ──────────────────────────────────────
+  # Carded not because an F&O bucket needs it, but because intraday-indian's
+  # CNC fallback trades it and the drift check can therefore validate this
+  # card against REAL billed charges already in the ledger.
+  nse_equity_delivery:
+    label: NSE cash equity delivery (CNC)
+    brokerage:
+      flat_per_order: 0
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"Rs 0 (Zero Brokerage)" on equity delivery.'
+    stt:
+      rate: 0.001           # 0.1%
+      side: both
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"Delivery: 0.1% buy & sell".'
+    exchange_txn:
+      rate: 0.000030699     # 0.0030699%
+      side: both
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: 'Dhan: "NSE: 0.0030699%" on turnover.'
+    sebi:
+      rate: 0.000001
+      side: both
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"SEBI Turnover Fees 0.0001%".'
+    stamp_duty:
+      rate: 0.00015         # 0.015%
+      side: buy
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"Delivery: 0.015%" on buy order turnover.'
+    gst_rate: 0.18
+    gst_source: https://dhan.co/pricing/
+    gst_verified_on: 2026-08-29
+
+  # ── NSE cash equity, intraday (MIS) ──────────────────────────────────────
+  nse_equity_intraday:
+    label: NSE cash equity intraday (MIS)
+    brokerage:
+      flat_per_order: 20
+      pct_of_turnover: 0.0003   # 0.03%
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: >-
+        "Rs 20 or 0.03% of trade value per executed order, whichever is
+        lower" — hence both fields; the estimator takes the minimum.
+    stt:
+      rate: 0.00025         # 0.025%
+      side: sell
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"Intraday: 0.025% sell only".'
+    exchange_txn:
+      rate: 0.000030699
+      side: both
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: 'Dhan: "NSE: 0.0030699%" on turnover.'
+    sebi:
+      rate: 0.000001
+      side: both
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"SEBI Turnover Fees 0.0001%".'
+    stamp_duty:
+      rate: 0.00003         # 0.003%
+      side: buy
+      source: https://dhan.co/pricing/
+      verified_on: 2026-08-29
+      note: '"Intraday: 0.003%" on buy order turnover.'
+    gst_rate: 0.18
+    gst_source: https://dhan.co/pricing/
+    gst_verified_on: 2026-08-29
