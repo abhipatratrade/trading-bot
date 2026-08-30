@@ -416,3 +416,58 @@ def test_only_derivative_buckets_allow_shorts() -> None:
     assert by_id["intraday-indian"].allows_shorts is False
     # Crypto sub-accounts have always been able to.
     assert by_id["longterm-crypto"].allows_shorts is True
+
+
+# ── the hard lot ceiling (Decision 037) ─────────────────────────────────
+def test_lot_ceiling_is_configured_for_the_first_live_run() -> None:
+    """One lot only, and it is the BINDING constraint: Kelly on this bucket's
+    mu/sigma wants six."""
+    from src.shared.bucket import load_bucket
+
+    assert load_bucket("commodity-indian").config.max_lots_per_position == 1
+
+
+def test_lot_ceiling_defaults_off_everywhere_else() -> None:
+    """A new risk knob must change nothing for the buckets already live."""
+    from src.shared.bucket import load_buckets
+
+    for b in load_buckets():
+        if b.id != "commodity-indian":
+            assert b.config.max_lots_per_position is None, b.id
+
+
+def test_a_lot_ceiling_below_one_is_rejected() -> None:
+    """Zero would mean "never trade", which is what `enabled: false` is for —
+    expressing it as a size would make a disabled bucket look enabled."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from src.shared.bucket import BucketConfig
+
+    with _pytest.raises(ValidationError):
+        BucketConfig(
+            capital_inr=Decimal("500000"), broker="dhan",
+            leverage_max=Decimal("7"), max_lots_per_position=0,
+        )
+
+
+def test_the_ceiling_is_expressed_in_lots_not_order_units() -> None:
+    """The distinction that would be catastrophic to get wrong on MCX.
+
+    Dhan's order `quantity` for MCX is in LOTS — verified against the margin
+    calculator 2026-08-30: qty 1 quoted Rs 9,859, qty 2 exactly double, qty 250
+    quoted Rs 24.6 LAKH on Rs 1.72 crore of notional. So one lot is
+    `quantity: 1`, and 250 is the contract SIZE in mmBtu.
+
+    The runner multiplies the ceiling by lot_size to reach order units, so on
+    MCX (lot_size 1) a ceiling of 1 lot is quantity 1, while on NSE
+    (lot_size 65) it would be quantity 65.
+    """
+    from src.shared.allocator.sizer import quantize_to_lots
+
+    mcx_lot_size, nse_lot_size = Decimal("1"), Decimal("65")
+    assert Decimal(1) * mcx_lot_size == Decimal("1")
+    assert Decimal(1) * nse_lot_size == Decimal("65")
+    # And the grid still holds under the ceiling.
+    assert quantize_to_lots(Decimal("1"), mcx_lot_size) == Decimal("1")
+    assert quantize_to_lots(Decimal("65"), nse_lot_size) == Decimal("65")

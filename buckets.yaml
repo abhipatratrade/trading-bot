@@ -215,6 +215,20 @@ buckets:
     # A 15m strategy. 60s keeps the runner acting on a bar close promptly; the
     # scan itself is one pinned symbol, so the cadence costs almost nothing.
     tick_interval_seconds: 60
+    # ONE LOT ONLY for the first live run (user decision 2026-08-30).
+    #
+    # Kelly on this bucket's mu/sigma wants SIX (raw 0.494 -> fractional 0.1235
+    # -> Rs 61,744 of margin at Rs 9,859/lot), so this ceiling is the binding
+    # constraint and is meant to be. At one lot the in-sample path implies a
+    # peak-to-trough drawdown of ~Rs 23,030 (4.6% of the bucket) rather than
+    # ~28%, and a single 16% overnight gap costs ~Rs 6,880 (1.4%) rather than
+    # ~8%.
+    #
+    # NOTE the unit: Dhan's order `quantity` for MCX is in LOTS, verified
+    # against the margin calculator 2026-08-30 (qty 1 -> Rs 9,859; qty 2 ->
+    # Rs 19,719; qty 250 -> Rs 24.6 LAKH on Rs 1.72 crore of notional). One lot
+    # is quantity 1. The 250 is the contract SIZE in mmBtu, not the order field.
+    max_lots_per_position: 1
     # 4.5% adverse move, the validated distance (RULES.md section 3), rested at
     # the exchange as a reduce-only stop-market. NOT a premium multiple — this
     # is a futures position, so the percent is of the futures price.

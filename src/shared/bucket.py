@@ -97,6 +97,20 @@ class BucketConfig(BaseModel):
     # Not derivable from ``market``: both are Indian, both are Dhan, both are
     # INR. It is genuinely a second axis and is carried as one.
     exchange: str = "NSE"
+    # Decision 037 — HARD ceiling on lots per position, applied AFTER Kelly,
+    # after both allocator caps, and after the margin fit. None ⇒ no ceiling.
+    #
+    # A blunt instrument on purpose. The percentage knobs all scale with price:
+    # `per_symbol_cap` set to buy exactly one lot at Rs 275 buys ZERO at Rs 350
+    # (the margin per lot grows, the rupee budget does not), so a bucket tuned
+    # that way silently stops trading when the underlying rallies. A lot count
+    # is the only expression of "one lot" that stays true at every price.
+    #
+    # commodity-indian sets 1 for its first live run (user decision
+    # 2026-08-30). Kelly on that bucket's mu/sigma wants 6, so this is the
+    # binding constraint — deliberately, on a strategy with no out-of-sample
+    # fold.
+    max_lots_per_position: int | None = Field(default=None, ge=1)
     # Decision 022 — broker-side protective stop distance as a percent of
     # entry price. Every open position gets an exchange-resident reduce-only
     # stop-market order at this distance, so a max loss holds even when the

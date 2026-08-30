@@ -507,6 +507,24 @@ class BucketRunner:
                     # nearly every time. Never rounds UP — one NIFTY lot is
                     # ~Rs 15.8L of notional against a Rs 5L bucket.
                     size = quantize_to_lots(size, lot_size)
+                    # Decision 037 — the hard lot ceiling, LAST. After Kelly,
+                    # after both caps, after the margin fit: everything above
+                    # can only ever propose a size, and this is the one number
+                    # that cannot be argued up by a favourable mu/sigma or a
+                    # generous margin quote.
+                    max_lots = self.bucket.config.max_lots_per_position
+                    if max_lots is not None:
+                        ceiling = Decimal(max_lots) * lot_size
+                        if size > ceiling:
+                            _log.info(
+                                "size_clamped_to_lot_ceiling",
+                                bucket_id=self.bucket.id,
+                                symbol=exec_symbol,
+                                wanted=str(size),
+                                ceiling=str(ceiling),
+                                max_lots=max_lots,
+                            )
+                            size = ceiling
                     if size < 1:
                         _log.warning(
                             "open_skipped_margin_unaffordable",
