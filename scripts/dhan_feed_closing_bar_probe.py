@@ -85,6 +85,9 @@ CODE_TICKER, CODE_PREV_CLOSE, CODE_DISCONNECT = 2, 6, 50
 PACKET_SIZE = {CODE_TICKER: 16, CODE_PREV_CLOSE: 16, CODE_DISCONNECT: 16}
 
 DEFAULT_SYMBOLS = ["ALKEM", "ASHOKLEY", "360ONE"]
+# The bot's own universe cache, maintained by the Dhan adapter. Present
+# wherever the bot runs, so this probe is not tied to a dev box.
+UNIVERSE_CACHE = Path(__file__).resolve().parents[1] / "data" / "dhan_universe.json"
 SCRIP_MASTER = Path(
     r"D:\Claude_TVconnect2\Backtesting Engine\data\cache\dhan_scrip_master.csv"
 )
@@ -114,8 +117,22 @@ def _load_token() -> tuple[str, str]:
     return row["token"], row["client_id"]
 
 
-def _resolve(symbols: list[str]) -> dict[str, str]:
-    """symbol -> NSE_EQ security id, read from the Dhan scrip master."""
+def _lookup_table() -> dict[str, tuple[str, str]]:
+    """symbol -> (security_id, exchange_segment).
+
+    Prefers the bot's own universe cache, which the Dhan adapter already
+    maintains and which exists wherever the bot runs -- so this probe works on
+    the Mumbai VM as well as a dev box. Falls back to the backtester's scrip
+    master CSV, which is Windows-only.
+    """
+    if UNIVERSE_CACHE.exists():
+        uni = json.loads(UNIVERSE_CACHE.read_text())
+        return {
+            k.upper(): (v["security_id"], v.get("exchange", "NSE_EQ"))
+            for k, v in uni.items()
+        }
+
+    print(f"  (no {UNIVERSE_CACHE}; falling back to the scrip master CSV)")
     try:
         import pandas as pd
 
@@ -131,24 +148,26 @@ def _resolve(symbols: list[str]) -> dict[str, str]:
             ],
         )
     except Exception as exc:  # pragma: no cover - diagnostic path
-        raise SystemExit(f"Could not read the scrip master ({exc}).") from exc
+        raise SystemExit(
+            f"No universe cache and could not read the scrip master ({exc})."
+        ) from exc
 
     m = df[(df.EXCH_ID == "NSE") & (df.SEGMENT == "E") & (df.INSTRUMENT == "EQUITY")]
-    by_sym = dict(
-        zip(
-            m.UNDERLYING_SYMBOL.astype(str).str.upper(),
-            m.SECURITY_ID.astype(str),
-            strict=False,
-        )
-    )
+    return {
+        str(sym).upper(): (str(sid), "NSE_EQ")
+        for sym, sid in zip(m.UNDERLYING_SYMBOL, m.SECURITY_ID, strict=False)
+    }
 
-    out: dict[str, str] = {}
+
+def _resolve(symbols: list[str]) -> dict[str, tuple[str, str]]:
+    table = _lookup_table()
+    out: dict[str, tuple[str, str]] = {}
     for s in symbols:
-        sid = by_sym.get(s.upper())
-        if sid is None:
-            print(f"  ! {s}: not in the scrip master, skipping")
+        hit = table.get(s.upper())
+        if hit is None:
+            print(f"  ! {s}: not found in the universe, skipping")
             continue
-        out[s.upper()] = sid
+        out[s.upper()] = hit
     if not out:
         raise SystemExit("No symbols resolved.")
     return out
@@ -193,7 +212,7 @@ async def _run(symbols: dict[str, str], stop_at: datetime, quiet: bool) -> dict:
 
     token, client_id = _load_token()
     url = f"{FEED_URL}?version=2&token={token}&clientId={client_id}&authType=2"
-    by_sid = {int(v): k for k, v in symbols.items()}
+    by_sid = {int(sid): sym for sym, (sid, _) in symbols.items()}
 
     ticks: dict[str, list[tuple[datetime, float, int]]] = defaultdict(list)
     notes: list[str] = []
@@ -206,8 +225,8 @@ async def _run(symbols: dict[str, str], stop_at: datetime, quiet: bool) -> dict:
                     "RequestCode": REQ_SUBSCRIBE_TICKER,
                     "InstrumentCount": len(symbols),
                     "InstrumentList": [
-                        {"ExchangeSegment": "NSE_EQ", "SecurityId": sid}
-                        for sid in symbols.values()
+                        {"ExchangeSegment": seg, "SecurityId": sid}
+                        for sid, seg in symbols.values()
                     ],
                 }
             )
@@ -363,7 +382,10 @@ def main() -> None:
         )
 
     symbols = _resolve([s.strip() for s in args.symbols.split(",") if s.strip()])
-    print("symbols: " + ", ".join(f"{k}={v}" for k, v in symbols.items()))
+    print(
+        "symbols: "
+        + ", ".join(f"{k}={sid}@{seg}" for k, (sid, seg) in symbols.items())
+    )
 
     try:
         result = asyncio.run(_run(symbols, stop_at, args.quiet))
