@@ -504,3 +504,68 @@ def test_frozen_backtest_parameters() -> None:
     assert cfg.universe_size == 5
     assert cfg.fno_only is True
     assert len(cfg.symbols) == 94
+
+
+# ---------------------------------------------------------------------------
+# bin_index: a post-close stray must not impersonate the closing bin
+# ---------------------------------------------------------------------------
+class TestBinIndexIsNotClamped:
+    """``bin_index`` used to pin every bar at/after 15:15 into bin 6.
+
+    That made the stub bin a junk drawer. Dhan really does emit strays — the
+    cached backtest CSVs carry stamps at 18:00/18:15/18:30/18:45 — and a stray
+    so filed became a bin-6 close with an EMA and a dist_pct, able to reach the
+    signal path as a fresh cross. The backtester it claims to mirror never
+    clamped, so this also restores that agreement.
+    """
+
+    @pytest.mark.parametrize(
+        ("hh", "mm", "expect"),
+        [
+            (9, 15, 0),    # open
+            (14, 15, 5),   # last full 1h bin
+            (15, 15, 6),   # the genuine stub — still bin 6
+            (16, 15, 7),   # past the stub's hour
+            (18, 0, 8),    # the stray Dhan actually emits
+            (18, 45, 9),
+        ],
+    )
+    def test_bins_run_past_the_session(self, hh: int, mm: int, expect: int) -> None:
+        moment = datetime(2026, 8, 6, hh, mm, tzinfo=_IST)
+        assert meanrev.bin_index(moment) == expect
+
+    def test_pre_open_print_is_still_rejected(self) -> None:
+        assert meanrev.bin_index(datetime(2026, 8, 6, 9, 0, tzinfo=_IST)) == -1
+
+    def test_a_stray_evening_bar_does_not_become_the_stub(self) -> None:
+        """The whole point: an 18:00 print must not land in bin 6."""
+        day = datetime(2026, 8, 6, tzinfo=_IST)
+        bars = _session_15m(day, [100.0] * 25)
+        bars.append(_bar(day.replace(hour=18, minute=0, tzinfo=_IST), 250.0))
+
+        h1 = meanrev.resample_1h(bars)
+        stub = h1[h1["bin"] == 6]
+        assert len(stub) == 1
+        assert stub["close"].iloc[0] == 100.0, "the stray overwrote the stub close"
+        assert 8 in set(h1["bin"]), "the stray should occupy its own bin"
+
+    def test_a_stray_cannot_manufacture_a_stub_signal(self) -> None:
+        """End-to-end: no bin 6 in the data, so a stray must not conjure one."""
+        cfg = _cfg()
+        # A flat series ending at 15:00 — genuinely NO 15:15 bar, which is what
+        # Dhan has served since 2026-08-03.
+        intraday = _series_15m(40, 100.0)
+        intraday = [b for b in intraday
+                    if not (b.timestamp.astimezone(_IST).hour == 15
+                            and b.timestamp.astimezone(_IST).minute == 15)]
+        day = _last_day(intraday)
+        # A stray far below the mean — a fresh cross, if it were believed.
+        intraday.append(_bar(day.replace(hour=18, minute=0, tzinfo=_IST), 50.0))
+        daily = _daily(40, 100.0, end=day - timedelta(days=1))
+
+        out = meanrev.evaluate_with_reason(
+            "TEST", intraday, daily, cfg,
+            want_bar_key=meanrev.bar_key(day.date(), 6),
+        )
+        assert out.signal is None
+        assert out.reason == meanrev.REASON_BIN_ABSENT

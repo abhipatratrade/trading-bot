@@ -177,15 +177,33 @@ def ist_date(bar: OHLCVBar) -> date_type:
 def bin_index(moment: datetime) -> int:
     """Which 1h bin an IST moment falls in (0 = 09:15→10:15, 6 = the stub).
 
-    Values outside the session clamp to the nearest end — the caller decides
-    what that means (``bar_key_at`` uses it to name the bin currently forming).
+    A moment PAST the session returns its true bin (7, 8, …) rather than being
+    pinned to the last one. That is what ``scanner_engine._resample_intraday``
+    does in the backtester — plain ``minutes // n``, no ceiling — and this
+    function's contract is to agree with it.
+
+    It used to clamp with ``min(..., _BINS_PER_SESSION - 1)``, which quietly
+    made bin 6 a junk drawer: EVERY bar at or after 15:15 landed there,
+    including strays. Dhan emits those — the cached backtest CSVs carry stamps
+    at 18:00/18:15/18:30/18:45, and see :func:`locate_bin` on the lone bar
+    stamped Sat 2026-08-01 14:30 for many NSE symbols. A stray so filed became
+    a bin-6 close, earned an EMA and a ``dist_pct``, and could reach the signal
+    path as a fresh cross — a trade priced off a bar describing no trading.
+    Unclamped it becomes bin 8, which no ``last_complete_bar_key`` ever names,
+    so ``locate_bin`` simply never matches it.
+
+    Callers are unaffected otherwise: ``last_complete_bar_key`` only consults
+    this inside the session (past 15:30 it names the stub outright), and within
+    the session the clamp never bound.
+
+    Pre-open prints still return -1; ``resample_1h`` drops those.
     """
     minutes = (moment.hour - SESSION_OPEN.hour) * 60 + (
         moment.minute - SESSION_OPEN.minute
     )
     if minutes < 0:
         return -1
-    return min(minutes // _BIN_MINUTES, _BINS_PER_SESSION - 1)
+    return minutes // _BIN_MINUTES
 
 
 def bar_key(day: date_type, index: int) -> str:
