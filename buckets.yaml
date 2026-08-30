@@ -168,3 +168,58 @@ buckets:
     # Armed 2026-08-18 (user decision). The Decision 022 sweep stays behind
     # it for legacy positions and as the net if the master switch goes off.
     attached_stops: true
+
+  # Decision 037 — eighth bucket. MCX commodity futures (NATGASMINI), CCI(20)
+  # 225/250 reversion on 15m. A DIFFERENT EXCHANGE from every bucket above:
+  # segment MCX_COMM, session 09:00-23:30, CTT instead of STT.
+  #
+  # SHIPS DISABLED. The port is proven — scripts/cci_gas_parity.py reproduces
+  # 125 of 125 backtested trades — but the STRATEGY has not cleared the bar
+  # every other bucket here cleared, and its own handoff says why:
+  #   * No out-of-sample fold, and structurally none available: TradingView
+  #     caps intraday history so 15m gas starts 2025-12-01 and the entire
+  #     sample IS the backtest.
+  #   * The same configuration is NEGATIVE on 30m and 1H over those months,
+  #     and negative in 3 of 4 years on 1H.
+  #   * THE EDGE IS THE UNPROTECTED EXPOSURE. 81 of 125 trades are held across
+  #     a session close and net +Rs 122,021; the 44 intraday-only trades net
+  #     -Rs 25,584. MCX gas is shut 23:30-09:00 and over weekends, and an
+  #     exchange-resident stop CANNOT FIRE while it is shut. Four trades gapped
+  #     through it in-sample on a series containing +16.0% and -10.8% session
+  #     gaps against a 4.5% stop. Adding a square-off removes the edge; keeping
+  #     it means accepting gap risk the stop does not cover.
+  # Enabling this is a deliberate act with those three facts in hand.
+  commodity-indian:
+    capital_inr: 500000
+    broker: dhan
+    exchange: MCX
+    # Margin is SPAN, not a leverage multiple. Probed live 2026-08-29:
+    # Rs 9,859/lot at Rs 275 = 14.3% of notional, i.e. ~7x. The ceiling is set
+    # at 7 so `leverage_max` is not the thing that silently binds; the real
+    # sizer is Kelly, and the margin preflight fits every order to the rupee
+    # figure Dhan quotes for it.
+    leverage_max: 7
+    enabled: false
+    account_ref: dhan
+    # Carry-forward. The strategy holds overnight by design — that is where its
+    # edge lives — so this is NOT an intraday product.
+    product: MARGIN
+    # No fallback. There is no cash equivalent of a futures contract, and a
+    # silent retry on a different product would be a different trade.
+    fallback_product: null
+    # The session is the entry window: this strategy signals on every completed
+    # 15m bar, including the 18:00 IST NYMEX open where 28 of 125 trades
+    # entered. Narrowing it would remove trades the backtest took.
+    entry_start: "09:00"
+    entry_end: "23:30"
+    # A 15m strategy. 60s keeps the runner acting on a bar close promptly; the
+    # scan itself is one pinned symbol, so the cadence costs almost nothing.
+    tick_interval_seconds: 60
+    # 4.5% adverse move, the validated distance (RULES.md section 3), rested at
+    # the exchange as a reduce-only stop-market. NOT a premium multiple — this
+    # is a futures position, so the percent is of the futures price.
+    stop_loss_pct: 4.5
+    # Decision 034's attached stop is unproven on MCX. The Decision 022 sweep
+    # rests the stop after the fill instead, which is the pre-034 behaviour and
+    # the one this venue has never contradicted.
+    attached_stops: false

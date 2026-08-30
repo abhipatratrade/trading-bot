@@ -74,8 +74,9 @@ from src.shared.contract_selection import (
     Selection,
     contract_hint,
     load_contract_selection,
+    plan_roll,
 )
-from src.shared.contracts import is_derivative
+from src.shared.contracts import is_derivative, underlying_of
 from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
@@ -264,6 +265,12 @@ class BucketRunner:
         # they are reduce-only, and a halted bucket must still manage the
         # positions it holds. Entries below are what the kill blocks.
         exited = self._run_exits(order_manager)
+
+        # Decision 037 — carry the contract forward. Before the kill-switch
+        # gate, because closing an expiring contract is risk-REDUCING and a
+        # position left to expire is worse than a halted bucket; the reopen
+        # half checks the switch itself.
+        self._roll_expiring(order_manager)
 
         if kill_switch.is_engaged(self.bucket.id):
             _log.info(
@@ -651,7 +658,12 @@ class BucketRunner:
         # would have stopped it. The reconciler now flattens these rows, but it
         # sweeps on its own 5-minute clock; this refuses to act on one in the
         # window before it does.
-        if self.bucket.market == Market.INDIAN:
+        # Decision 037 — ask the BUCKET, not the market. `Market.INDIAN` meant
+        # "cash equity" when this guard was written; commodity-indian is also
+        # INDIAN and holds shorts as a matter of course, so gating on the
+        # market would drop every one of them from the exit engine and leave
+        # the position open and unmanaged.
+        if not self.bucket.allows_shorts:
             shorts = [p for p in held_rows if p.side == PositionSide.SHORT]
             if shorts:
                 for p in shorts:
@@ -718,6 +730,112 @@ class BucketRunner:
                 if self._close_position(om, strat_name, pos, regimes.get(sym)):
                     exited += 1
         return exited
+
+    def _roll_expiring(self, om: OrderManager) -> int:
+        """Carry open derivative positions into the next contract.
+
+        Decision 037, user instruction 2026-08-29: positions are CARRIED
+        FORWARD rather than squared off, and a contract inside the
+        ``min_days_to_expiry`` floor is no longer the one to hold.
+
+        A roll is TWO orders and they are NOT symmetrical in risk. The close is
+        placed first and the open only follows a confirmed close, because the
+        failure modes are not equal: ending up FLAT for one tick costs a
+        signal, while ending up DOUBLE — long the near month and the far one at
+        once — is twice the exposure the allocator approved, on a bucket whose
+        stop cannot fire overnight.
+
+        Runs BEFORE entries and independently of the kill switch's entry block:
+        the close half is risk-reducing, and a contract left to expire is a
+        worse outcome than a halted bucket. The OPEN half is skipped while
+        killed — re-entering is risk-increasing, and Decision 024 is explicit
+        that a killed bucket may reduce but never add.
+        """
+        if not self.bucket.trades_derivatives():
+            return 0
+
+        registry = getattr(self._data, "fno", None)
+        if registry is None:
+            return 0
+
+        with session_scope() as session:
+            held = list(
+                session.execute(
+                    select(Position).where(
+                        Position.bucket_id == self.bucket.id,
+                        Position.side != PositionSide.FLAT,
+                        Position.quantity > 0,
+                    )
+                ).scalars()
+            )
+        if not held:
+            return 0
+
+        today = self._clock.now().date()
+        killed = kill_switch.is_engaged(self.bucket.id)
+        rolled = 0
+
+        for pos in held:
+            config = self.contract_configs.get("")
+            if config is None:
+                continue
+            decision = plan_roll(
+                held_symbol=pos.symbol,
+                underlying=underlying_of(pos.symbol),
+                source=registry,
+                config=config,
+                on=today,
+            )
+            if not decision.should_roll:
+                # The one case worth shouting about: inside the floor with
+                # nowhere to go. Carrying is then impossible and the position
+                # must be closed by a human before it expires.
+                if "CLOSE, do not carry" in decision.reason:
+                    send_alert_dedup(
+                        f"roll_impossible:{self.bucket.id}:{pos.symbol}",
+                        f"[{self.bucket.id}] {pos.symbol} is inside its expiry "
+                        f"floor and has NO later contract to roll into. "
+                        f"{decision.reason}",
+                    )
+                continue
+
+            _log.info(
+                "rolling_contract",
+                bucket_id=self.bucket.id,
+                symbol=pos.symbol,
+                to=decision.to_contract.symbol if decision.to_contract else None,
+                reason=decision.reason,
+            )
+            if not self._close_position(
+                om, pos.strategy_name or "", pos, regime=None
+            ):
+                _log.error(
+                    "roll_close_failed_not_reopening",
+                    bucket_id=self.bucket.id,
+                    symbol=pos.symbol,
+                )
+                continue
+            rolled += 1
+
+            if killed:
+                _log.warning(
+                    "roll_reopen_skipped_kill_switch",
+                    bucket_id=self.bucket.id,
+                    symbol=pos.symbol,
+                )
+                continue
+            # The far leg is a fresh ENTRY in every respect the safety layers
+            # care about, so it goes through the normal entry path on the next
+            # tick rather than being force-placed here: it must be sized by the
+            # allocator against current margin, carry its own protective stop,
+            # and be refused if the preflight cannot price it. Placing it
+            # inline would bypass all three.
+            _log.info(
+                "roll_reopen_deferred_to_entry_path",
+                bucket_id=self.bucket.id,
+                to=decision.to_contract.symbol if decision.to_contract else None,
+            )
+        return rolled
 
     def _close_position(
         self,

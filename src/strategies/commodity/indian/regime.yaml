@@ -1,0 +1,31 @@
+# commodity-indian regime — DISABLED by design (Decision 037).
+#
+# Decision 014 gives every bucket a per-bucket HMM. This one has no regime
+# model and should not get an invented one: the handoff's RULES.md section 5
+# names the absence of a regime filter as the strategy's KNOWN GAP and says
+# plainly that none was found. The configuration is positive on 15m over
+# Dec-2025 -> Aug-2026 and NEGATIVE on 30m and 1H over the same months, and
+# negative in 3 of 4 years on 1H — so a gate is exactly what is missing, and
+# exactly what nobody has evidence for.
+#
+# Building one here would be inventing the missing piece of somebody else's
+# research and would change which trades happen away from the validated set.
+# If a filter is ever found, this is where it lands.
+#
+# With enabled: false, predict_regime returns None, the sizer's per-symbol
+# multiplier falls back to 1.0, and strategy_master.csv leaves both regime
+# columns blank (regime-agnostic under Decision 016's OR semantics).
+# allocator.yaml pins all three multipliers to 1.0 as belt-and-braces, so no
+# single edit silently re-introduces a gate the backtest never had.
+enabled: false
+# Unused while disabled. NATGASMINI is its own proxy — MCX publishes no index
+# for this bucket to reason about, which is part of why the gap is open.
+proxy_symbol: NATGASMINI
+# Read as one input to the bucket's tick cadence; buckets.yaml pins that
+# explicitly via tick_interval_seconds (a 15m strategy must act on a bar close
+# within a minute).
+tf: 15m
+training_window_days: 365
+inference_lookback_bars: 250
+retrain_cadence: manual
+symbols: []

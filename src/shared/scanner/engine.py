@@ -107,6 +107,8 @@ class ScannerConfig(BaseModel):
     # ``run_gap_reversal_scan``.
     # "equity_meanrev_1h" = the 1h EMA20-dislocation cut (Decision 032),
     # dispatched to ``run_meanrev_scan``.
+    # "pinned" = the universe IS config.symbols, unfiltered (Decision 037) —
+    # for a bucket whose strategy does all the selecting itself.
     engine: str = "generic"
     # Free-text universe label for equity configs (e.g. nse_bse_all_equities);
     # informational — the equity universe comes from the Dhan data adapter.
@@ -221,6 +223,22 @@ def run_scan(
     if config.engine == "equity_intraday":
         return run_gap_reversal_scan(
             bucket_id=bucket_id, data=data, config=config, scan_date=scan_date
+        )
+    if config.engine == "pinned":
+        # Decision 037 — a universe that IS the config. The commodity bucket
+        # trades one pinned underlying, so there is nothing to filter or rank:
+        # the CCI state machine in the strategy does all the deciding, and a
+        # scanner that pretended otherwise would just be ceremony between the
+        # config file and the strategy.
+        #
+        # Deliberately NOT the "generic" path, which joins against
+        # ``symbol_mapping`` for the crypto Binance/Delta overlap and would
+        # return nothing here.
+        return ScanResult(
+            bucket_id=bucket_id,
+            date=scan_date,
+            universe=list(config.symbols),
+            evaluated_count=len(config.symbols),
         )
     if config.engine == "equity_meanrev_1h":
         return run_meanrev_scan(

@@ -1,0 +1,33 @@
+# commodity-indian scanner — CCI(20) reversion on MCX natural gas mini.
+#
+# backtest_ref: Backtesting Engine/results/handoff/cci_gas_15m/
+#   (handoff.yaml + RULES.md + trades.json)
+#   PARITY: scripts/cci_gas_parity.py reproduces 125 of 125 trades, 100.0%.
+#
+# THE EVIDENCE, STATED PLAINLY, because this file is where someone looks first:
+#   fold          FULL — and not by choice. TradingView caps intraday history,
+#                 so 15m gas starts 2025-12-01 and the entire sample IS the
+#                 backtest. There is no holdout and cannot be one at this tf.
+#   adjacent tfs  the SAME configuration is NEGATIVE on 30m and 1H over those
+#                 months, and negative in 3 of 4 years on 1H.
+#   consistency   66.7% of 30 screening cells positive, against a coin flip's
+#                 50%, on cells that are not independent.
+#   selection     chosen for STABILITY across fill models (~6% spread), not for
+#                 the best backtest — ranking on in-sample profit is what
+#                 produced every false positive in that study.
+#
+# There is nothing to filter or rank: the universe is one pinned contract and
+# the CCI state machine in the strategy does all the deciding. The `pinned`
+# engine exists so that is explicit rather than dressed up as a scan.
+engine: pinned
+universe: mcx_natural_gas_mini
+universe_size: 1
+
+filters: []
+ranker:
+  name: none
+  params: {}
+
+# ONE underlying. The strategy resolves it to a contract itself, using the same
+# selector and config the runner uses for execution.
+symbols: [NATGASMINI]

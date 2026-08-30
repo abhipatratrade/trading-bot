@@ -1,0 +1,33 @@
+# Which contract a CCI gas signal trades (Decision 037).
+#
+# User instruction, 2026-08-29: CARRY THE CONTRACT FORWARD, and if the nearest
+# expiry is inside 15 days, select the next month instead.
+#
+# WHAT THIS CHANGES vs THE BACKTEST — read before enabling.
+# The validated run used a CONTINUOUS FRONT-MONTH series and had no expiry
+# logic at all. A 15-day floor means roughly half of every month is spent on the
+# NEXT contract: a different instrument, at a different absolute price
+# (contango/backwardation), with thinner liquidity. The 4.5% stop is a percent
+# of price, so it lands at a different absolute level there. And each roll is
+# two real orders paying a real spread, where the spliced series charged
+# nothing. Live results will diverge from the 125-trade backtest in a direction
+# that run does not measure.
+#
+# Verified against the live scrip master 2026-08-29:
+#   2026-08-31 -> NATGASMINI-20260925-FUT   (25 days to expiry, held)
+#   2026-09-11 -> NATGASMINI-20261027-FUT   (14 days, rolled)
+contract_selection:
+  instrument: future
+  expiry_rule: nearest
+  min_days_to_expiry: 15
+  # No ceiling: "nearest past the floor" is the whole rule, and a max would
+  # only ever refuse the contract the floor just selected.
+  max_days_to_expiry: null
+  # CCI is computed on the FUTURES prints, not on a spot index — there is no
+  # spot series for natural gas on this venue, and the backtest signalled on
+  # the contract.
+  signal_source: contract
+  # The run applied no liquidity filter. Recorded as zero rather than invented:
+  # a threshold nobody tested would change which trades happen.
+  min_open_interest: 0
+  min_volume: 0

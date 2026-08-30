@@ -228,6 +228,23 @@ class Bucket:
         return self.contracts_yaml_path_for(scanner).is_file()
 
     @property
+    def allows_shorts(self) -> bool:
+        """Can this bucket legitimately hold a SHORT position?
+
+        Cash equity cannot: every Indian strategy here is long-only and a demat
+        account carries no short, so a short row on those buckets is corrupt —
+        Dhan reports a sale out of holdings as a negative day-position until
+        settlement, and acting on one BUYS shares to "close" a position that
+        does not exist (2026-08-18, PIIND).
+
+        A DERIVATIVE bucket is the opposite case: selling to open is a normal
+        entry, and 64 of the CCI gas strategy's 125 backtested trades are
+        sells. Reusing the cash rule there would silently drop every short from
+        the exit engine — the position would be opened and then never managed.
+        """
+        return self.trades_derivatives() or self.market != Market.INDIAN
+
+    @property
     def strategy_master_csv_path(self) -> Path:
         return self.folder / "strategy_master.csv"
 

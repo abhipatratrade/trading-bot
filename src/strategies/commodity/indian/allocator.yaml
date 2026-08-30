@@ -1,0 +1,76 @@
+# Sizing for commodity-indian (CCI gas reversion 15m) — Decision 037.
+#
+# backtest_ref: Backtesting Engine/results/handoff/cci_gas_15m/handoff.yaml
+#
+# ── mu/sigma, and the denominator ──────────────────────────────────────────
+# Per TRADING DAY, on MARGIN — the handoff states the denominator explicitly,
+# which is the field most likely to be got wrong in F&O (premium vs margin vs
+# underlying notional differ by ~100x). Margin is right here: a future's
+# capital at risk is what the exchange blocks.
+#
+# 89 trading days with at least one exit, over 2025-12-01 -> 2026-08-26.
+fractional_kelly: 0.25
+per_symbol_cap: 0.30
+aggregate_cap: 1.00
+
+default_for_unknown:
+  mu_per_period: 0.099501     # per trading day, fraction of margin
+  sigma_per_period: 0.448818
+
+stats: {}
+
+# ── THE KELLY OUTPUT NEEDS READING BEFORE IT IS TRUSTED ────────────────────
+# The handoff says so itself, and the arithmetic is why:
+#   raw Kelly = mu/sigma^2 = 0.0995 / 0.2014 = 0.494
+#   fractional (0.25)      = 0.1235 of equity as margin
+#   on Rs 5,00,000         = Rs 61,744 -> at Rs 9,859/lot (the REAL quoted
+#                            margin, probed 2026-08-29) that is 6 LOTS.
+#
+# On the in-sample path 6 lots implies a peak-to-trough drawdown of roughly
+# Rs 138,000 — about 28% of the bucket — and a single 16% overnight gap (one
+# occurred in-sample) costs ~8% of the bucket. Those numbers are the reason
+# `per_symbol_cap` is not the binding constraint here: Kelly is, and it is
+# sized off ONE favourable regime with no holdout.
+#
+# The figures are large because the denominator is a single mini lot
+# (~Rs 10k of margin) while daily P&L swings are a large multiple of it. That
+# is arithmetically correct and still not a licence to size on it.
+#
+# TO REDUCE SIZE, lower `fractional_kelly` — it is the honest knob. Do NOT
+# lower per_symbol_cap to compensate; that changes what the cap means for any
+# future strategy in this bucket.
+
+# Deliberately FLAT. The handoff names the absence of a regime filter as the
+# strategy's known gap and says none was found; regime.yaml is disabled and the
+# strategy_master row leaves both regime columns blank. These 1.0s are
+# belt-and-braces so no single edit re-introduces a gate the run never had.
+regime_multipliers:
+  bear: 1.00
+  neutral: 1.00
+  bull: 1.00
+
+# The margin the sizer converts a notional into lots with. NOT the fx path —
+# MCX is quoted in rupees, so the rate is 1 and the contract "size" is the
+# multiplier the registry supplies per contract (250 mmBtu for NATGASMINI),
+# which the runner passes as contract_sizes_override.
+fx_inr_per_usd: 1
+default_contract_size: 250
+contract_sizes:
+  NATGASMINI: 250
+
+# ── What the backtest achieved — REPORTING ONLY, never read by the sizer ───
+# Every figure is from the FULL fold, because no other fold exists (see
+# scanner.yaml). Read them as descriptive of one favourable regime.
+backtest_baseline:
+  profit_factor: 1.7988
+  win_rate: 0.552
+  mean_trade_return: 0.096841   # per trade, fraction of margin
+  trades: 125
+  note: >-
+    FULL fold — not a choice. TradingView caps intraday history so 15m gas
+    starts 2025-12-01 and the whole sample is the backtest; there is no holdout
+    and cannot be one at this timeframe. The same configuration is NEGATIVE on
+    30m and 1H over the same months and in 3 of 4 years on 1H. Net Rs 96,437 on
+    ONE lot over ~9 months, with a peak-to-trough drawdown of Rs 23,030 — 211%
+    of a single lot's margin, which is why sizing is the live question rather
+    than the edge.

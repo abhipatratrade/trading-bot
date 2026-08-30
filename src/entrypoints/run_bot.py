@@ -47,6 +47,7 @@ from src.data_sources.base import MarketData
 from src.data_sources.binance import BinanceData
 from src.data_sources.delta_india import DeltaIndiaData
 from src.data_sources.dhan import BOT_REQUEST_DELAY_SECONDS, DhanData
+from src.data_sources.dhan_fno import FnoRegistry
 from src.data_sources.symbol_loader import (
     DEFAULT_CSV,
     fetch_mappings,
@@ -164,6 +165,45 @@ def _bot_placed_order_id(exchange_order_id: str) -> bool:
             ).first()
             is not None
         )
+
+
+def _bucket_underlyings(bucket) -> set[str]:
+    """The underlyings a derivative bucket's scanner sets actually name.
+
+    Scoping the registry to these is what keeps it off the VM's memory ceiling:
+    the full NSE derivative segment is 74,322 contracts and MCX another 16,298,
+    against a 958MB box that has already OOM'd once (2026-08-21).
+
+    Reads every named scanner set (Decision 026), not just the default, or a
+    bucket running two sets would resolve only half its symbols.
+    """
+    from src.shared.scanner.engine import load_scanner_config
+    from src.shared.strategy_master.loader import load_strategy_master
+
+    names = {""}
+    try:
+        master = load_strategy_master(
+            bucket.strategy_master_csv_path,
+            bucket_trading_type=bucket.trading_type.value,
+        )
+        names |= {row.scanner for row in master.rows}
+    except Exception:  # noqa: BLE001 — a bad CSV fails the runner, not this
+        _log.warning("bucket_underlyings_master_unreadable", bucket_id=bucket.id)
+
+    out: set[str] = set()
+    for name in names:
+        path = bucket.scanner_yaml_path_for(name)
+        if not path.is_file():
+            continue
+        try:
+            out |= set(load_scanner_config(path).symbols)
+        except Exception:  # noqa: BLE001
+            _log.warning(
+                "bucket_underlyings_scanner_unreadable",
+                bucket_id=bucket.id,
+                scanner=name or "(default)",
+            )
+    return out
 
 
 def _price_bands(data: object, is_dhan: bool) -> dict[str, Decimal | None] | None:
@@ -330,6 +370,8 @@ def main() -> None:
     # Broker financing rate on the funded portion of a carried position
     # (Decision 032) — subtracted from realized P&L by the reconciler.
     carry_aprs: dict[str, Decimal] = {}
+    # exchange -> the underlyings its buckets trade (Decision 037).
+    derivative_underlyings: dict[str, set[str]] = {}
     for bucket in all_buckets:
         if (
             bucket.config.enabled
@@ -344,14 +386,50 @@ def main() -> None:
                 stop_products[bucket.id] = bucket.config.product
             if bucket.config.carry_interest_apr is not None:
                 carry_aprs[bucket.id] = bucket.config.carry_interest_apr
+            # Decision 037 — which derivative venues this process needs a
+            # contract registry for. Collected per EXCHANGE rather than per
+            # bucket because the registry is one catalogue per venue, and two
+            # buckets on the same exchange must share it (a second copy would
+            # double the parse on a 958MB VM).
+            if bucket.contracts_yaml_path.is_file():
+                derivative_underlyings.setdefault(
+                    bucket.config.exchange, set()
+                ).update(_bucket_underlyings(bucket))
     if dhan_accounts:
         try:
             # Pace charts calls under Dhan's 5 req/s Data-API cap: the
             # intraday-indian morning scan fetches ~2 calls/symbol across the
             # NIFTY-100 (Decision 029). Single-fetch paths (swing exits) only
             # eat the small per-call delay.
+            # Decision 037 — attach a contract registry when any enabled
+            # bucket trades derivatives. SCOPED to the underlyings those
+            # buckets actually name: the full NSE segment is 74k contracts and
+            # MCX another 16k, and this VM has under a gigabyte.
+            #
+            # One registry per process, so only ONE exchange is supported at a
+            # time here. That is honest rather than limiting today (the single
+            # derivative bucket is MCX), and it fails loudly below rather than
+            # silently resolving half the symbols if that ever changes.
+            fno_registry = None
+            if derivative_underlyings:
+                if len(derivative_underlyings) > 1:
+                    _log.error(
+                        "multiple_derivative_exchanges_unsupported",
+                        exchanges=sorted(derivative_underlyings),
+                    )
+                exchange, underlyings = sorted(derivative_underlyings.items())[0]
+                fno_registry = FnoRegistry(
+                    underlyings=underlyings, exchange=exchange
+                )
+                _log.info(
+                    "fno_registry_attached",
+                    exchange=exchange,
+                    underlyings=sorted(underlyings),
+                )
             dhan_data = DhanData.from_settings(
-                settings, request_delay_seconds=BOT_REQUEST_DELAY_SECONDS
+                settings,
+                request_delay_seconds=BOT_REQUEST_DELAY_SECONDS,
+                fno=fno_registry,
             )
             for ref, ref_bucket_ids in dhan_accounts.items():
                 client = DhanClient.from_settings(
@@ -364,6 +442,12 @@ def main() -> None:
                     # unverified whether Dhan echoes it onto super-order legs,
                     # and it would not survive a restart if it did not.
                     owns_order_id=_bot_placed_order_id,
+                    # Decision 036/037 — per-contract tick, lot and freeze
+                    # quantity. None for a cash-only process, which keeps every
+                    # equity bucket on its historical constants.
+                    contract_spec=(
+                        dhan_data.contract_spec if fno_registry else None
+                    ),
                 )
                 # Reachability probe (one authed GET). Dhan's SANDBOX edge
                 # blocks datacenter IPs with a bodyless 403 (confirmed from the

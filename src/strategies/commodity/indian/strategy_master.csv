@@ -1,0 +1,2 @@
+strategy_name,tf,min_vol,trading_regime_1,trading_regime_2,trading_type,scanner
+cci_gas_reversion_15m,15m,,,,commodity,

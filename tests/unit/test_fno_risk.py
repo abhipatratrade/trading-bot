@@ -396,3 +396,23 @@ def test_a_user_position_larger_than_ours_is_still_flagged() -> None:
         owned={"SWIGGY": Decimal("15")},
     )
     assert not got.ok
+
+
+# ── a derivative bucket may hold a short; a cash bucket may not ─────────
+def test_only_derivative_buckets_allow_shorts() -> None:
+    """`Market.INDIAN` meant "cash equity" when the exit engine's short guard
+    was written. commodity-indian is also INDIAN and holds shorts as a matter
+    of course — 64 of its strategy's 125 backtested trades are sells — so
+    gating on the market would drop every one from the exit engine and leave
+    the position open and unmanaged."""
+    from src.shared.bucket import load_buckets
+
+    by_id = {b.id: b for b in load_buckets()}
+    assert by_id["commodity-indian"].allows_shorts is True
+    # Cash equity must keep refusing them: a demat account carries no short,
+    # and Dhan reports a sale out of holdings as a negative day-position until
+    # settlement (2026-08-18, PIIND).
+    assert by_id["swing-indian"].allows_shorts is False
+    assert by_id["intraday-indian"].allows_shorts is False
+    # Crypto sub-accounts have always been able to.
+    assert by_id["longterm-crypto"].allows_shorts is True
