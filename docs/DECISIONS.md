@@ -2096,3 +2096,79 @@ accumulated forward evidence, the question to ask is whether the strategy is
 positive out-of-sample **and** whether its overnight gap exposure is acceptable
 at the size Kelly wants — which on the supplied μ/σ is 5 lots at ₹5L, a 23%
 drawdown on the in-sample path and ~7% of the bucket on a single 16% gap.
+
+### Dhan Forever Orders and Conditional Triggers — API research, 2026-08-30
+
+Prompted by a user question during Decision 037: can the stop, or the
+condition-based exit, be made to survive the bot dying? Read from Dhan's own v2
+API docs. This settles part of Decision 035's open question and opens a new one.
+
+**Correction to something I asserted on 2026-08-29:** I said a condition-based
+exit "cannot be delegated to any venue, under any order type." That is wrong.
+Dhan has a Conditional Trigger API that fires on technical indicators. The
+conclusion for the commodity bucket happens to be unchanged, but the reasoning
+was not — the limit is a segment restriction, not a law of exchanges.
+
+#### 1. Conditional Trigger API — indicator-based, and NOT available on MCX
+
+`POST /alerts/orders` (also PUT/DELETE/GET). Fires one or more orders when a
+condition is met, and the condition may be **price OR a technical indicator**.
+
+- `timeFrame`: `DATE`, `ONE_MIN`, `FIVE_MIN`, `FIFTEEN_MIN` — the 15-minute bar
+  this strategy signals on is directly expressible.
+- `expDate` defaults to **one year**, so a trigger survives sessions.
+- `operator` includes `CROSSING_UP`; `indicatorName` takes values like `SMA_5`,
+  `SMA_10`.
+
+**The blocker:** the documentation states *"Conditional Triggers are currently
+supported only for Equities and Indices,"* and the allowed `exchangeSegment`
+values are `NSE_EQ`, `BSE_EQ`, `IDX_I`. **`MCX_COMM` is not among them.**
+
+A second, softer limit even where it IS available: the indicator list lives in
+the Annexure and CCI was not confirmed present — the documented examples are
+simple moving averages. "CCI(20) on hlc3" may not be expressible at all.
+
+#### 2. Forever Order (GTT) — solves persistence, triggers on PRICE only
+
+`POST /forever/orders`, `orderFlag` of `SINGLE` or `OCO`. OCO carries both legs
+(`price1` / `triggerPrice1` / `quantity1`, with `legName` of `TARGET_LEG` or
+`STOP_LOSS_LEG`), so one request can rest a stop AND a target.
+
+**Validity is up to 365 days** — "until it either triggers or reaches a maximum
+validity period of 365 days, whichever comes first." That is precisely the
+property Decision 035 wanted: a stop that does not expire at session close.
+
+**SOURCES DISAGREE on whether it reaches MCX with a MARGIN product**, and the
+disagreement is recorded rather than resolved by preference:
+
+| source | creation `productType` | creation `exchangeSegment` |
+|---|---|---|
+| dhanhq.co/docs/v2/forever/ | `CNC`, `MTF` | NSE_EQ, NSE_FNO, BSE_EQ, MCX_COMM |
+| Kalaiviswa/dhan-api-v2-docs mirror | `CNC`, `MTF`, `INTRADAY`, `MARGIN` | NSE_EQ, NSE_FNO, BSE_EQ, MCX_COMM |
+
+Dhan's own page is the more authoritative of the two and reads NARROWER. The
+Annexure separately defines `MARGIN` as "Carry Forward in Futures & Options",
+and Dhan's retail support article frames Forever Orders around ETF investing —
+both of which lean toward the narrower reading.
+
+**One empirical test settles it**: create a SINGLE Forever Order on the front
+NATGASMINI future with `productType: MARGIN`, a trigger far from market so it
+cannot fire, then cancel it. A rejection names the limitation exactly. That
+places a real (resting) order and therefore needs explicit approval first.
+
+#### What this changes
+
+- **For commodity-indian: the CCI exit still cannot be delegated.** Not because
+  no venue can do it, but because Dhan's indicator triggers stop at equities and
+  indices. It remains bot-side and blind if the bot dies.
+- **For the STOP on commodity-indian:** a Forever Order would fix the
+  DAY-validity expiry *if* MCX+MARGIN is permitted. Unresolved above.
+- **DECISION 035 IS PARTLY ANSWERED.** It asked whether GTT could carry the
+  overnight stop for the multi-day Indian buckets. `MTF` is an allowed creation
+  productType in BOTH readings, so **swing-indian's overnight gap is closable**
+  — that has been open since 2026-08-18.
+- **NEW, and worth more than any of the above:** Conditional Triggers cover
+  `NSE_EQ` / `BSE_EQ` / `IDX_I` at 15-minute resolution with a one-year life.
+  The Decision 036 F&O buckets and swing-indian could delegate indicator-based
+  exits to the venue — subject to whether the specific indicator is expressible.
+  Nothing in this repo uses that today.
