@@ -259,7 +259,7 @@ async def _run(symbols: dict[str, str], stop_at: datetime, quiet: bool) -> dict:
     return {"ticks": ticks, "notes": notes}
 
 
-def _report(result: dict) -> None:
+def _report(result: dict) -> str:
     ticks: dict[str, list] = result["ticks"]
     notes: list[str] = result["notes"]
     print("\n" + "=" * 70)
@@ -277,7 +277,11 @@ def _report(result: dict) -> None:
             "subscription never delivered anything. Check the token, the market\n"
             "hours, and the protocol notes above before drawing any conclusion."
         )
-        return
+        return (
+            "Dhan closing-bar probe: <b>NO DATA</b>.\n"
+            "The subscription delivered nothing at all, which says nothing about "
+            "15:15. Check the token and the market hours."
+        )
 
     sym0 = next(iter(ticks))
     arrival, _, ltt0 = ticks[sym0][0]
@@ -349,6 +353,28 @@ def _report(result: dict) -> None:
         print("  Re-run on a TRADING DAY, started by ~15:10 IST.")
     print("=" * 70)
 
+    if n_after > 0:
+        return (
+            f"Dhan closing-bar probe: <b>TICKS EXIST</b> after 15:15 "
+            f"({n_after} ticks; control window {n_control}).\n"
+            "The live feed carries the closing window — Dhan is only failing to "
+            "SERVE it through the charts REST API. Rebuilding bin 6 from a "
+            "recorder is feasible."
+        )
+    if n_control > 0:
+        return (
+            f"Dhan closing-bar probe: <b>NO TICKS</b> after 15:15, and the feed "
+            f"WAS live ({n_control} ticks in 15:00-15:15).\n"
+            "The gap is upstream of the REST API. A recorder would record "
+            "nothing — do not build one. Report to apihelp@dhan.co."
+        )
+    return (
+        "Dhan closing-bar probe: <b>INCONCLUSIVE</b>.\n"
+        "No ticks in the 15:00-15:15 control window either, so the feed was not "
+        "delivering a live session and the silence after 15:15 proves nothing. "
+        "Re-run on a trading day, started by ~14:55 IST."
+    )
+
 
 def main() -> None:
     p = argparse.ArgumentParser(
@@ -362,6 +388,11 @@ def main() -> None:
         help="run for N minutes instead of until 15:35 IST",
     )
     p.add_argument("--quiet", action="store_true", help="suppress the per-tick log")
+    p.add_argument(
+        "--alert",
+        action="store_true",
+        help="also push the verdict to Telegram (the bot's own alert channel)",
+    )
     args = p.parse_args()
 
     now = datetime.now(IST)
@@ -392,7 +423,18 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\ninterrupted -- no report (re-run across 15:15 for a verdict).")
         return
-    _report(result)
+    verdict = _report(result)
+
+    if args.alert:
+        # The probe fires unattended from a systemd timer, so the verdict has to
+        # travel to the reader rather than sit in a log file on the VM.
+        from src.core.alerts import send_alert
+
+        sent = send_alert(verdict)
+        print(
+            "\nTelegram: "
+            + ("sent" if sent else "NOT sent (channel disabled or failed)")
+        )
 
 
 if __name__ == "__main__":
