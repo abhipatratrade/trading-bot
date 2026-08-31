@@ -55,6 +55,52 @@ from src.data_sources.dhan_fno import FnoRegistry
 
 _FOREVER_PATH = "/v2/forever/orders"
 
+# Rejections that say NOTHING about whether MCX + MARGIN is permitted.
+#
+# The request died at the perimeter — IP allowlist, auth, quota, a malformed
+# body — so Dhan never looked at ``productType`` or ``exchangeSegment`` at all.
+# Reporting "not available" from one of these is how a decision gets closed on
+# evidence that was never collected: on 2026-08-31 a DH-905 "Invalid IP" from
+# an unlisted laptop printed the full NOT-AVAILABLE verdict, which would have
+# left swing-indian's overnight gap open on a finding nobody had made.
+_PERIMETER_MARKERS = (
+    "invalid ip",
+    "invalid token",
+    "invalid client",
+    "unauthor",
+    "forbidden",
+    "too many requests",
+    "rate limit",
+    "timed out",
+    "timeout",
+    "internal server",
+    "service unavailable",
+    "bad gateway",
+)
+
+# Only a refusal that names WHAT WE SENT answers the question.
+_VERDICT_MARKERS = (
+    "product",
+    "segment",
+    "order type",
+    "not allowed",
+    "not supported",
+    "not permitted",
+    "forever",
+)
+
+
+def _answers_the_question(message: str) -> bool:
+    """True only if Dhan refused the PAYLOAD rather than the CALLER.
+
+    Biased hard toward returning False. A wrong "inconclusive" costs one more
+    probe run; a wrong "not available" closes a live risk question on nothing.
+    """
+    text = message.lower()
+    if any(m in text for m in _PERIMETER_MARKERS):
+        return False
+    return any(m in text for m in _VERDICT_MARKERS)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -197,12 +243,21 @@ def main() -> int:
         )
     except DhanAPIError as exc:
         print(f"  REJECTED: [{exc.code}] {exc}")
+        if _answers_the_question(str(exc)):
+            print(
+                "\nNOT AVAILABLE — and the message above names why.\n"
+                "  The DAY-validity stop stands, and the narrower reading of\n"
+                "  the docs (CNC/MTF only) is the correct one."
+            )
+            return 1
         print(
-            "\nNOT AVAILABLE — and the message above names why.\n"
-            "  The DAY-validity stop stands, and the narrower reading of the\n"
-            "  docs (CNC/MTF only) is the correct one."
+            "\nINCONCLUSIVE — the request never reached the product check.\n"
+            "  This rejection is about the CONNECTION, not about whether MCX\n"
+            "  accepts a MARGIN Forever Order. Nothing has been learned about\n"
+            "  Decision 035; do NOT close it on this. Re-run from an allowed\n"
+            "  IP — the bot VM, 34.14.200.220 (docs/runbook.md)."
         )
-        return 1
+        return 3
     except Exception as exc:  # noqa: BLE001
         print(f"  ERROR {type(exc).__name__}: {exc}")
         return 1
