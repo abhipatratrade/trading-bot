@@ -230,6 +230,7 @@ class DhanClient(Broker):
         data_token_manager: DhanTokenManager | None = None,
         product_type: str = "MTF",
         owns_order_id: Callable[[str], bool] | None = None,
+        contract_spec: Callable[[str], ContractSpec | None] | None = None,
     ) -> DhanClient:
         """Build a client for the active mode (House Rule #6).
 
@@ -258,6 +259,7 @@ class DhanClient(Broker):
             base_url=acct.order_base_url,
             product_type=product_type,
             owns_order_id=owns_order_id,
+            contract_spec=contract_spec,
         )
 
     # ── HTTP ────────────────────────────────────────────────────────────
