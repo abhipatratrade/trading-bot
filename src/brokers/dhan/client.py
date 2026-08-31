@@ -129,6 +129,27 @@ def _is_ours(correlation_id: object) -> bool:
     return str(correlation_id or "").strip().lower() not in _NOT_OURS
 
 
+# Dhan keeps GTTs in a SEPARATE order book from working orders.
+_FOREVER_PATH = "/v2/forever/orders"
+
+# Forever-order states that are finished. Anything else counts as still
+# RESTING — including a status this list has never heard of.
+#
+# The default direction is deliberate. An unrecognised state treated as dead
+# makes the order INVISIBLE to the orphan sweep, and an invisible forever order
+# is the precise failure this whole path exists to prevent: it can still
+# trigger, and with no position behind it that trigger OPENS one. An
+# unrecognised state treated as resting costs, at worst, a redundant cancel.
+_FOREVER_DEAD_STATES = {
+    "CANCELLED",
+    "TRIGGERED",
+    "EXPIRED",
+    "REJECTED",
+    "TRADED",
+    "COMPLETE",
+}
+
+
 def is_invalid_token_error(exc: BaseException) -> bool:
     """True when ``exc`` is a Dhan single-session token invalidation (DH-906).
 
@@ -219,6 +240,14 @@ class DhanClient(Broker):
         # per order per lookup, and the sweep does three lookups a tick against
         # a rate-limited account.
         self._owned_ids: set[str] = set()
+        # Order ids last seen on the FOREVER endpoint. ``cancel_order`` reads it
+        # to route the DELETE, because the two order books are separate and a
+        # cancel sent to the wrong one returns success while the order keeps
+        # resting. Refreshed wholesale by every ``get_forever_orders`` call, and
+        # the sweep always lists before it cancels, so it cannot go stale within
+        # a tick. An id that is not in here falls back to the working-order
+        # endpoint, which is the behaviour every existing caller already has.
+        self._forever_ids: set[str] = set()
         self._log = get_logger("brokers.dhan")
 
     @classmethod
@@ -819,7 +848,16 @@ class DhanClient(Broker):
                     raw={"error": "correlationId not found"},
                 )
             exchange_order_id = order.exchange_order_id
-        result = self._request("DELETE", f"/v2/orders/{exchange_order_id}")
+        # Route to the book the order actually lives in. A GTT deleted via
+        # /v2/orders is not found there, and Dhan's answer to that is not
+        # reliably an error — so the wrong endpoint can report success while the
+        # order keeps resting for up to a year. See ``_forever_ids``.
+        if exchange_order_id in self._forever_ids:
+            path = f"{_FOREVER_PATH}/{exchange_order_id}"
+            self._log.info("cancelling_forever_order", order_id=exchange_order_id)
+        else:
+            path = f"/v2/orders/{exchange_order_id}"
+        result = self._request("DELETE", path)
         status = str(result.get("orderStatus", "")).upper() if isinstance(result, dict) else ""
         return CancelResult(
             exchange_order_id=exchange_order_id,
@@ -941,6 +979,71 @@ class DhanClient(Broker):
         if symbol is not None:
             orders = [o for o in orders if o.symbol == symbol]
         return orders
+
+    def supports_forever_orders(self) -> bool:
+        """True — proven live on MCX_COMM with MARGIN, 2026-08-31."""
+        return True
+
+    def get_forever_orders(self, symbol: str | None = None) -> list[OpenOrder]:
+        """Resting GTTs, shaped as ``OpenOrder`` so the stop sweep can plan on them.
+
+        Deliberately NOT folded into ``get_open_orders``. A GTT is not a working
+        order, and the reconciler matches working orders against ledger trades —
+        handing it a year-long resting trigger would invite it to reason about
+        an order that is not trying to fill. The one consumer that genuinely
+        needs these is ``plan_stop_protection``, which asks a narrower question:
+        what protective stops are resting right now?
+
+        ``reduce_only`` carries the same correlationId proof as the working-order
+        path, and for the same Decision 027 reason: the sweep CANCELS what it
+        matches, and the user places GTTs by hand in the Dhan app on this shared
+        account. A GTT without our correlationId is theirs, stays False here, and
+        is therefore invisible to the planner rather than merely skipped by it.
+        """
+        result = self._request("GET", _FOREVER_PATH) or []
+        if not isinstance(result, list):
+            self._log.warning("forever_orders_unexpected_shape", got=type(result).__name__)
+            result = []
+        orders = [
+            self._to_forever_order(o)
+            for o in result
+            if str(o.get("orderStatus", "")).upper() not in _FOREVER_DEAD_STATES
+        ]
+        # Refresh the routing set from the FULL list, before any symbol filter —
+        # a cancel must route correctly for every resting GTT, not just the ones
+        # this particular caller asked about.
+        self._forever_ids = {
+            o.exchange_order_id for o in orders if o.exchange_order_id
+        }
+        if symbol is not None:
+            orders = [o for o in orders if o.symbol == symbol]
+        return orders
+
+    def _to_forever_order(self, o: dict[str, Any]) -> OpenOrder:
+        qty = Decimal(str(o.get("quantity", 0) or 0))
+        # Trigger first, price second. The super-order bug of 2026-08-25 was
+        # exactly this shape — Dhan returned a resting leg's trigger under
+        # `price` — so read the field that should hold it, then fall back rather
+        # than reporting a stop with no trigger at all.
+        trig = o.get("triggerPrice") or o.get("price")
+        ours = _is_ours(o.get("correlationId"))
+        return OpenOrder(
+            exchange_order_id=str(o.get("orderId", "")),
+            client_order_id=str(o["correlationId"]) if ours else None,
+            symbol=o.get("tradingSymbol", str(o.get("securityId", ""))),
+            side=str(o.get("transactionType", "")).lower(),
+            size=qty,
+            # A GTT has never filled anything; it rests in full until it fires.
+            unfilled_size=qty,
+            order_type=str(o.get("orderType", "")),
+            limit_price=Decimal(str(o["price"])) if o.get("price") else None,
+            status="open",
+            stop_price=Decimal(str(trig)) if trig else None,
+            reduce_only=bool(trig) and ours,
+            forever=True,
+            created_at=_parse_ts(o.get("createTime")),
+            raw=o,
+        )
 
     def required_margin(
         self,

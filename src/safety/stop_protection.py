@@ -785,6 +785,7 @@ def ensure_stop_protection(
     clock: Clock | None = None,
     shared_account: bool = False,
     attached_stops_enabled: bool = False,
+    forever_stops_enabled: bool = False,
 ) -> StopPlan:
     """Make the exchange state match the plan for one sub-account.
 
@@ -810,6 +811,50 @@ def ensure_stop_protection(
 
     positions = broker.get_positions()
     open_orders = broker.get_open_orders()
+
+    # Decision 035/037: GTTs rest in a SECOND order book, and the planner below
+    # can only cancel an orphan it can see. Merged in here rather than inside
+    # ``get_open_orders`` so the reconciler's view of working orders is
+    # untouched — a year-long resting trigger is not an order trying to fill.
+    #
+    # Why a forever orphan is worse than a working one, and why this pass
+    # exists at all: a working stop is validity DAY, so an orphan expires by
+    # itself — it FAILS SAFE. A forever order rests up to 365 days with no link
+    # to any position, so one that outlives its position OPENS a position when
+    # it triggers. Nothing else in this codebase would ever retire it.
+    #
+    # Dark by default, and gated on the FEATURE rather than the capability, for
+    # the reason the attached-stop branch below documents: nothing here places a
+    # forever order yet, so polling every tick would spend quota on a
+    # guaranteed-empty answer — on the account that returned 805 "too many
+    # requests" on 2026-08-31. Turn it on in the same change that starts
+    # resting them.
+    if forever_stops_enabled and hasattr(broker, "supports_forever_orders"):
+        try:
+            if broker.supports_forever_orders():  # type: ignore[attr-defined]
+                open_orders = [
+                    *open_orders,
+                    *broker.get_forever_orders(),  # type: ignore[attr-defined]
+                ]
+        except Exception:
+            # Does NOT abort the sweep — the opposite of the attached-stop
+            # lookup below, and deliberately. There, an empty answer is
+            # indistinguishable from "nothing attached" and acting on it would
+            # CANCEL live protection, so skipping the tick is the safe move.
+            # Here the cost of a failed read is one more tick of an invisible
+            # orphan, while aborting would drop standalone stop protection for
+            # every position on the account.
+            _log.error(
+                "forever_order_lookup_failed",
+                account_ref=account_ref,
+                exc_info=True,
+            )
+            send_alert_dedup(
+                f"forever_lookup:{account_ref}",
+                f"[{account_ref}] could not read resting GTTs — an orphaned "
+                f"forever stop stays invisible this tick. A GTT that outlives "
+                f"its position OPENS one when it triggers.",
+            )
 
     # Decision 034: which positions the venue already protects itself. This is
     # read BEFORE anything is planned and a failure aborts the whole sweep,

@@ -240,6 +240,21 @@ class OpenOrder:
     status: str
     stop_price: Decimal | None = None
     reduce_only: bool = False
+    # A venue-resident GTT (Dhan "Forever Order") rather than a working order.
+    #
+    # It matters because the two live on DIFFERENT endpoints and CANCEL
+    # differently: a working order is DELETE /v2/orders/{id}, a forever order is
+    # DELETE /v2/forever/orders/{id}. Routing a cancel to the wrong one leaves
+    # the order resting while reporting success.
+    #
+    # The lifetime is the reason this distinction is safety-critical. A working
+    # stop is validity DAY and expires on its own, so an orphan is self-clearing
+    # — it FAILS SAFE. A forever order lives up to 365 days with no link to any
+    # position, so a stop that outlives its position becomes a naked ENTRY when
+    # it triggers: it FAILS OPEN. Proven acceptable on MCX_COMM with MARGIN
+    # 2026-08-31 (Decision 035/037), which is exactly why the orphan sweep has
+    # to be able to see one.
+    forever: bool = False
     created_at: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
