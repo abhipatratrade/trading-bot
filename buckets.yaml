@@ -199,7 +199,30 @@ buckets:
     # sizer is Kelly, and the margin preflight fits every order to the rupee
     # figure Dhan quotes for it.
     leverage_max: 7
-    enabled: false
+    # LIVE on user instruction 2026-08-31, with these facts on the table and
+    # unresolved — recorded here because `enabled: true` is the only line in
+    # this file that spends real money, and the migration that seeded this
+    # bucket shipped it false on purpose:
+    #
+    #   * No out-of-sample fold, STRUCTURALLY. TradingView caps intraday
+    #     history, so the 15m sample starts 2025-12-01 and the whole sample IS
+    #     the backtest. The same configuration is NEGATIVE on 30m and 1H over
+    #     those same months, and negative in 3 of 4 years on 1H.
+    #   * The edge IS the unprotected exposure. 81 of 125 backtested trades are
+    #     held across a session close and net +Rs 122,021; the 44 intraday-only
+    #     trades net -Rs 25,584. MCX is shut 23:30-09:00 and over weekends, and
+    #     the resting stop cannot fire while it is shut. Four trades gapped
+    #     through it in-sample.
+    #   * The roll is not in the backtest, which traded a spliced continuous
+    #     front-month series with no expiry logic and paid no roll spread.
+    #   * The MCX ORDER PATH HAS NEVER PLACED A LIVE TRADE. The margin
+    #     preflight and the Forever Order probe are proven; entry, exit, the
+    #     resting stop on MCX, and the roll executor are not.
+    #
+    # `max_lots_per_position: 1` below is what makes that acceptable rather
+    # than reckless: it caps the implied peak-to-trough drawdown near 4.6% of
+    # the bucket instead of ~28%.
+    enabled: true
     account_ref: dhan
     # Carry-forward. The strategy holds overnight by design — that is where its
     # edge lives — so this is NOT an intraday product.
