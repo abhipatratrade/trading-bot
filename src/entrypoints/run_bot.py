@@ -35,6 +35,7 @@ from src.core.alerts import (
     reset_alert_dedup,
     send_alert,
     send_alert_dedup,
+    send_alert_throttled,
 )
 from src.core.clock import RealClock
 from src.core.config import get_settings
@@ -486,11 +487,16 @@ def main() -> None:
                 )
         except Exception:
             _log.error("dhan_account_init_failed", exc_info=True)
-            send_alert(
+            # Throttled ACROSS restarts, not just within this process: this
+            # fires during startup, and a startup failure is restarted forever
+            # by systemd. See send_alert_throttled — 2026-08-30 sent 829 of
+            # these in 20 hours and buried the alert that named the fault.
+            send_alert_throttled(
+                "startup:dhan_account_init_failed",
                 "[bot] Dhan account init FAILED — swing-indian will NOT run "
                 "(crypto buckets unaffected). Causes: bad Dhan creds on the "
                 "VM, or the Dhan sandbox edge-blocking this host's IP "
-                "(datacenter IPs get 403; awaiting Dhan support)."
+                "(datacenter IPs get 403; awaiting Dhan support).",
             )
             dhan_data = None
             # Roll back partial Dhan wiring so the runner loop skips Indian buckets.
@@ -553,10 +559,13 @@ def main() -> None:
         enabled_ids = [b.id for b in all_buckets if b.config.enabled]
         if enabled_ids:
             _log.error("no_runners_despite_enabled_buckets", enabled=enabled_ids)
-            send_alert(
+            # Throttled across restarts — this is the exit that systemd retries
+            # forever, so an unthrottled send here is a guaranteed flood.
+            send_alert_throttled(
+                "startup:no_runners_despite_enabled_buckets",
                 f"[bot] {len(enabled_ids)} bucket(s) enabled but NONE could "
                 f"start ({', '.join(enabled_ids)}) — exiting non-zero so "
-                f"systemd retries. Usually an account init failure above."
+                f"systemd retries. Usually an account init failure above.",
             )
             raise SystemExit(1)
         _log.error("no_enabled_buckets")

@@ -27,7 +27,9 @@ the same key to emit a one-off "recovered" ping and reset the counter::
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 import httpx
 
@@ -46,6 +48,16 @@ _DEFAULT_DEDUP_WINDOW_SECONDS = 3600.0
 # until the process restarted (journal 2026-06-23: a transient tick
 # error silenced its own channel for ~6h).
 _dedup_state: dict[str, tuple[int, float]] = {}
+
+# Cross-PROCESS throttle state. ``_dedup_state`` above is per-process, which is
+# right for a long-lived loop and useless in a crash loop: systemd hands every
+# restart a fresh interpreter and an empty dict. Disk is the only memory that
+# survives that, so this one lives beside the token cache in /state (already
+# gitignored).
+_THROTTLE_STATE_PATH = (
+    Path(__file__).resolve().parents[2] / "state" / "alert_throttle.json"
+)
+_DEFAULT_THROTTLE_SECONDS = 3600.0
 
 
 def send_alert(message: str) -> bool:
@@ -199,3 +211,54 @@ def reset_alert_dedup(key: str | None = None) -> None:
     else:
         _dedup_state.pop(key, None)
         _sustained_state.pop(key, None)
+
+
+def send_alert_throttled(
+    key: str,
+    message: str,
+    min_interval_seconds: float = _DEFAULT_THROTTLE_SECONDS,
+    *,
+    path: Path | None = None,
+) -> bool:
+    """Send at most once per ``min_interval_seconds`` for ``key``, ACROSS restarts.
+
+    ``send_alert_dedup`` counts in memory, so a process that dies and is
+    restarted starts again from zero. That is exactly the shape of a startup
+    failure: the bot exits non-zero, systemd restarts it, it fails the same way
+    and alerts again. On 2026-08-30 a ``contract_spec`` TypeError did this 414
+    times and sent **829 Telegram messages in 20 hours** — which did not merely
+    annoy, it buried the capped dead-man's-switch alert that actually named the
+    fault. Use this for anything that can fire during startup.
+
+    State is a JSON map of key -> last-sent unix time. Wall clock, not
+    ``time.monotonic``, because monotonic is meaningless across processes.
+
+    Fail-open: if the file cannot be read or written the alert is SENT. A
+    duplicate page is a nuisance; a swallowed one is how outages get missed.
+    """
+    target = path or _THROTTLE_STATE_PATH
+    now = time.time()
+
+    state: dict[str, float] = {}
+    try:
+        if target.exists():
+            loaded = json.loads(target.read_text())
+            if isinstance(loaded, dict):
+                state = {k: float(v) for k, v in loaded.items()}
+    except Exception:  # noqa: BLE001 - fail open, see docstring
+        _log.warning("alert_throttle_read_failed", key=key, exc_info=True)
+        state = {}
+
+    last = state.get(key)
+    if last is not None and 0 <= now - last < min_interval_seconds:
+        return False
+
+    state[key] = now
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(state))
+    except Exception:  # noqa: BLE001 - fail open, see docstring
+        _log.warning("alert_throttle_write_failed", key=key, exc_info=True)
+
+    minutes = max(1, int(min_interval_seconds // 60))
+    return send_alert(f"{message}\n(repeats suppressed for {minutes}m)")
