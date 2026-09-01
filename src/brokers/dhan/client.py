@@ -232,6 +232,7 @@ class DhanClient(Broker):
         mtf_fallback_cnc: bool = True,
         http: httpx.Client | None = None,
         owns_order_id: Callable[[str], bool] | None = None,
+        canonical_symbol: Callable[[str], str | None] | None = None,
         contract_spec: Callable[[str], ContractSpec | None] | None = None,
     ) -> None:
         self._token = token_manager
@@ -252,6 +253,11 @@ class DhanClient(Broker):
         # adapter stays DB-free (the backtester imports it). See
         # ``_owns_super_order`` for why correlationId alone is not enough.
         self._owns_order_id = owns_order_id
+        # Dhan securityId -> the symbol THIS BOT uses. Injected like
+        # ``resolve_symbol``, so the adapter still knows nothing about the
+        # scrip master. None (cash equity) keeps Dhan's tradingSymbol, which
+        # there IS the bot's ticker. See ``_symbol_of``.
+        self._canonical_symbol = canonical_symbol
         # Ids the ledger has already confirmed as ours. Bounded by the number of
         # super orders this process places; the alternative is a DB round-trip
         # per order per lookup, and the sweep does three lookups a tick against
@@ -276,6 +282,7 @@ class DhanClient(Broker):
         data_token_manager: DhanTokenManager | None = None,
         product_type: str = "MTF",
         owns_order_id: Callable[[str], bool] | None = None,
+        canonical_symbol: Callable[[str], str | None] | None = None,
         contract_spec: Callable[[str], ContractSpec | None] | None = None,
     ) -> DhanClient:
         """Build a client for the active mode (House Rule #6).
@@ -305,6 +312,7 @@ class DhanClient(Broker):
             base_url=acct.order_base_url,
             product_type=product_type,
             owns_order_id=owns_order_id,
+            canonical_symbol=canonical_symbol,
             contract_spec=contract_spec,
         )
 
@@ -774,7 +782,7 @@ class DhanClient(Broker):
             leg = self._stop_leg(order)
             if leg is None:
                 continue
-            symbol = order.get("tradingSymbol") or str(order.get("securityId", ""))
+            symbol = self._symbol_of(order)
             # Dhan reports a resting leg's trigger under ``price``. The
             # ``stopLossPrice`` key exists only on the PLACEMENT body we send —
             # it does not come back on the read, so reading it alone returned
@@ -831,9 +839,7 @@ class DhanClient(Broker):
             ) from exc
 
         for order in orders:
-            order_symbol = order.get("tradingSymbol") or str(
-                order.get("securityId", "")
-            )
+            order_symbol = self._symbol_of(order)
             if order_symbol != symbol or self._stop_leg(order) is None:
                 continue
             order_id = str(order.get("orderId", ""))
@@ -874,7 +880,7 @@ class DhanClient(Broker):
             if not live_target:
                 continue
             order_id = str(order.get("orderId", ""))
-            symbol = order.get("tradingSymbol") or str(order.get("securityId", ""))
+            symbol = self._symbol_of(order)
             if order_id and self._retire_target_leg(order_id, symbol):
                 cleared.append(order_id)
         return cleared
@@ -950,7 +956,7 @@ class DhanClient(Broker):
                 continue
             out.append(
                 PositionInfo(
-                    symbol=h.get("tradingSymbol", str(h.get("securityId", ""))),
+                    symbol=self._symbol_of(h),
                     side="long",  # you cannot hold a short in a demat account
                     size=qty,
                     entry_price=Decimal(str(h.get("avgCostPrice", 0) or 0)),
@@ -992,7 +998,7 @@ class DhanClient(Broker):
             avg = p.get("buyAvg") if net > 0 else p.get("sellAvg")
             positions.append(
                 PositionInfo(
-                    symbol=p.get("tradingSymbol", str(p.get("securityId", ""))),
+                    symbol=self._symbol_of(p),
                     side=side,
                     size=abs(net),
                     entry_price=Decimal(str(avg or p.get("costPrice", 0) or 0)),
@@ -1078,7 +1084,7 @@ class DhanClient(Broker):
         return OpenOrder(
             exchange_order_id=str(o.get("orderId", "")),
             client_order_id=str(o["correlationId"]) if ours else None,
-            symbol=o.get("tradingSymbol", str(o.get("securityId", ""))),
+            symbol=self._symbol_of(o),
             side=str(o.get("transactionType", "")).lower(),
             size=qty,
             # A GTT has never filled anything; it rests in full until it fires.
@@ -1194,7 +1200,7 @@ class DhanClient(Broker):
                     FillInfo(
                         fill_id=str(f.get("exchangeTradeId", f.get("orderId", ""))),
                         exchange_order_id=str(f.get("orderId", "")),
-                        symbol=f.get("tradingSymbol", str(f.get("securityId", ""))),
+                        symbol=self._symbol_of(f),
                         side=str(f.get("transactionType", "")).lower(),
                         size=qty,
                         price=Decimal(str(f.get("tradedPrice", f.get("price", 0)) or 0)),
@@ -1361,7 +1367,7 @@ class DhanClient(Broker):
         return OpenOrder(
             exchange_order_id=str(o.get("orderId", "")),
             client_order_id=o.get("correlationId"),
-            symbol=o.get("tradingSymbol", str(o.get("securityId", ""))),
+            symbol=self._symbol_of(o),
             side=str(o.get("transactionType", "")).lower(),
             size=qty,
             unfilled_size=qty - filled,
@@ -1391,6 +1397,35 @@ class DhanClient(Broker):
             created_at=_parse_ts(o.get("createTime")),
             raw=o,
         )
+
+    def _symbol_of(self, raw: dict[str, Any]) -> str:
+        """The symbol THIS BOT uses for whatever Dhan just described.
+
+        Dhan echoes derivatives back under its own spelling. On 2026-09-01 a
+        live NATGASMINI position came back as ``NATGASMINI-25Sep2026-FUT``
+        while the bot had minted, ordered and stored ``NATGASMINI-20260925-FUT``.
+        Nothing joined the two, so ``net_owned`` could not see the bot's own
+        position: it read as FOREIGN, so the sweep placed no protective stop
+        (Decision 027 leaves foreign positions strictly alone), the reconciler
+        never matched it, the strategy could never exit it, and the bucket —
+        believing itself flat — opened a second lot fifteen minutes later.
+
+        So translate by ``securityId``, which is the one identifier both sides
+        agree on, and keep ``tradingSymbol`` only as the fallback it always was.
+        Cash equity injects no translator and is unaffected: there Dhan's
+        tradingSymbol IS the bot's ticker.
+        """
+        if self._canonical_symbol is not None:
+            sec = raw.get("securityId")
+            if sec:
+                try:
+                    canonical = self._canonical_symbol(str(sec))
+                except Exception:  # noqa: BLE001 - never let a lookup break parsing
+                    self._log.warning("canonical_symbol_failed", security_id=str(sec))
+                    canonical = None
+                if canonical:
+                    return canonical
+        return raw.get("tradingSymbol") or str(raw.get("securityId", ""))
 
     def close(self) -> None:
         if self._owns_http:

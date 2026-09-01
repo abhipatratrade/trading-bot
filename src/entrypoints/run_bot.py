@@ -449,6 +449,15 @@ def main() -> None:
                     contract_spec=(
                         dhan_data.contract_spec if fno_registry else None
                     ),
+                    # Dhan securityId -> the symbol the bot minted. Without it
+                    # a derivative position comes back under Dhan's own
+                    # spelling, never matches the ledger, and reads as FOREIGN:
+                    # no stop, no exit, no reconciliation, and re-entry on the
+                    # next signal because the bucket believes it is flat. That
+                    # is the 2026-09-01 commodity-indian incident.
+                    canonical_symbol=(
+                        dhan_data.canonical_symbol if fno_registry else None
+                    ),
                 )
                 # Reachability probe (one authed GET). Dhan's SANDBOX edge
                 # blocks datacenter IPs with a bodyless 403 (confirmed from the

@@ -247,6 +247,26 @@ class DhanData(MarketData):
             return None
         return self._fno.spec(symbol)
 
+    def canonical_symbol(self, security_id: str) -> str | None:
+        """Dhan ``securityId`` -> the symbol THIS BOT uses, or None.
+
+        The reverse of ``resolve``, and the fix for a live incident on
+        2026-09-01. Dhan echoes derivative positions back under its own
+        ``tradingSymbol`` spelling — ``NATGASMINI-25Sep2026-FUT`` — while the
+        bot mints and stores ``NATGASMINI-20260925-FUT``. Nothing matched the
+        two, so ``net_owned`` could not recognise the bot's own position: it
+        read as FOREIGN, got no protective stop, was never reconciled, and the
+        strategy could not exit it. Believing itself flat, the bucket then
+        opened a second lot fifteen minutes later.
+
+        Returns None for cash equity, where Dhan's tradingSymbol IS the ticker
+        the bot uses and no translation is wanted.
+        """
+        if self._fno is None:
+            return None
+        contract = self._fno.by_security_id(str(security_id))
+        return contract.symbol if contract else None
+
     # Back-compat internal alias (data adapter's own callers).
     _resolve = resolve
 

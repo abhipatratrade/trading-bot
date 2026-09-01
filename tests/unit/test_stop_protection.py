@@ -474,6 +474,11 @@ class TestDhanStopRecognition:
 
 
 _DUMMY_CLIENT = DhanClient.__new__(DhanClient)
+# __new__ skips __init__, so the instance has no attributes at all. The
+# parser reads one: `_canonical_symbol`, which translates Dhan's own symbol
+# spelling back to the bot's (2026-09-01 — see test_canonical_symbol.py).
+# None is the cash-equity setting these fixtures represent.
+_DUMMY_CLIENT._canonical_symbol = None
 
 
 # ── PIIND, 2026-08-12: swing-indian's first ever fill went unprotected ────
