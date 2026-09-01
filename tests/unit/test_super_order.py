@@ -257,7 +257,10 @@ class TestRetireStopBeforeClosing:
                          order_type=OrderType.MARKET, reduce_only=True)
         )
         methods = [c["method"] for c in http.calls]
-        assert methods == ["GET", "DELETE", "POST"], "cancel must precede the sell"
+        # A trailing GET is place_order verifying the accepted sell against the
+        # order book (Phase 11c) — it runs after everything here. What this test
+        # guards is the PREFIX: look up the leg, cancel it, only then sell.
+        assert methods[:3] == ["GET", "DELETE", "POST"], "cancel must precede the sell"
 
     def test_close_aborts_when_the_leg_cannot_be_cancelled(self) -> None:
         """Refusing to sell is recoverable — the position stays protected by
@@ -330,7 +333,12 @@ class TestRetireStopBeforeClosing:
                          order_type=OrderType.MARKET, reduce_only=True,
                          stop_price=Decimal("2300")),
         )
-        assert http.paths("GET") == [], "no super-order lookup for a resting stop"
+        # The post-placement verify reads /v2/orders/{id}; what must NOT happen
+        # is a super-order leg lookup, which is what would mean the client had
+        # mistaken this resting stop for a closing order.
+        assert http.paths("GET") == ["/v2/orders/960"], (
+            "no super-order lookup for a resting stop"
+        )
 
 
 # ── Ownership on the shared account (Decision 027) ───────────────────────

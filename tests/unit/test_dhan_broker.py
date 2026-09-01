@@ -87,18 +87,23 @@ def test_mtf_rejection_falls_back_to_cnc_at_1x_size() -> None:
     # order was sized at the scrip's MTF multiple, so re-sending that quantity
     # as cash would spend `leverage`x the margin the sizer budgeted — on an
     # account shared with the user's own money.
-    http = _FakeHttp({"POST /v2/orders": [
-        _Resp({"errorType": "Order_Error", "errorCode": "DH-XXX",
-               "errorMessage": "MTF not allowed"}),
-        _Resp({"orderId": "777", "orderStatus": "PENDING"})]})
+    http = _FakeHttp({
+        "POST /v2/orders": [
+            _Resp({"errorType": "Order_Error", "errorCode": "DH-XXX",
+                   "errorMessage": "MTF not allowed"}),
+            _Resp({"orderId": "777", "orderStatus": "PENDING"})],
+        # An accepted order is now confirmed against the order book before
+        # place_order returns — Dhan's RMS rejects asynchronously.
+        "GET /v2/orders/777": [_Resp({"orderStatus": "OPEN"})]})
     req = OrderRequest(symbol="TBZ", side="buy", size=Decimal("38"),
                        fallback_max_size=Decimal("10"))
     res = _client(http).place_order(req)
-    assert len(http.calls) == 2
-    assert http.calls[0]["json"]["productType"] == "MTF"
-    assert http.calls[0]["json"]["quantity"] == 38
-    assert http.calls[1]["json"]["productType"] == "CNC"
-    assert http.calls[1]["json"]["quantity"] == 10
+    posts = [c for c in http.calls if c["method"] == "POST"]
+    assert len(posts) == 2
+    assert posts[0]["json"]["productType"] == "MTF"
+    assert posts[0]["json"]["quantity"] == 38
+    assert posts[1]["json"]["productType"] == "CNC"
+    assert posts[1]["json"]["quantity"] == 10
     assert res.raw["productType"] == "CNC"
     assert res.size == Decimal("10")
     assert res.exchange_order_id == "777"
@@ -127,17 +132,20 @@ def test_mis_rejection_falls_back_to_cnc_at_1x_size() -> None:
     # Decision 029 (amended): an MIS-ineligible scrip retries as CNC, and the
     # size MUST drop to the 1x-affordable quantity — re-sending the leveraged
     # size on a cash product would spend `leverage`x the budgeted margin.
-    http = _FakeHttp({"POST /v2/orders": [
-        _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"}),
-        _Resp({"orderId": "888", "orderStatus": "PENDING"})]})
+    http = _FakeHttp({
+        "POST /v2/orders": [
+            _Resp({"errorCode": "DH-XXX", "errorMessage": "MIS not allowed"}),
+            _Resp({"orderId": "888", "orderStatus": "PENDING"})],
+        "GET /v2/orders/888": [_Resp({"orderStatus": "OPEN"})]})
     req = OrderRequest(symbol="SWIGGY", side="buy", size=Decimal("40"),
                        product="INTRADAY", fallback_max_size=Decimal("10"))
     res = _client(http).place_order(req)
-    assert len(http.calls) == 2
-    assert http.calls[0]["json"]["productType"] == "INTRADAY"
-    assert http.calls[0]["json"]["quantity"] == 40
-    assert http.calls[1]["json"]["productType"] == "CNC"
-    assert http.calls[1]["json"]["quantity"] == 10, "must clamp to 1x size"
+    posts = [c for c in http.calls if c["method"] == "POST"]
+    assert len(posts) == 2
+    assert posts[0]["json"]["productType"] == "INTRADAY"
+    assert posts[0]["json"]["quantity"] == 40
+    assert posts[1]["json"]["productType"] == "CNC"
+    assert posts[1]["json"]["quantity"] == 10, "must clamp to 1x size"
     # The result reports what was actually placed, so the Trade row is honest.
     assert res.size == Decimal("10")
     assert res.raw["productType"] == "CNC"
@@ -620,3 +628,107 @@ def test_a_failing_spec_lookup_degrades_to_the_cash_defaults() -> None:
                        reduce_only=True)
     client.place_order(req)
     assert http.calls[0]["json"]["triggerPrice"] == 812.35  # Rs 0.05 fallback
+
+
+# ---------------------------------------------------------------------------
+# Rejection reasons — Phase 11c
+#
+# August 2026: 588 REJECTED orders against 9 FILLED, and not one recorded why.
+# Dhan's RMS rejects ASYNCHRONOUSLY — the POST returns 2xx with TRANSIT and the
+# verdict lands in the order book afterwards, under `omsErrorDescription`. A
+# place_order that reported the POST's status could never see it, so an
+# MTF-ineligible scrip and an out-of-band stop trigger were the same fact:
+# "rejected", retried every ~90s forever.
+# ---------------------------------------------------------------------------
+def test_async_rejection_is_read_off_the_order_book() -> None:
+    http = _FakeHttp({
+        "POST /v2/orders": [_Resp({"orderId": "901", "orderStatus": "TRANSIT"})],
+        "GET /v2/orders/901": [
+            _Resp({"orderStatus": "REJECTED",
+                   "omsErrorDescription": "MTF is not permitted for this Scrip"})],
+    })
+    req = OrderRequest(symbol="TBZ", side="buy", size=Decimal("19"))
+    res = _client(http, fallback=False).place_order(req)
+
+    assert res.status == "rejected"  # NOT the POST's "pending"
+    assert res.raw["_reject_reason"] == "MTF is not permitted for this Scrip"
+
+
+def test_verify_polls_while_the_venue_is_undecided() -> None:
+    """TRANSIT is not a verdict — keep reading until the book has one."""
+    http = _FakeHttp({
+        "POST /v2/orders": [_Resp({"orderId": "902", "orderStatus": "TRANSIT"})],
+        "GET /v2/orders/902": [
+            _Resp({"orderStatus": "TRANSIT"}),
+            _Resp({"orderStatus": "PENDING"}),
+            _Resp({"orderStatus": "REJECTED",
+                   "omsErrorDescription": "Insufficient margin"})],
+    })
+    res = _client(http, fallback=False).place_order(
+        OrderRequest(symbol="TBZ", side="buy", size=Decimal("19"))
+    )
+    assert res.raw["_reject_reason"] == "Insufficient margin"
+
+
+def test_a_settled_live_order_stops_polling_immediately() -> None:
+    """The common case must cost ONE read and no sleep."""
+    http = _FakeHttp({
+        "POST /v2/orders": [_Resp({"orderId": "903", "orderStatus": "TRANSIT"})],
+        "GET /v2/orders/903": [_Resp({"orderStatus": "TRADED"})],
+    })
+    res = _client(http, fallback=False).place_order(
+        OrderRequest(symbol="TBZ", side="buy", size=Decimal("19"))
+    )
+    assert res.status == "filled"
+    assert "_reject_reason" not in res.raw
+    assert len([c for c in http.calls if c["method"] == "GET"]) == 1
+
+
+def test_a_rejection_with_no_text_still_reports_something() -> None:
+    """A blank omsErrorDescription must not read as 'no error'."""
+    http = _FakeHttp({
+        "POST /v2/orders": [_Resp({"orderId": "904", "orderStatus": "TRANSIT"})],
+        "GET /v2/orders/904": [_Resp({"orderStatus": "REJECTED"})],
+    })
+    res = _client(http, fallback=False).place_order(
+        OrderRequest(symbol="TBZ", side="buy", size=Decimal("19"))
+    )
+    assert res.raw["_reject_reason"] == "REJECTED"
+
+
+def test_a_failed_verify_leaves_the_post_status_standing() -> None:
+    """Best-effort: the order IS placed, and the reconciler settles it later."""
+    http = _FakeHttp({
+        "POST /v2/orders": [_Resp({"orderId": "905", "orderStatus": "TRANSIT"})],
+    })  # no GET route => the verify raises internally
+    res = _client(http, fallback=False).place_order(
+        OrderRequest(symbol="TBZ", side="buy", size=Decimal("19"))
+    )
+    assert res.status == "pending"
+    assert res.exchange_order_id == "905"
+    assert "_reject_reason" not in res.raw
+
+
+def test_get_order_surfaces_the_reason_for_the_reconciler() -> None:
+    """The path that matters most: an async rejection found minutes later."""
+    http = _FakeHttp({
+        "GET /v2/orders/906": [
+            _Resp({"orderId": "906", "orderStatus": "REJECTED", "quantity": 19,
+                   "transactionType": "SELL", "tradingSymbol": "PIIND",
+                   "omsErrorDescription": "Trigger price out of range"})],
+    })
+    order = _client(http).get_order("906")
+    assert order is not None
+    assert order.status == "rejected"
+    assert order.reject_reason == "Trigger price out of range"
+
+
+def test_a_live_order_carries_no_reject_reason() -> None:
+    http = _FakeHttp({
+        "GET /v2/orders/907": [
+            _Resp({"orderId": "907", "orderStatus": "OPEN", "quantity": 19,
+                   "transactionType": "BUY", "tradingSymbol": "PIIND"})],
+    })
+    order = _client(http).get_order("907")
+    assert order is not None
+    assert order.reject_reason is None

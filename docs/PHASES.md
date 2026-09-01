@@ -806,9 +806,143 @@ them rather than hand over a label that cannot be verified — the right call.
 
 ---
 
+## Phase 11 — Execution-path observability [Aug-2026 reconciliation handoff]
+
+The Backtesting Engine reconciled August 2026 against the frozen configs:
+**11 signals should have fired across both live Indian buckets, 4 filled.**
+Its conclusion held up — the strategies are correct and every loss is
+downstream of a correct signal. Its *diagnosis* did not: the handoff proposed
+"one shared scheduler/VM/timer fault" behind the blind days. There are three
+causes, and two were already fixed before the handoff was written.
+
+### Blind-day attribution (swing-indian: 64 of 147 scan bins missing)
+
+| cause | window | bins | status |
+|---|---|---|---|
+| **kill switch suppresses the scan** | 08-12 13:18 → 08-18 15:05 | **28** | **THIS PHASE** |
+| VM OOM → token deadlock | 08-21 11:17 → 08-24 | 11 | fixed `77e8878` + swap, 08-24 |
+| dead token → empty universe | 08-04 → 08-05 | 14 | fixed `03a7e80`, 08-07 |
+| pre-bar-key-fix day | 08-03 | 6 | fixed `01a2612`, 08-01 |
+| the ~15:16 pass (bin #5) never ran | 08-07/10/11/26/27 | 5 | open, below |
+
+Aug 17 — the one date the handoff called an exact both-bucket overlap — is
+real and IS one shared cause: **both buckets were kill-switched**, swing since
+08-12 (PIIND) and intraday since 08-14 09:43 (PPLPHARMA). Aug 4/5 and Aug 24
+are the two already-fixed outages, which is why they look like the same fault
+from the outside: all three make a bucket stop scanning.
+
+### 11a — A halted bucket must still SEE (P0)
+
+`BucketRunner.run_once()` returns at the kill-switch gate *before* the scanner,
+so a halted bucket writes zero `scanner_snapshot` rows. That is a Decision 024
+violation on its face — the switch is defined to block risk-INCREASING actions,
+and scanning increases nothing — and it cost 28 of the month's 64 missing bins.
+
+It is also **invisible to both perception invariants**, which each defer to the
+other: `check_bucket_liveness` reads the bucket heartbeat, still beaten on the
+halted path, so the bucket looks healthy; `check_scan_coverage` sees no
+`SCANNER_RUN`, returns `coverage is None`, and hands the case to liveness by
+design. Nothing reported that swing-indian had not looked at the market for
+four sessions. It only ever cleared because a human clicked the dashboard.
+
+- [x] Scan hoisted above the kill gate; the halt now lands per-strategy AFTER
+      `_scan_for(row.scanner)` and `select_entries` (both contractually pure)
+      and BEFORE the sizer, so every named set still persists its snapshot.
+      Entries are refused twice — here, and again in
+      `OrderManager.place_order`, which raises `KillSwitchEngagedError` on
+      anything that is not an allowed reduce-only
+- [x] A halted bucket now LOGS what it would have entered
+      (`entries_blocked_kill_switch`), so "halted through a live signal" and
+      "halted through a quiet week" stop being the same record
+- [x] `check_kill_switch_dwell` (NOTICE, `kill_switch_dwell_minutes=120`).
+      Deliberately NOT gated on the session being open — a halt taken on a
+      Friday must page over the weekend, which is exactly the window the
+      2026-08-15 one slept through
+- [x] 10 tests: the killed bucket scans both sets, reports the universe it saw,
+      never reaches the sizer; an un-killed control proves the restructure did
+      not just disable the path. Plus 6 on the dwell check, including the real
+      116.0h August outage
+
+### 11b — `SIZING_DECISION` names the reason (P1)
+
+The handoff reports "no reason was recorded" for BLUESTARCO 08-07. Not quite:
+`sizing_snapshot` recorded `SKIPPED_OTHER | missing or non-positive mark price`
+38 times. The *audit* event carries only the enum, and the audit log is what a
+human reads. (The underlying cause — `/v2/marketfeed/quote` 401ing on the dead
+token — was fixed in `03a7e80` the same day, which split
+`PRICE_FETCH_FAILED_REASON` from `NO_MARK_PRICE_REASON`.)
+
+- [x] `sizing_audit_line()` — extracted pure, so the line a human reads is
+      testable. The message names the first skip with its reason and counts the
+      rest; the payload carries all of them under `skipped`. A run where
+      everything placed is byte-identical to before (no `skipped` key, no
+      suffix), so the happy path gained no noise. 6 tests
+
+### 11c — A rejected order stores the broker's error (P1)
+
+**588 REJECTED against 9 FILLED in August, and not one records why.** Dhan's
+RMS rejects ASYNCHRONOUSLY: the POST returns 2xx with `TRANSIT`/`PENDING` and
+the reason appears in the order book afterwards as `omsErrorDescription`, so
+`place_order` returning the POST's status can never see it.
+`scripts/dhan-scanner/scanner_live.py:376` (`_post_and_verify`) already solved
+this and the fix is a port.
+
+Note what the census actually says: **575 of the 588 carry `protective_stop`**.
+The dominant rejection volume is the stop SWEEP being refused and retried, not
+entries — 8 BHARATFORG buys are the visible tip of it.
+
+- [x] `OpenOrder.reject_reason`, read by a single `_reject_reason()` so the
+      placement path and the reconciler cannot drift apart on the key
+- [x] `place_order` verifies an unsettled POST against the order book. Two
+      deliberate departures from the interim scanner it was ported from: it
+      READS BEFORE SLEEPING (the reference sleeps first, which costs a second
+      on every order whose verdict is already waiting — inside a 60s tick that
+      may place a stop per position), and it runs AFTER the Decision 034
+      target-leg retirement, so polling never delays the step that disarms an
+      unbacktested take-profit
+- [x] Persisted to `trade.extra["reject_reason"]` on BOTH paths. The reconciler
+      one is the load-bearing half: Dhan rejects asynchronously, so that is
+      where most rejections are actually discovered
+- [x] 7 tests, including a rejection with no text (reports the status rather
+      than nothing) and a failed verify (leaves the POST's status standing)
+
+### 11d — Deferred (measure before building)
+
+- [ ] The missing ~15:16 pass (bin #5) on 5 days. Distinct from the 15:15
+      closing-bar regression already logged 2026-08-03; 5 bins, no known signal
+      cost, and it needs a run of clean sessions to characterise
+- [x] PIIND "double-sell" 08-18 — **CLOSED, not a bug.** The bot placed exactly
+      ONE sell (trade 6653, real exchange id 23126081841601). The "second fill"
+      is trade 6663: `exchange_order_id='unrecorded:PIIND:20260818080840'`,
+      `synthetic_exit: true` — a bookkeeping row, never an order. The handoff
+      counted a ledger row as a fill.
+
+      What the audit trail actually shows is more useful. After the 12:16 sell,
+      Dhan reported PIIND as a SHORT of 15 (the sale artifact — a sold holding
+      shows as a short for minutes), the reconciler re-imported the
+      just-closed position as an orphan (`source_trade_id: 6653` — it was the
+      bot's own sell), and `_run_exits` then tried to "close" the phantom by
+      BUYING 15, three times, all rejected. The user also sold PIIND by hand
+      that day, which is one of the three causes `_detect_unrecorded_exits`
+      exists for. Fixed the same afternoon: `cab3660` (13:42 IST), `c676133`,
+      `8328fbf` — the 13:47/14:01/14:09 restarts in the audit log are those
+      deploys. The synthetic row predates the fix by four minutes.
+- [ ] Persist the decision inputs (`pattern`, `pattern_close_ist`, the pattern
+      bar's OHLC) into `trade.extra` — P2 in the handoff. Reconciliation
+      re-derives from re-fetched bars and live bars are not byte-identical:
+      PPLPHARMA 08-14 recorded `signal_price` 209.23 against a nearest
+      re-fetched 209.19, and 0.04 can flip the engulfing test
+- [ ] **Decision needed, not a bug**: the validated NIFTY-100 gap set has never
+      traded live. 100% of live intraday activity is `scanner_broad.yaml`,
+      whose own header marks it NOT backtest-validated
+
+---
+
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-09-01 — **Phase 11: the August execution reconciliation.** The Backtesting Engine's handoff was right that 11 signals should have fired and 4 filled, and right that the strategies are clean — wherever the bot looked, its signals matched. Its DIAGNOSIS was wrong in a way worth recording: it read the blind-day overlap (Aug 4, 5, 17, 24) as exact and inferred "one shared scheduler/VM/timer fault". Querying production instead of the documents, the 64 missing swing bins decompose into THREE causes and two were already fixed before the handoff was written: Aug 4/5 is the dead-token empty universe (`03a7e80`, 08-07 — the `scan_coverage` invariant it added cites those exact dates), Aug 21 11:17 → Aug 24 is the VM OOM (`77e8878` + swap, 08-24), Aug 3 is the pre-bar-key-fix day. THE LIVE ONE, and the largest at 28 bins: **the kill switch was a blindfold.** `run_once` returned before the scanner, so a halted bucket wrote zero snapshot rows — a Decision 024 violation on its face, since scanning increases no risk. A `stop_coverage` trip over an unstopped PIIND held swing-indian from 08-12 13:18 to 08-18 15:05 and took intraday-indian's 08-17 with it; that IS the shared Aug 17 cause, just not the one proposed. The audit log settles it exactly: Aug 4 shows 11 SCANNER_RUNs with `evaluated: 0` (ran, saw nothing), Aug 17 shows none at all (never ran), and the swing bins resume at 15:08 on 08-18 — three minutes after the dashboard disengage. Worse than blind, it was SILENT: `check_bucket_liveness` reads a heartbeat the halted path still beats, and `check_scan_coverage` treats an absent scan as liveness's problem, so six days of blindness fell exactly between the two checks and paged nobody. `check_kill_switch_dwell` now owns that gap, and is deliberately not session-gated so a Friday halt pages over the weekend. TWO CORRECTIONS to the handoff, both worth keeping: (1) the swing reconciliation script's "Aug 5 and 24 actually ran some bins" is an artefact of attributing by `bar_key` rather than scan date — the 09:16 pass reads the PREVIOUS session's stub bin, so a blind Monday still produces a `#6` row for it. The DB has zero rows on both dates. (2) "no reason was recorded" for BLUESTARCO is not so — `sizing_snapshot` held "missing or non-positive mark price" 38 times; the audit log, which is what a person reads, carried only the enum. Both halves are the same defect and both are fixed. On rejections the handoff UNDERSTATED it: not 370 PIIND sells but **588 REJECTED against 9 FILLED for the month, none with a reason**, and 575 of them carry `protective_stop` — the dominant volume is the stop sweep being refused and retried, not entries. Ported `_post_and_verify` with two changes: read before sleeping (the reference's sleep-first costs a second per order in a 60s tick), and run it AFTER the Decision 034 target-leg retirement so nothing delays disarming an unbacktested take-profit. 23 new tests, 1022 green, ruff clean. Both Indian kill switches confirmed disengaged. DEFERRED with reasons in 11d: the missing ~15:16 pass (5 bins), the PIIND double-sell, persisting the decision inputs, and the NIFTY-100-set decision.
 
 - 2026-08-29 (cont. 3) — **Decision 037: MCX venue**. The Phase 9E handoff arrived and is MCX natural gas, not NSE. The handoff itself was exemplary — followed the schema, left blanks rather than inventing numbers, and OPENED with the three reasons it does not fit: wrong exchange, no out-of-sample fold (structurally — TradingView caps intraday history so the whole sample IS the backtest, and the same config is negative on 30m/1H over the same months and in 3 of 4 years on 1H), and an edge that lives entirely in exposure the stop cannot protect (81 of 125 trades held across a session close net +Rs 122,021 while the 44 intraday-only trades net -Rs 25,584, and MCX gas is SHUT 23:30-09:00 plus weekends). That third one is not an engineering problem: adding a square-off removes the edge. User chose to build the venue, ship disabled, and add a forward dry-run to accumulate the missing evidence. THE FINDING: the scrip master does not carry the contract multiplier. On NSE LOT_SIZE is both the order unit and the units a lot controls (NIFTY 65 for both). On MCX LOT_SIZE reads 1 — the order unit — while a Natural Gas Mini lot controls 250 mmBtu, which is NOWHERE in the file. Phase A's registry would have computed a notional 250x too small and every margin and Kelly figure with it. Split into `lot_size` (order quantity) and `multiplier` (notional), threaded separately through the runner; MCX REFUSES a contract whose multiplier is unknown rather than defaulting, because there the default is known-wrong. Cited, and it reconciles two ways: the Rs 0.10 tick those sources give matches the master's own TICK_SIZE, and loading NATGASMINI live gives a notional of Rs 42,975 at Rs 171.9 — the backtest's own figure, to the rupee, derived independently. Taxonomy: TradingType.COMMODITY + BucketConfig.exchange, NOT Market.COMMODITY — 7 of the 10 `Market.INDIAN` sites need the INDIAN behaviour for a commodity bucket (sizing cap, margin fit, ledger P&L), and rewriting them to `in (INDIAN, COMMODITY)` would have been the signal that the distinction was never a market difference. PORT: pure CCI(20) state machine + a parity harness replaying the backtest's own 10,901 bars — **125/125 exact, 100.0%**, zero missing, zero extra, zero mismatches, the strongest parity in this repo. It got there by finding a real bug: the first cut scored 122/125 and all three misses were one rule — a STOP-EXIT BAR STILL ARMS. The stop path returned before the arming test, so a bar where the stop fired and CCI had also gone beyond the arm level never registered the setup. Reading the rules would not have found it; replaying the trades did. Parity CANNOT check contract selection — the run used a continuous front-month series and the handoff refused to back-fill unverifiable expiry labels, which was right. 18 new tests, 961 green at commit time, ruff clean. REMAINING: MCX session calendar, MCX cost card (CTT not STT — the NSE card must NOT be applied), a roll rule the backtest does not contain, the bucket + migration, and the dry-run.
 

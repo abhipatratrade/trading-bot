@@ -854,3 +854,90 @@ def test_signal_delivery_matches_the_sizer_constant_exactly() -> None:
     src = inspect.getsource(si.signals_lost_to_data)
     assert "PRICE_FETCH_FAILED_REASON" in src
     assert sizer.NO_MARK_PRICE_REASON not in src
+
+
+# ---------------------------------------------------------------------------
+# kill_switch_dwell — Phase 11a
+#
+# The gap this closes: a halt is invisible to BOTH other perception checks.
+# bucket_liveness reads the bucket heartbeat, which the halted path still
+# beats; scan_coverage sees no SCANNER_RUN and defers to liveness by design.
+# In August 2026 a stop_coverage halt on PIIND held swing-indian down from
+# 08-12 13:18 to 08-18 15:05 — four sessions — and paged nobody.
+# ---------------------------------------------------------------------------
+NOW = _ist("2026-07-28", "11:00")
+
+
+def test_dwell_ok_when_switch_is_clear():
+    r = si.check_kill_switch_dwell(
+        bucket_id="swing-indian", engaged_at=None, now=NOW, max_dwell_minutes=120
+    )
+    assert r.ok
+
+
+def test_dwell_ok_inside_threshold():
+    """A halt taken and cleared within a session must stay quiet."""
+    r = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=NOW - timedelta(minutes=119),
+        now=NOW,
+        max_dwell_minutes=120,
+    )
+    assert r.ok
+
+
+def test_dwell_notices_past_threshold():
+    r = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=NOW - timedelta(minutes=121),
+        now=NOW,
+        max_dwell_minutes=120,
+    )
+    assert not r.ok
+    assert r.severity is Severity.NOTICE  # never HALT — it is already halted
+    assert "swing-indian" in r.message
+    assert r.detail["dwell_minutes"] == 121
+
+
+def test_dwell_reports_the_august_outage():
+    """The real one: 08-12 13:18 -> 08-18 15:05, and nothing said so."""
+    engaged = _ist("2026-08-12", "13:18")
+    r = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=engaged,
+        now=_ist("2026-08-17", "09:16"),  # the Monday it was blind
+        max_dwell_minutes=120,
+    )
+    assert not r.ok
+    assert "116.0h" in r.message  # 6,958 minutes of blindness
+    assert r.detail["dwell_minutes"] == 6958
+    assert "2026-08-12 13:18" in r.message
+
+
+def test_dwell_pages_once_not_every_tick():
+    """dwell_minutes grows every tick; the signature must not."""
+    a = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=NOW - timedelta(minutes=200),
+        now=NOW,
+        max_dwell_minutes=120,
+    )
+    b = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=NOW - timedelta(minutes=900),
+        now=NOW,
+        max_dwell_minutes=120,
+    )
+    assert a.alert_signature == b.alert_signature == "halted"
+    assert a.detail != b.detail  # the detail moves, the signature does not
+
+
+def test_dwell_tolerates_a_naive_engaged_at():
+    """engaged_at predates the tz-aware column on some rows; must not crash."""
+    r = si.check_kill_switch_dwell(
+        bucket_id="swing-indian",
+        engaged_at=(NOW - timedelta(hours=9)).replace(tzinfo=None),
+        now=NOW,
+        max_dwell_minutes=120,
+    )
+    assert not r.ok

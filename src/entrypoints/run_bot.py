@@ -790,6 +790,7 @@ def main() -> None:
         reject_window_minutes=settings.order_reject_window_minutes,
         reject_max=settings.order_reject_max,
         bucket_stale_multiple=settings.bucket_stale_multiple,
+        kill_switch_dwell_minutes=settings.kill_switch_dwell_minutes,
     )
     _log.info(
         "session_invariants_ready",

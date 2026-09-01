@@ -300,6 +300,53 @@ class SizingResult:
     reason: str | None = None
 
 
+def sizing_audit_line(
+    results: dict[str, SizingResult],
+    *,
+    strategy_name: str,
+    bucket_id: str,
+) -> tuple[str, dict[str, str]]:
+    """The SIZING_DECISION message and its per-candidate skip reasons. PURE.
+
+    WHY the reason appears here when ``SizingSnapshot`` already stores it: the
+    snapshot is the forensic table, and the audit log is what a human reads. On
+    2026-08-07 a live BLUESTARCO signal was dropped 38 times in an hour and the
+    only line anyone saw was
+
+        sized 1 candidates for mean_reversion_1h@swing-indian: 0 placed
+
+    which is a decision with its reason removed. The August reconciliation spent
+    a full code-archaeology session establishing that the reason HAD been
+    recorded — in another table — and reported it as "no reason was recorded".
+    Both halves of that are the same bug: the record a person actually reads did
+    not carry the cause.
+
+    The reason goes in the MESSAGE, not only the payload, because a payload does
+    not appear in a Telegram alert or in a tail of the journal. Only the first is
+    named to keep the line bounded; ``results`` preserves candidate order, so
+    "first" is chronological rather than arbitrary, and the payload carries all
+    of them.
+    """
+    placed_n = sum(
+        1 for r in results.values() if r.decision == SizingDecision.PLACED
+    )
+    skipped = {
+        sym: (r.reason or r.decision.value)
+        for sym, r in results.items()
+        if r.decision != SizingDecision.PLACED
+    }
+    why = ""
+    if skipped:
+        sym, reason = next(iter(skipped.items()))
+        why = f" ({sym}: {reason}" + (
+            f", +{len(skipped) - 1} more)" if len(skipped) > 1 else ")"
+        )
+    return (
+        f"sized {len(results)} candidates for {strategy_name}@{bucket_id}: "
+        f"{placed_n} placed{why}"
+    ), skipped
+
+
 def size_positions(
     *,
     bucket: Bucket,
@@ -635,22 +682,14 @@ def size_positions(
                     reason=res.reason,
                 )
             )
+        message, skipped = sizing_audit_line(
+            results, strategy_name=strategy_name, bucket_id=bucket.id
+        )
         session.add(
             AuditLog(
                 strategy_id=bucket.id,
                 event_type=AuditEventType.SIZING_DECISION,
-                message=(
-                    f"sized {len(results)} candidates for "
-                    f"{strategy_name}@{bucket.id}: "
-                    + str(
-                        sum(
-                            1
-                            for r in results.values()
-                            if r.decision == SizingDecision.PLACED
-                        )
-                    )
-                    + " placed"
-                ),
+                message=message,
                 payload={
                     "bucket_id": bucket.id,
                     "strategy_name": strategy_name,
@@ -658,6 +697,9 @@ def size_positions(
                         s: (r.value if r else None) for s, r in regimes.items()
                     },
                     "decisions": {s: r.decision.value for s, r in results.items()},
+                    # Dropped entirely when everything placed, so the happy
+                    # path's payload is byte-identical to before.
+                    **({"skipped": skipped} if skipped else {}),
                 },
             )
         )

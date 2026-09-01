@@ -1348,6 +1348,7 @@ class Reconciler:
 
                 # Order is no longer open — check what happened
                 new_status = OrderStatus.UNKNOWN
+                order_info = None
                 if trade.exchange_order_id:
                     order_info = self._broker.get_order(trade.exchange_order_id)
                     if order_info:
@@ -1364,6 +1365,16 @@ class Reconciler:
                     "old_status": trade.status.value,
                     "new_status": new_status.value,
                 }
+                # Dhan's RMS rejects asynchronously, so THIS is where most
+                # rejections are discovered — the placement call had already
+                # returned "pending". Storing the reason only on the placement
+                # path would have left the common case blank, which is what it
+                # was for all 588 of August 2026's rejections.
+                reason = getattr(order_info, "reject_reason", None)
+                if reason and new_status == OrderStatus.REJECTED:
+                    trade.extra = {**(trade.extra or {}), "reject_reason": reason}
+                    diff["reject_reason"] = reason
+
                 report.diffs.append(diff)
                 report.orders_updated += 1
                 trade.status = new_status

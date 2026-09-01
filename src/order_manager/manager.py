@@ -358,6 +358,17 @@ class OrderManager:
                             result.raw["_target_leg_cancelled"]
                         ),
                     }
+                # The venue's reason, when the adapter resolved the order far
+                # enough to have one. Broker-agnostic: any adapter that can name
+                # a rejection puts it under this key. The reconciler stores the
+                # same key for the async case (an order rejected after we stop
+                # looking), so one query answers "why was this refused" whichever
+                # path found out.
+                if result.raw.get("_reject_reason"):
+                    t.extra = {
+                        **(t.extra or {}),
+                        "reject_reason": str(result.raw["_reject_reason"]),
+                    }
             session.add(
                 AuditLog(
                     strategy_id=strategy_id,

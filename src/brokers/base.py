@@ -256,6 +256,16 @@ class OpenOrder:
     # to be able to see one.
     forever: bool = False
     created_at: datetime | None = None
+    # The venue's own words for why this order died, when it did. Dhan calls it
+    # ``omsErrorDescription``; every venue has some equivalent and none of them
+    # is the status. In August 2026 this bot logged 588 REJECTED orders against
+    # 9 FILLED and recorded the reason for none of them, so an MTF-ineligible
+    # scrip, an out-of-band trigger and a margin shortfall were one undivided
+    # fact — and the sweep retried each of them every ~90s regardless.
+    #
+    # None means "not rejected, or the venue said nothing", never "no error":
+    # a status of ``rejected`` with no text is still a rejection.
+    reject_reason: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 

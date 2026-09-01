@@ -31,6 +31,7 @@ the correlationId so a transport-error retry finds an order that already landed.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -95,6 +96,22 @@ _STATUS_MAP: dict[str, str] = {
     "CANCELLED": "canceled",
     "EXPIRED": "expired",
 }
+
+# Dhan's RMS rejects ASYNCHRONOUSLY. The POST is accepted, returns an orderId
+# and a status of TRANSIT/PENDING, and only the order book afterwards carries
+# the verdict — with the reason in ``omsErrorDescription``. So a place_order
+# that reports the POST's status can never see a rejection, which is how 588
+# rejected orders in August 2026 came to hold no reason between them.
+#
+# ``scripts/dhan-scanner/scanner_live.py::_post_and_verify`` has done this
+# correctly since 2026-07-13; this is that logic, ported.
+_ORDER_DEAD_STATES = {"REJECTED", "CANCELLED", "EXPIRED"}
+# Statuses that mean "the venue has not decided yet" — the ones worth waiting on.
+_ORDER_UNSETTLED_STATES = {"", "TRANSIT", "PENDING"}
+# Seconds to wait before each re-read of the order book. Totals 6s against a
+# 60s tick, and only ever runs on an order that has NOT yet settled.
+_VERIFY_BACKOFF_SECONDS = (1.0, 2.0, 3.0)
+_REJECT_REASON_KEY = "omsErrorDescription"
 
 # Order states Dhan considers still working (for get_open_orders).
 _OPEN_STATES = {"TRANSIT", "PENDING", "OPEN", "PART_TRADED", "PARTIALLY_FILLED"}
@@ -457,6 +474,36 @@ class DhanClient(Broker):
         if is_super and order_id:
             target_cancelled = self._retire_target_leg(order_id, request.symbol)
 
+        # Resolve an unsettled POST against the order book before returning.
+        # Without this the caller stores "pending" for an order the RMS killed a
+        # second later, and the reason — the only thing separating "MTF is not
+        # permitted for this Scrip" from a margin shortfall or an out-of-band
+        # trigger — is never read at all.
+        #
+        # AFTER the target-leg retirement, deliberately. That retirement is the
+        # Decision 034 safety step: until it lands, an unbacktested take-profit
+        # is armed at the venue. Polling for up to 6s in front of it would delay
+        # the one action here that must not wait, to learn something about an
+        # order that was accepted.
+        #
+        # Best-effort throughout: a verify that fails leaves the POST's own
+        # status standing, and the reconciler settles it on its next sweep.
+        status_raw = str(result.get("orderStatus", "") or "").upper()
+        reject_reason: str | None = None
+        if order_id and status_raw in _ORDER_UNSETTLED_STATES:
+            status_raw, reject_reason = self._verify_order(order_id, status_raw)
+            if status_raw:
+                result["orderStatus"] = status_raw
+        if reject_reason:
+            self._log.warning(
+                "order_rejected_by_venue",
+                symbol=request.symbol,
+                side=request.side,
+                product=product,
+                order_id=order_id,
+                reason=reject_reason,
+            )
+
         return OrderResult(
             exchange_order_id=order_id,
             client_order_id=request.client_order_id,
@@ -469,6 +516,7 @@ class DhanClient(Broker):
             raw={
                 **result,
                 "productType": product,
+                **({"_reject_reason": reject_reason} if reject_reason else {}),
                 **(
                     {
                         "_super_order": True,
@@ -1248,6 +1296,64 @@ class DhanClient(Broker):
         spec = self._spec_for(symbol)
         return spec.freeze_qty if spec is not None else None
 
+    def _verify_order(
+        self, order_id: str, status_raw: str
+    ) -> tuple[str, str | None]:
+        """Re-read an unsettled order until the venue decides. Never raises.
+
+        Returns ``(status, reject_reason)``. Mirrors the interim scanner's
+        ``_post_and_verify`` — poll while the status is TRANSIT/PENDING, then
+        report what the book says.
+
+        Swallowing every error is deliberate: this runs AFTER an order has been
+        accepted, so a failure here means we do not know the outcome yet — which
+        is precisely the state the caller was already in. Raising would turn an
+        unknown status into a failed placement, and the OrderManager would treat
+        an order that may be live at the exchange as one to retry.
+        """
+        # Read BEFORE sleeping, and sleep only between reads. The interim
+        # scanner sleeps first; that costs a full second on every order whose
+        # verdict is already waiting, and this runs inside a 60s tick that may
+        # place a stop for each open position. Same worst case, no cost in the
+        # common one.
+        for i in range(len(_VERIFY_BACKOFF_SECONDS) + 1):
+            if i:
+                time.sleep(_VERIFY_BACKOFF_SECONDS[i - 1])
+            try:
+                detail = self._request("GET", f"/v2/orders/{order_id}")
+            except Exception as exc:  # noqa: BLE001 — see docstring
+                # Terse, not exc_info: the order IS placed, the reconciler will
+                # settle it, and this fires on ordinary upstream weather.
+                self._log.warning(
+                    "order_verify_failed",
+                    order_id=order_id,
+                    error=str(exc)[:120],
+                )
+                break
+            row = detail[0] if isinstance(detail, list) and detail else detail
+            if not isinstance(row, dict) or not row:
+                break
+            status_raw = str(row.get("orderStatus", status_raw) or status_raw).upper()
+            if status_raw in _ORDER_DEAD_STATES:
+                # A dead order with no text still reports its status, so the
+                # caller can always answer "why" with something.
+                return status_raw, self._reject_reason(row) or status_raw
+            if status_raw not in _ORDER_UNSETTLED_STATES:
+                break  # settled and alive — nothing to explain
+        return status_raw, None
+
+    @staticmethod
+    def _reject_reason(o: dict[str, Any]) -> str | None:
+        """Dhan's own words for why an order died, or None.
+
+        Kept to a single reader so the placement path and the reconciler cannot
+        drift apart on the key — the reconciler is where an ASYNC rejection
+        actually lands, and it would be the half that silently kept storing
+        nothing.
+        """
+        reason = str(o.get(_REJECT_REASON_KEY, "") or "").strip()
+        return reason or None
+
     def _to_open_order(self, o: dict[str, Any]) -> OpenOrder:
         qty = Decimal(str(o.get("quantity", 0) or 0))
         filled = Decimal(str(o.get("filledQty", o.get("tradedQty", 0)) or 0))
@@ -1265,6 +1371,7 @@ class DhanClient(Broker):
             ),
             status=_STATUS_MAP.get(str(o.get("orderStatus", "")).upper(), "unknown"),
             stop_price=Decimal(str(trig)) if trig else None,
+            reject_reason=self._reject_reason(o),
             # Dhan has no reduce-only flag for equities, so infer it: a resting
             # order that carries BOTH a trigger price and OUR correlationId is a
             # protective stop this bot placed. ``correlationId`` is only ever

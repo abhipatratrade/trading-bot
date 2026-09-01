@@ -273,20 +273,34 @@ class BucketRunner:
         # half checks the switch itself.
         self._roll_expiring(order_manager)
 
-        if kill_switch.is_engaged(self.bucket.id):
+        # A HALTED BUCKET STILL LOOKS. Decision 024 blocks risk-INCREASING
+        # actions, and scanning increases nothing — it fetches bars and writes
+        # audit rows. This used to `return` right here, which made the kill
+        # switch a blindfold: from 2026-08-12 13:18 to 2026-08-18 15:05 a
+        # stop_coverage halt on PIIND cost swing-indian 28 scan bins, and
+        # intraday-indian all of 2026-08-17, with ZERO scanner_snapshot rows to
+        # show for any of it. The reconciliation could not tell a halted bucket
+        # from a market that never signalled.
+        #
+        # Worse, it was SILENT. The two perception invariants each defer to the
+        # other and the halt fell down the gap: `check_bucket_liveness` reads
+        # the per-bucket heartbeat, which run_bot beats after this method
+        # returns normally — including on this path — so the bucket looked
+        # healthy; `check_scan_coverage` saw no SCANNER_RUN, concluded
+        # `coverage is None`, and handed the case to liveness by design. Six
+        # days of blindness paged nobody, and it only cleared when a human
+        # clicked the dashboard. `check_kill_switch_dwell` now owns that gap.
+        #
+        # So the gate moves DOWN, to the sizer (see `killed` below). Entries
+        # are still refused, and refused twice: OrderManager.place_order runs
+        # its own kill-switch check and raises KillSwitchEngagedError on
+        # anything that is not an explicitly-allowed reduce-only, so no order
+        # can reach a broker through here even if this loop grows a new path.
+        killed = kill_switch.is_engaged(self.bucket.id)
+        if killed:
             _log.info(
-                "bucket_killed_exits_only",
+                "bucket_killed_scan_only",
                 bucket_id=self.bucket.id,
-                exited=exited,
-            )
-            return RunSummary(
-                bucket_id=self.bucket.id,
-                placed=0,
-                skipped={},
-                eligible_strategies=[],
-                blocked_strategies={"*": "kill switch engaged"},
-                universe=[],
-                regime=None,
                 exited=exited,
             )
 
@@ -385,12 +399,34 @@ class BucketRunner:
                 )
                 continue
 
-            eligible.append(strat_name)
             strategy = strat_cls()
+            # Before the halt check, so EVERY named scanner set still persists
+            # its snapshot. `intraday-indian:broad` is reached only here — it is
+            # 100% of that bucket's live activity, and a halt that skipped this
+            # line would leave the set that actually trades unobserved.
             strat_scan = _scan_for(row.scanner)
             entry_candidates = strategy.select_entries(
                 strat_scan.universe, self._data
             )
+
+            # The halt lands HERE: after the scan and the strategy's own read
+            # (both pure — BaseStrategy.select_entries may not place orders,
+            # write to the DB, or call a broker) and before the sizer. Naming
+            # what WOULD have been entered is the forensic half; "halted through
+            # a live signal" and "halted through a quiet week" are different
+            # facts, and the August record can distinguish neither.
+            if killed:
+                blocked[strat_name] = "kill switch engaged"
+                if entry_candidates:
+                    _log.warning(
+                        "entries_blocked_kill_switch",
+                        bucket_id=self.bucket.id,
+                        strategy=strat_name,
+                        would_have_entered=[ec.symbol for ec in entry_candidates],
+                    )
+                continue
+
+            eligible.append(strat_name)
             if not entry_candidates:
                 continue
 

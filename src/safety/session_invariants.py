@@ -55,6 +55,8 @@ from src.core.models import (
     AuditEventType,
     AuditLog,
     BrokerName,
+    KillSwitch,
+    KillSwitchScope,
     OrderStatus,
     SizingSnapshot,
     Trade,
@@ -550,6 +552,66 @@ def check_scan_coverage(
     return InvariantResult(name, bucket_id, ok=True)
 
 
+def check_kill_switch_dwell(
+    *,
+    bucket_id: str,
+    engaged_at: datetime | None,
+    now: datetime,
+    max_dwell_minutes: int,
+) -> InvariantResult:
+    """A halt that has lasted too long is itself reported.
+
+    The kill switch has exactly one way out: ``kill_switch.disengage`` has a
+    single caller, the dashboard button. So an engaged switch waits for a human
+    who may not know they are being waited on — and until then the bucket trades
+    nothing.
+
+    Nothing watched that. On 2026-08-12 a ``stop_coverage`` halt over an
+    unstopped PIIND engaged swing-indian at 13:18 and it stayed engaged until
+    2026-08-18 15:05: four sessions, 28 scan bins, silent. intraday-indian went
+    the same way on 08-14 and lost all of 08-17. Both perception invariants
+    passed the whole time — ``check_bucket_liveness`` because the halted path
+    still completes a pass and beats the bucket heartbeat, and
+    ``check_scan_coverage`` because it treats an absent scan as liveness's
+    problem, not blindness. The halt fell exactly between them.
+
+    NOTICE, never HALT — the bucket is already halted; this is the notification
+    that it still is. ``alert_signature`` is deliberately the bucket alone, so a
+    dwell that grows every tick pages once and not every hour.
+
+    ``engaged_at is None`` means the switch is clear (or predates the column),
+    which is not a fault.
+    """
+    name = "kill_switch_dwell"
+    if engaged_at is None:
+        return InvariantResult(name, bucket_id, ok=True)
+
+    if engaged_at.tzinfo is None:
+        engaged_at = engaged_at.replace(tzinfo=now.tzinfo)
+    dwell = (now - engaged_at).total_seconds() / 60.0
+    if dwell <= max_dwell_minutes:
+        return InvariantResult(name, bucket_id, ok=True)
+
+    hours = dwell / 60.0
+    return InvariantResult(
+        name,
+        bucket_id,
+        ok=False,
+        severity=Severity.NOTICE,
+        message=(
+            f"HALTED {hours:.1f}h: {bucket_id}'s kill switch has been engaged "
+            f"since {engaged_at:%Y-%m-%d %H:%M} and only a human can clear it "
+            f"(dashboard). The bucket is scanning but will enter nothing until "
+            f"someone does."
+        ),
+        detail={
+            "engaged_at": engaged_at.isoformat(),
+            "dwell_minutes": round(dwell),
+        },
+        alert_signature="halted",
+    )
+
+
 def check_signal_delivery(
     *,
     bucket_id: str,
@@ -797,6 +859,14 @@ class InvariantThresholds:
     # failure. Comfortably wider than one swing-indian 1h bin, so a miss stays
     # visible for the rest of the bin it happened in rather than for one tick.
     signal_lost_window_minutes: int = 90
+    # How long a bucket may sit halted before the halt itself is reported.
+    # 120 min is a bit under one NSE session: a halt taken intraday and cleared
+    # the same day stays quiet, while one that survives into the next session
+    # — the shape that cost four sessions in August — pages before that session
+    # opens. Unlike every other threshold here this one is NOT gated on the
+    # session being open: a halt entered on Friday afternoon must page over the
+    # weekend, which is precisely when there is time to clear it.
+    kill_switch_dwell_minutes: int = 120
     # Decision 036 — the F&O ceilings.
     #
     # A derivative's margin is re-evaluated continuously by the exchange and
@@ -831,6 +901,35 @@ def count_recent_rejects(
             .scalars()
             .all()
         )
+
+
+def kill_switch_engaged_at(*, bucket_id: str) -> datetime | None:
+    """When this bucket's kill switch was engaged; None if it is not.
+
+    Reads the row rather than ``kill_switch.is_engaged`` because the dwell is
+    the whole point — "engaged" is already visible on the dashboard, "engaged
+    since Tuesday" is what nobody had.
+
+    A GLOBAL halt is reported against every bucket it stops, since that is what
+    it does. Where both are engaged the bucket's own row wins: it is the more
+    specific fact, and the one a reader can act on.
+    """
+    with session_scope() as session:
+        row = session.execute(
+            select(KillSwitch).where(
+                KillSwitch.scope == KillSwitchScope.STRATEGY,
+                KillSwitch.strategy_id == bucket_id,
+                KillSwitch.engaged.is_(True),
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = session.execute(
+                select(KillSwitch).where(
+                    KillSwitch.scope == KillSwitchScope.GLOBAL,
+                    KillSwitch.engaged.is_(True),
+                )
+            ).scalar_one_or_none()
+        return row.engaged_at if row is not None else None
 
 
 def last_scan_coverage(*, bucket_id: str, since: datetime) -> ScanCoverage | None:
@@ -1091,6 +1190,20 @@ def run_session_invariants(
                 ),
                 threshold=thresholds.reject_max,
                 window_minutes=thresholds.reject_window_minutes,
+            )
+        )
+        # NOT gated on check_liveness. Every other perception check is, because
+        # outside a session a bucket is correctly idle — but a halt is a fact
+        # about configuration, not about the market, and it is true at 3am on a
+        # Sunday. Reporting it then is the useful moment: there is time to clear
+        # it before the open, which is exactly what did not happen over the
+        # 2026-08-15 weekend.
+        results.append(
+            check_kill_switch_dwell(
+                bucket_id=watch.bucket_id,
+                engaged_at=kill_switch_engaged_at(bucket_id=watch.bucket_id),
+                now=now,
+                max_dwell_minutes=thresholds.kill_switch_dwell_minutes,
             )
         )
         if check_liveness:

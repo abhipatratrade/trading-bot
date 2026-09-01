@@ -246,6 +246,11 @@ class Settings(BaseSettings):
     order_reject_max: int = 3
     # A bucket is stalled once it has missed this many of its own cadences.
     bucket_stale_multiple: float = 3.0
+    # How long a bucket may sit kill-switched before the halt itself pages.
+    # Only a human clears the switch, so a halt nobody is told about waits
+    # forever: a stop_coverage trip on PIIND held swing-indian down from
+    # 2026-08-12 to 08-18 — four sessions, 28 scan bins — in silence.
+    kill_switch_dwell_minutes: int = 120
     # ENFORCING since 2026-08-01 (Decision 033). Shipped observe-only on
     # 2026-07-28 and ran four sessions (28-31 Jul) with no false positive.
     #
