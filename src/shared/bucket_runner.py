@@ -71,6 +71,7 @@ from src.shared.bucket import Bucket, Market
 from src.shared.contract_selection import (
     ContractSelectionConfig,
     ContractSelector,
+    Instrument,
     Selection,
     contract_hint,
     load_contract_selection,
@@ -1006,15 +1007,35 @@ class BucketRunner:
         multipliers: dict[str, Decimal] = {}
         hints: dict[str, dict[str, object]] = {}
 
+        # Spot is only needed to pick a STRIKE. A futures selection has no
+        # strike — expiry is the entire rule — and some underlyings have no spot
+        # series to fetch at all: MCX quotes NATGASMINI only as futures, which
+        # is why that bucket's contracts.yaml carries `signal_source: contract`
+        # and why the strategy resolves its own contract with a dummy spot.
+        # ``ContractSelector.select`` says as much in its own docstring: "Only
+        # consulted for options; a future needs no strike."
+        #
+        # Requiring one unconditionally made commodity-indian INERT on the day
+        # it went live: every tick logged contract_selection_no_spot, dropped
+        # its only candidate and returned an empty plan, so the scanner was
+        # never reached and no order could ever be placed. The bucket looked
+        # healthy throughout — bucket_run_start, bucket_run_complete,
+        # blocked=[] — while being structurally incapable of trading.
+        needs_spot = config.instrument is not Instrument.FUTURE
+
         for sym in symbols:
             spot = spot_prices.get(sym)
-            if spot is None or spot <= 0:
+            if needs_spot and (spot is None or spot <= 0):
                 _log.warning(
                     "contract_selection_no_spot",
                     bucket_id=self.bucket.id,
                     underlying=sym,
                 )
                 continue
+            if spot is None or spot <= 0:
+                # Futures path. Positive so no strike arithmetic can divide by
+                # zero, and never consulted — the selector filters on expiry.
+                spot = Decimal("1")
             chosen: Selection = selector.select(
                 sym, spot=spot, side=sides.get(sym, "buy"), on=today
             )
