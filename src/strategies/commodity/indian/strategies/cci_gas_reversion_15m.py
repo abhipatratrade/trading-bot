@@ -103,7 +103,9 @@ class CciGasReversion15m(Strategy):
         )
         return chosen.contract if chosen.ok else None
 
-    def _state_for(self, underlying: str, data: MarketData) -> tuple[CCIState, object] | None:
+    def _state_for(
+        self, underlying: str, data: MarketData
+    ) -> tuple[CCIState, object, list, object] | None:
         """Replay the contract's bars and return the settled state machine."""
         contract = self._contract_for(underlying, data)
         if contract is None:
@@ -129,27 +131,53 @@ class CciGasReversion15m(Strategy):
             for b in raw
         ]
         state = CCIState()
-        state.run(bars)
-        return state, contract
+        # Keep the SIGNALS, not just the settled state. "Is this machine in a
+        # position?" and "did this bar OPEN one?" are different questions, and
+        # only the second one may place an order — see select_entries.
+        signals = state.run(bars)
+        return state, contract, signals, bars[-1].ts
 
     # ── entries ─────────────────────────────────────────────────────────
     def select_entries(
         self, candidates: list[str], data: MarketData
     ) -> list[EntryCandidate]:
-        """Fire only on the bar that just closed.
+        """Fire only on the bar that actually OPENED the position.
 
-        ``CCIState.run`` replays the whole window and leaves the machine in its
-        settled state, so "did the last bar open a position?" is read off the
-        state rather than off the signal list — a signal from three bars ago is
-        history, not an instruction.
+        The distinction is not pedantic; it is what stops the same setup being
+        entered twice. Until 2026-09-02 this asked only whether the settled
+        machine HELD a position, which is true on every tick for the whole life
+        of the trade — so a buy was proposed every 60 seconds from entry to
+        exit, and the only thing preventing a duplicate was the sizer's dedup
+        gate noticing the bot already held it.
+
+        That made the ledger the sole guard, and the ledger has been wrong
+        twice for unrelated reasons: on 09-01 a symbol mismatch hid the position
+        (two lots opened fifteen minutes apart on ONE signal, both stamped
+        signal_price 272.8), and on 09-02 a stop that MCX stripped the trigger
+        from liquidated it and the machine re-entered immediately (both stamped
+        280.0). Same mechanism, same day-shape, different root cause.
+
+        A transition test needs no ledger. If the last bar produced an ``enter``
+        signal, this is a new trade; otherwise the machine is merely still in
+        one, and there is nothing to place. The backtest took 125 trades, not
+        one per tick, so this is also the reading that matches it — dedup
+        becomes a second line of defence rather than the only one.
         """
         out: list[EntryCandidate] = []
         for underlying in candidates:
             got = self._state_for(underlying, data)
             if got is None:
                 continue
-            state, contract = got
+            state, contract, signals, last_ts = got
             if state.pos is Pos.FLAT or state.entry_price is None:
+                continue
+            # THE TRANSITION TEST. `step` can return an exit and an entry on the
+            # same bar (an exit frees an entry), so this asks for an `enter` on
+            # the closing bar specifically, not merely for any signal.
+            opened_now = any(
+                sig.action == "enter" and sig.ts == last_ts for sig in signals
+            )
+            if not opened_now:
                 continue
             side = "buy" if state.pos is Pos.LONG else "sell"
             out.append(
@@ -192,7 +220,10 @@ class CciGasReversion15m(Strategy):
             got = self._state_for(underlying, data)
             if got is None:
                 continue
-            state, _ = got
+            state = got[0]
+            # Exits are deliberately NOT transition-gated. A missed exit leaves
+            # a live position the strategy believes it has closed; a repeated
+            # one is a no-op once the position is gone.
             if state.pos is Pos.FLAT:
                 out.append(symbol)
         return out
