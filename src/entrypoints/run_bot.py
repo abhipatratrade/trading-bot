@@ -305,6 +305,11 @@ def main() -> None:
     # bucket → broker product its stops must be placed under. Crypto has no
     # product dimension, so only the Dhan buckets populate this.
     stop_products: dict[str, str] = {}
+    # bucket → the VENUE whose session hours gate its sweep. Not cosmetic: one
+    # Dhan account now spans two exchanges with different hours (NSE 09:15
+    # -15:30, MCX 09:00-23:30), and the sweep used to ask about NSE for all of
+    # them. See ``_sweep_stops``.
+    stop_exchanges: dict[str, str] = {}
     for bucket in all_buckets:
         if not bucket.config.enabled or bucket.market != Market.CRYPTO:
             continue
@@ -385,6 +390,7 @@ def main() -> None:
                 stop_pcts[bucket.id] = bucket.config.stop_loss_pct
             if bucket.config.product:
                 stop_products[bucket.id] = bucket.config.product
+            stop_exchanges[bucket.id] = bucket.config.exchange or "NSE"
             if bucket.config.carry_interest_apr is not None:
                 carry_aprs[bucket.id] = bucket.config.carry_interest_apr
             # Decision 037 — which derivative venues this process needs a
@@ -719,14 +725,36 @@ def main() -> None:
             pcts = {b: p for b, p in stop_pcts.items() if b in ref_bucket_ids}
             if not pcts:
                 continue
-            # An equity venue takes no orders outside its session, so sweeping a
-            # Dhan account at 22:40 can only produce rejects. On 2026-08-12 an
+            # A venue takes no orders outside its session, so sweeping a Dhan
+            # account at 22:40 can only produce rejects. On 2026-08-12 an
             # unplaceable PIIND stop was retried every ~90s all evening — 117
             # attempts in three hours, and it would have run all night, every
             # night, until the position closed. Crypto has no session and is
             # deliberately NOT gated: a 24/7 venue must be swept 24/7.
-            if ref in dhan_accounts and nse_session(clock.now()) is NseSession.CLOSED:
-                continue
+            #
+            # Gated PER BUCKET, on the bucket's OWN venue. This asked
+            # ``nse_session(now)`` for the whole account until 2026-09-02, and
+            # that default (exchange="NSE", 09:15-15:30) silently clocked the
+            # MCX bucket to equity hours while MCX trades 09:00-23:30. The cost
+            # was not theoretical: commodity-indian opened two NATGASMINI lots
+            # at 23:11 and 23:26 on 2026-09-01, six hours past NSE close, and
+            # the sweep was gated off for both — no stop was ever ATTEMPTED for
+            # a live position, while stop_coverage screamed for 344 ticks.
+            #
+            # Filtering the pct map rather than skipping the account keeps what
+            # the old gate was protecting: an NSE-equity stop is still never
+            # retried at 22:40, because its bucket drops out of `pcts` while
+            # the MCX bucket stays in.
+            if ref in dhan_accounts:
+                swept_at = clock.now()
+                pcts = {
+                    b: p
+                    for b, p in pcts.items()
+                    if nse_session(swept_at, exchange=stop_exchanges.get(b, "NSE"))
+                    is not NseSession.CLOSED
+                }
+                if not pcts:
+                    continue
             # Before the sweep, and outside its try: a target leg that failed
             # to cancel at placement is an armed unbacktested exit, and it must
             # not depend on the sweep succeeding to get retried.
@@ -908,6 +936,11 @@ def main() -> None:
                     max_funding_rate=funding_max,
                     clock=clock,
                     shared_account=ref in dhan_accounts,
+                    # A flatten must close under the product the position is
+                    # held under, or Dhan refuses it (DH-906) and the breaker
+                    # empties nothing — on the one path that exists for
+                    # emptying a bucket.
+                    product_by_bucket=stop_products,
                 )
                 _note_safety_ok(
                     f"breaker_error:{ref}",

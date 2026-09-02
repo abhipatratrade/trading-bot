@@ -918,6 +918,18 @@ class BucketRunner:
                 size=pos.quantity,
                 order_type=OrderType.MARKET,
                 reduce_only=True,
+                # The SAME product the position is held under. Omitting it
+                # falls back to the adapter's constructor default (MTF), which
+                # is a cash-equity product: on 2026-09-02 five attempts to
+                # close two MCX NATGASMINI lots were refused with DH-906
+                # "Trades are not allowed for this Product / Scrip", leaving a
+                # live position with no working exit at all.
+                #
+                # The stop path already learned this on 2026-08-11, when an
+                # INTRADAY position got an MTF stop and Dhan rejected it 116
+                # times; it passes product_by_bucket for exactly this reason.
+                # The exit path never got the same fix.
+                product=self.bucket.config.product,
                 extra_payload=(
                     {"decision_price": str(exit_mark)} if exit_mark else None
                 ),

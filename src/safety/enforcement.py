@@ -51,6 +51,7 @@ def enforce_breakers(
     max_funding_rate: Decimal,
     clock: Clock | None = None,
     shared_account: bool = False,
+    product_by_bucket: dict[str, str] | None = None,
 ) -> bool:
     """Run all breakers for one sub-account; halt + flatten on any trip.
 
@@ -192,6 +193,7 @@ def enforce_breakers(
         bucket_id=bucket_ids[0] if bucket_ids else "unknown",
         order_manager=order_manager,
         clock=clk,
+        product_by_bucket=product_by_bucket,
     )
 
     send_alert_dedup(
@@ -210,6 +212,7 @@ def _flatten_positions(
     bucket_id: str,
     order_manager: OrderManager,
     clock: Clock,
+    product_by_bucket: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
     """Close every position with a reduce-only market order.
 
@@ -231,6 +234,24 @@ def _flatten_positions(
                 size=pos.size,
                 order_type=OrderType.MARKET,
                 reduce_only=True,
+                # The SAME product the position is held under. Without it the
+                # adapter falls back to its constructor default (MTF, a
+                # CASH-EQUITY product) and Dhan refuses the order outright with
+                # DH-906 "Trades are not allowed for this Product / Scrip" —
+                # which is exactly how five attempts to close two MCX
+                # NATGASMINI lots failed on 2026-09-02.
+                #
+                # This is the flatten, so the consequence is worse than there:
+                # a breaker trips precisely when the bucket must be emptied,
+                # and a flatten that cannot place an order leaves the position
+                # open with the kill switch already engaged.
+                #
+                # Resolved off ``bucket_id``, which is the same approximation
+                # this function already makes — the caller passes bucket_ids[0]
+                # and positions are not attributed per bucket here. Correct for
+                # an account whose buckets share a product (every account
+                # today); a mixed-product account would need real attribution.
+                product=(product_by_bucket or {}).get(bucket_id),
                 allow_when_killed=True,
                 intent_id=f"breaker-flatten-{minute}",
             )
