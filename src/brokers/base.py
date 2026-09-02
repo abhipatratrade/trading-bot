@@ -225,6 +225,22 @@ class ContractSpec:
     lot_size: Decimal = Decimal("1")
     tick_size: Decimal = Decimal("0.05")
     freeze_qty: Decimal | None = None
+    # UNDERLYING UNITS per lot — what NOTIONAL is computed on, as distinct from
+    # `lot_size`, which is the ORDER quantity.
+    #
+    # Equal on NSE (a NIFTY lot is 65 for both) and NOT equal on MCX, where the
+    # scrip master reports LOT_SIZE 1 while a Natural Gas Mini lot controls 250
+    # mmBtu. Conflating them understates notional 250x, which on 2026-09-02
+    # showed a Rs 1,850 profit as a Rs 24.77 LOSS: gross P&L was computed per
+    # unit while charges came from the real notional.
+    #
+    # 0 means "same as lot_size", which is the cash-equity and NSE answer.
+    multiplier: Decimal = Decimal("0")
+
+    @property
+    def notional_unit(self) -> Decimal:
+        """Units a single order quantity controls, for notional and P&L."""
+        return self.multiplier if self.multiplier > 0 else self.lot_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +379,16 @@ class Broker(ABC):
         are unaffected.
         """
         return None
+
+    def contract_notional_unit(self, symbol: str) -> Decimal:  # noqa: B027
+        """Units ONE order quantity controls, for notional and P&L.
+
+        Distinct from ``contract_size``, which returns the ORDER unit — the
+        quantity the venue accepts. The two are equal everywhere except MCX,
+        where an order quantity of 1 controls 250 mmBtu. Adapters that know
+        better override; the default keeps every existing venue unchanged.
+        """
+        return self.contract_size(symbol) or Decimal("1")
 
     def contract_size(
         self, symbol: str, default: Decimal | None = Decimal("1")

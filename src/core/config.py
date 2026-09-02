@@ -279,6 +279,32 @@ class Settings(BaseSettings):
     # first entry, and keep the Decision 022 sweep behind it as the net.
     attached_stops_enabled: bool = False
 
+    # Does MCX honour a resting stop's TRIGGER, or does it strip it?
+    #
+    # OFF because on 2026-09-02 it demonstrably stripped it. The bot sent
+    # orderType STOP_LOSS_MARKET with triggerPrice 269.60 and price 0 — that
+    # payload is correct, and NSE has always accepted it. Dhan booked it as
+    #
+    #     SELL TRADED  type=LIMIT  triggerPrice=0.0  price=266.9  avg=281.5
+    #
+    # a plain limit sell below market with NO trigger, which filled INSTANTLY
+    # and closed the position it was placed to protect. The same conversion is
+    # visible on the entry (MARKET booked as LIMIT 285.00), so this is MCX
+    # market-protection being applied to a stop and losing the trigger on the
+    # way through.
+    #
+    # That makes a standalone MCX stop WORSE than none: not "might not fire",
+    # but "fires immediately, every time". And there is no safe limit price to
+    # fall back on — any sell limit at or below market is marketable, so a
+    # dropped trigger always executes.
+    #
+    # The adapter therefore REFUSES to place one while this is False, which
+    # surfaces as a loud stop_place_failed rather than a silent liquidation.
+    # Protection on MCX comes from the ATTACHED stop (Decision 034, proven
+    # accepted 2026-09-02) until scripts/mcx_stop_probe.py shows a resting stop
+    # keeping its trigger — then flip this on the VM, no redeploy.
+    mcx_standalone_stops_verified: bool = False
+
     # -- Retention (nightly prune job on the Railway scheduler) --------------
     # audit_log keeps 3× longer — it's the forensic record (House Rule #8).
     snapshot_retention_days: int = 60

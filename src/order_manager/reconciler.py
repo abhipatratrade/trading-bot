@@ -1137,7 +1137,12 @@ class Reconciler:
                 )
                 if agg is None:
                     continue
-                csize = self._broker.contract_size(trade.symbol)
+                # NOTIONAL unit, not the order unit. They differ on MCX
+                # (order quantity 1 controls 250 mmBtu) and using the lot there
+                # understates notional 250x, so P&L came out per-unit while
+                # charges came from the true notional — a profit shown as a
+                # loss on 2026-09-02.
+                csize = self._broker.contract_notional_unit(trade.symbol)
                 notional = trade_notional(
                     agg.avg_price, agg.filled_size, csize
                 )

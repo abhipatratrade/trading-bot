@@ -66,6 +66,13 @@ from src.core.logging import get_logger
 # F&O callers pass ``contract_spec`` so the real grid is used (Decision 036).
 _DEFAULT_TICK = Decimal("0.05")
 
+# How far THROUGH the trigger an MCX stop-limit rests, so a triggered stop
+# behaves as close to a market stop as a limit can. 1% is the buffer Dhan
+# itself derived when it converted our 269.60 stop into a 266.90 limit on
+# 2026-09-02 — matching it keeps the fill behaviour familiar rather than
+# inventing a number.
+_MCX_STOP_LIMIT_BUFFER = Decimal("0.01")
+
 # Super Order endpoints (Decision 034). Entry + target + stop-loss in ONE
 # request, so a stop the venue refuses means the ENTRY never happens.
 _SUPER_PATH = "/v2/super/orders"
@@ -412,6 +419,31 @@ class DhanClient(Broker):
                 f"freeze quantity {freeze}; split across orders",
             )
 
+        # A standalone stop on MCX is not merely unreliable, it is INVERTED:
+        # on 2026-09-02 the venue stripped the trigger, booked the order as a
+        # plain limit below market, and filled it instantly — closing the very
+        # position the stop was protecting. Refusing is the safe answer because
+        # there is no limit price that fails safe: any sell at or below market
+        # is marketable the moment the trigger is gone.
+        #
+        # This raises rather than returning, so the sweep records
+        # stop_place_failed and PAGES about an uncovered position, instead of
+        # quietly liquidating it. MCX protection comes from the attached stop
+        # (Decision 034) until scripts/mcx_stop_probe.py proves the trigger
+        # survives, then MCX_STANDALONE_STOPS_VERIFIED=true on the VM.
+        if (
+            request.stop_price is not None
+            and exchange == "MCX_COMM"
+            and not get_settings().mcx_standalone_stops_verified
+        ):
+            raise DhanAPIError(
+                "MCX_STOP_UNVERIFIED",
+                f"{request.symbol}: refusing a standalone stop on MCX — the "
+                f"venue stripped the trigger on 2026-09-02 and the order "
+                f"filled immediately at market. Use the attached stop, or set "
+                f"MCX_STANDALONE_STOPS_VERIFIED once the probe passes.",
+            )
+
         path = _SUPER_PATH if is_super else _PLAIN_PATH
         body = (
             self._super_order_body(request, security_id, exchange, product_type)
@@ -545,7 +577,15 @@ class DhanClient(Broker):
         product_type: str,
     ) -> dict[str, Any]:
         is_stop = request.stop_price is not None
-        if is_stop:
+        # MCX strips the trigger off a STOP_LOSS_MARKET and books it as a plain
+        # LIMIT, which then fills at once — see Settings.mcx_standalone_stops_
+        # verified for the 2026-09-02 evidence. A stop-LIMIT carries an explicit
+        # price, so there is nothing for market-protection to invent, and that
+        # is the form this venue is given.
+        mcx_stop = is_stop and exchange == "MCX_COMM"
+        if mcx_stop:
+            order_type = "STOP_LOSS"
+        elif is_stop:
             order_type = "STOP_LOSS_MARKET"
         elif request.order_type == OrderType.LIMIT:
             order_type = "LIMIT"
@@ -565,6 +605,18 @@ class DhanClient(Broker):
         }
         if request.order_type == OrderType.LIMIT and request.limit_price is not None:
             body["price"] = float(request.limit_price)
+        elif mcx_stop:
+            # A stop-LIMIT needs its own price. Set it THROUGH the trigger — a
+            # sell fills below, a buy above — so once triggered it behaves as
+            # close to a market stop as this venue allows. The buffer is the
+            # same ~1% Dhan itself derived when it mangled the order.
+            trigger = self._snap_tick(request.stop_price, request.symbol)  # type: ignore[arg-type]
+            through = (
+                trigger * (Decimal("1") - _MCX_STOP_LIMIT_BUFFER)
+                if request.side.lower() == "sell"
+                else trigger * (Decimal("1") + _MCX_STOP_LIMIT_BUFFER)
+            )
+            body["price"] = float(self._snap_tick(through, request.symbol))
         else:
             body["price"] = 0
         if is_stop:
@@ -1272,6 +1324,18 @@ class DhanClient(Broker):
                 )
             page += 1
         return out
+
+    def contract_notional_unit(self, symbol: str) -> Decimal:
+        """Units per order quantity — the MULTIPLIER, not the lot.
+
+        On NSE these coincide (a NIFTY lot is 65 for both). On MCX the scrip
+        master reports LOT_SIZE 1 while a Natural Gas Mini lot controls 250
+        mmBtu, so using the lot understates notional 250x — which on
+        2026-09-02 rendered a Rs 1,850 profit as a Rs 24.77 LOSS, because gross
+        P&L was per-unit while charges came from the real notional.
+        """
+        spec = self._spec_for(symbol)
+        return spec.notional_unit if spec is not None else Decimal("1")
 
     def contract_size(
         self, symbol: str, default: Decimal | None = Decimal("1")  # noqa: ARG002

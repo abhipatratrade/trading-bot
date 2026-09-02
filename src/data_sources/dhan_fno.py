@@ -277,6 +277,7 @@ class DerivativeContract:
             lot_size=Decimal(self.lot_size),
             tick_size=self.tick_size,
             freeze_qty=Decimal(self.freeze_qty) if self.freeze_qty > 0 else None,
+            multiplier=Decimal(self.multiplier or 0),
         )
 
     def to_dict(self) -> dict[str, Any]:
