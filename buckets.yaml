@@ -256,7 +256,27 @@ buckets:
     # the exchange as a reduce-only stop-market. NOT a premium multiple — this
     # is a futures position, so the percent is of the futures price.
     stop_loss_pct: 4.5
-    # Decision 034's attached stop is unproven on MCX. The Decision 022 sweep
-    # rests the stop after the fill instead, which is the pre-034 behaviour and
-    # the one this venue has never contradicted.
-    attached_stops: false
+    # PROVEN on MCX 2026-09-02: a super order with productType MARGIN on
+    # MCX_COMM was accepted (orderId 23326090227875, scripts/mcx_super_probe.py).
+    # This said "unproven on MCX" until then — and nobody had ever tested it;
+    # the older path was simply assumed safer. It was not.
+    #
+    # The entry and its stop now go in ONE request, so a stop Dhan refuses means
+    # the ENTRY never happens. That matters here more than anywhere else in this
+    # repo, because every other stop path on this bucket has now failed in
+    # production:
+    #
+    #   2026-09-01  the position could not be matched to the ledger (Dhan
+    #               reports NATGASMINI-25Sep2026-FUT, the bot minted
+    #               NATGASMINI-20260925-FUT), so the sweep read it as the
+    #               user's and left it alone. Two lots, no stop.
+    #   2026-09-02  the sweep was clocked to NSE hours (09:15-15:30) while MCX
+    #               trades 09:00-23:30, so for both entries — placed at 23:11
+    #               and 23:26 — it never even ran.
+    #   2026-09-02  the exit path omitted `product`, so the fallback close went
+    #               out MTF and Dhan refused it five times (DH-906).
+    #
+    # An attached stop depends on none of that: no ledger row, no symbol
+    # round-trip, no ownership chain, no session gate. It is the only stop on
+    # this bucket that cannot be silently absent.
+    attached_stops: true
