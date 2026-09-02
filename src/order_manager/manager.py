@@ -395,9 +395,22 @@ class OrderManager:
             price_str = f"trigger {stop_price}"
         else:
             price_str = str(limit_price) if limit_price is not None else "market"
+        # An ATTACHED stop is invisible here unless it is said out loud. The tag
+        # above keys on ``stop_price``, which is the STANDALONE stop, so once
+        # commodity-indian moved to Decision 034 on 2026-09-02 its entries began
+        # reporting a bare "ORDER BUY 1 ... @ market" while silently carrying a
+        # stop at 267.10. The protection got better and the telemetry got worse,
+        # which is the wrong way round: on a bucket whose every other stop path
+        # has failed, "is this position covered?" must be answerable from the
+        # phone.
+        protection = (
+            f" +stop {attached_stop_price}"
+            if attached_stop_price is not None
+            else ""
+        )
         send_alert(
-            f"[{scope}] {tag} {side.upper()} {size} {symbol} @ {price_str} "
-            f"[{mapped_status.value}]"
+            f"[{scope}] {tag} {side.upper()} {size} {symbol} @ {price_str}"
+            f"{protection} [{mapped_status.value}]"
         )
 
         return PlacementResult(
