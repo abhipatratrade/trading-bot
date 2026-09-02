@@ -36,7 +36,10 @@ SAFETY — and read this, because it is WEAKER than the forever probe's:
 * Dry run is the default; ``--place`` is required to send anything.
 * A live price is REQUIRED before placing — every distance below is relative to
   market, so a missing price means no guarantee at all.
-* Cancellation is in a ``finally``, and a failed cancel shouts.
+* Cancellation is in a ``finally``, RETRIED while Dhan says the order is still
+  in transit, and a failed cancel shouts. The retry is not defensive padding:
+  the first version cancelled once, lost that race on 2026-09-02, and left a
+  live buy order resting on a real account — see ``cancel_with_retry``.
 * Reads the bot's token from the shared ``dhan_token`` row via a STATIC manager
   with no mint path, so it cannot evict the live session.
 
@@ -53,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -112,6 +116,44 @@ _VERDICT_MARKERS = (
     "bo/co",
     "bracket",
 )
+
+
+def cancel_with_retry(
+    client: DhanClient,
+    order_id: str,
+    *,
+    attempts: int = 10,
+    delay: float = 2.0,
+) -> object:
+    """Cancel an order that Dhan may not be ready to cancel yet.
+
+    A freshly placed order sits in TRANSIT until it reaches the exchange, and
+    Dhan REFUSES to cancel it in that state:
+
+        DH-906: Order Still In Transit. Kindly Refresh Your Orderbook
+
+    The first version of this script cancelled once, immediately after
+    placing, and treated the attempt as the safety guarantee. On 2026-09-02 it
+    lost that race and left a LIVE BUY ORDER resting 3% below market on a real
+    account — the exact outcome the ``finally`` existed to prevent.
+
+    So retry while the refusal is the transit race, and only that: any other
+    error is a real failure and must surface immediately rather than being
+    swallowed by nine more attempts.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return client._request(  # noqa: SLF001 — probe, not a code path
+                "DELETE", f"{_SUPER_PATH}/{order_id}/{_ENTRY_LEG}"
+            )
+        except DhanAPIError as exc:
+            if "transit" not in str(exc).lower():
+                raise
+            last = exc
+            print(f"    cancel attempt {attempt + 1}: still in transit, retrying")
+            time.sleep(delay)
+    raise last if last else RuntimeError("cancel failed with no error recorded")
 
 
 def classify(message: str) -> str:
@@ -314,9 +356,7 @@ def main() -> int:
     finally:
         if order_id:
             try:
-                cancelled = client._request(  # noqa: SLF001
-                    "DELETE", f"{_SUPER_PATH}/{order_id}/{_ENTRY_LEG}"
-                )
+                cancelled = cancel_with_retry(client, order_id)
                 print(f"  CANCELLED {order_id}: {json.dumps(cancelled)}")
             except Exception as exc:  # noqa: BLE001
                 print(
