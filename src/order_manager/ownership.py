@@ -102,6 +102,23 @@ def _closes_exposure(trade: _TradeLike) -> bool:
     return bool(flag)
 
 
+def opens_exposure(trade: _TradeLike) -> bool:
+    """Does this order OPEN exposure (an entry), rather than reduce it?
+
+    The public inverse of :func:`_closes_exposure`, for callers outside this
+    module that need "is this an entry?" — notably the stop sweep's orphan-leg
+    race guard, which asked ``side == BUY`` and therefore could not see a short
+    entry at all. On 2026-09-04 that let the sweep cancel the protective leg of
+    a NATGASMINI short 14 seconds after it opened.
+
+    Sharing the predicate rather than re-deriving it is deliberate: two
+    implementations of "what counts as an entry" is exactly how
+    ``_load_attribution`` and ``_load_stop_distances`` drifted apart and cost a
+    live position its stop.
+    """
+    return not _closes_exposure(trade)
+
+
 def net_owned_signed(trades: Iterable[_TradeLike]) -> dict[str, Decimal]:
     """``{symbol: signed_net_qty}`` — POSITIVE long, NEGATIVE short. PURE.
 

@@ -39,28 +39,19 @@ from src.core.clock import Clock, RealClock
 from src.core.db import session_scope
 from src.core.logging import get_logger
 from src.core.models import (
-    OrderSide,
     OrderStatus,
     Position,
     PositionSide,
     Trade,
 )
 from src.order_manager.manager import OrderManager
-from src.order_manager.ownership import bot_owned_quantities, bucket_allows_shorts
+from src.order_manager.ownership import (
+    bot_owned_quantities,
+    bucket_allows_shorts,
+    opens_exposure,
+)
 
 _log = get_logger("safety.stop_protection")
-
-
-def _allows_shorts(bucket_id: str | None) -> bool:
-    """May a position attributed to ``bucket_id`` legitimately be SHORT?
-
-    An UNATTRIBUTED symbol answers False. Attribution is late by design — the
-    Position row is written by the 5-minute reconciler while this sweep runs
-    seconds after a fill — so "we do not know whose bucket this is" is exactly
-    the settlement-artifact case, not the derivative one, and the conservative
-    answer is the one that refuses to act on it.
-    """
-    return bool(bucket_id) and bucket_allows_shorts(bucket_id)  # type: ignore[arg-type]
 
 # Re-place the stop when its trigger sits more than this relative distance
 # from the expected trigger (entry price moved on adds, config changed).
@@ -305,6 +296,19 @@ def resolve_target_price(
     else:
         raw = entry_price * (Decimal("1") - frac)
     return _round_to_tick(raw, tick)
+
+
+
+def _allows_shorts(bucket_id: str | None) -> bool:
+    """May a position attributed to ``bucket_id`` legitimately be SHORT?
+
+    An UNATTRIBUTED symbol answers False. Attribution is late by design — the
+    Position row is written by the 5-minute reconciler while this sweep runs
+    seconds after a fill — so "we do not know whose bucket this is" is exactly
+    the settlement-artifact case, not the derivative one, and the conservative
+    answer is the one that refuses to act on it.
+    """
+    return bool(bucket_id) and bucket_allows_shorts(bucket_id)  # type: ignore[arg-type]
 
 
 def plan_stop_protection(
@@ -718,15 +722,24 @@ def _load_recent_entry_symbols(
     reason as ``_load_attribution`` and ``_load_stop_distances``: a Dhan order is
     ``pending`` from the moment it is placed, so a filter without it would miss
     the exact rows this function exists to find — the newest ones.
+
+    An entry is "not reduce_only", NOT "a BUY". Asking for BUY made a short
+    entry invisible to the one guard written to prevent this exact outcome, and
+    on 2026-09-04 the sweep cancelled the protective leg of a NATGASMINI short
+    fourteen seconds after it opened — the position then ran naked for hours.
+    ``opens_exposure`` falls back to the long-only reading when a row carries no
+    flag, so historic rows resolve exactly as they did before.
     """
     cutoff = now - timedelta(minutes=within_minutes)
     with session_scope() as session:
         rows = (
             session.execute(
-                select(Trade.symbol)
+                # The whole row, not just the symbol: whether a trade opens or
+                # closes exposure lives in ``extra``, which SQL would have to
+                # reach into as JSONB. Cheap — this window is minutes wide.
+                select(Trade)
                 .where(
                     Trade.bucket_id.in_(bucket_ids),
-                    Trade.side == OrderSide.BUY,
                     Trade.created_at > cutoff,
                     Trade.status.in_(
                         [
@@ -737,12 +750,11 @@ def _load_recent_entry_symbols(
                         ]
                     ),
                 )
-                .distinct()
             )
             .scalars()
             .all()
         )
-    return set(rows)
+        return {t.symbol for t in rows if opens_exposure(t)}
 
 
 def _load_stop_distances(bucket_ids: list[str]) -> dict[str, Decimal]:
