@@ -31,7 +31,10 @@ from src.core.models import (
     PositionSide,
     Trade,
 )
-from src.order_manager.ownership import bot_owned_quantities
+from src.order_manager.ownership import (
+    bot_owned_quantities,
+    bucket_allows_shorts,
+)
 
 
 @dataclass
@@ -94,6 +97,45 @@ class Reconciler:
         # order must be observed repeatedly before the bot writes an exit for
         # it, because a single bad read would fabricate one.
         self._shortfall_seen: dict[str, tuple[Decimal, int]] = {}
+
+    def _may_adopt_orphan(self, side: str, latest_trade: Trade | None) -> bool:
+        """May this un-tracked exchange position become a bot Position row?
+
+        Everything except a short on a shared account: yes. A short there is
+        the one case where "the bot owns this symbol" and "the bot opened this
+        position" can come apart, so it is decided by the BUCKET.
+
+        On a CASH bucket, no. The long-only ownership view expresses positive
+        quantities only, so the caller's ``sym in owned`` test can pass on a
+        symbol we are LONG in the ledger while the broker reports a SHORT —
+        which is exactly what a settlement artifact looks like. Selling PIIND
+        out of holdings on 2026-08-18 produced a negative day-position, this
+        method's predecessor adopted it, and the resulting row told the stop
+        sweep there was a short to protect. Adopting it is how the artifact
+        became state.
+
+        On a DERIVATIVE bucket the argument inverts and refusing costs more
+        than adopting: selling to open is an ordinary entry (64 of the CCI gas
+        strategy's 125 backtested trades are sells) and ownership is signed
+        there, so a short IS provable. Blanket refusal stranded a real
+        NATGASMINI short on 2026-09-04 — no Position row, so ``select_exits``
+        never ran and the signal exit, the profitable half of that strategy,
+        could not fire.
+
+        An unattributable short (no filled trade, or a trade carrying no
+        bucket) is refused: there is no bucket to ask, and "we cannot say whose
+        this is" is the artifact case, not the derivative one.
+
+        Same shape as the ``allows_shorts`` guard in ``bucket_runner``
+        (Decision 037): ask the bucket, not the account.
+        """
+        if not self._shared_account or side != "short":
+            return True
+        return bool(
+            latest_trade
+            and latest_trade.bucket_id
+            and bucket_allows_shorts(latest_trade.bucket_id)
+        )
 
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
@@ -680,25 +722,15 @@ class Reconciler:
                         exchange_size=str(ex_pos.size),
                     )
                     continue
-                if self._shared_account and ex_pos.side == "short":
-                    # A short is never provably ours here: ``net_owned``
-                    # expresses only long quantities, so the check above can
-                    # pass on a symbol we are LONG in the ledger while the
-                    # broker reports a SHORT — which is precisely what a
-                    # settlement artifact looks like.
-                    #
-                    # On 2026-08-18 selling PIIND out of holdings produced a
-                    # negative day-position, and this branch adopted it as a
-                    # short Position row (``orphan_position_reopened``). That
-                    # row then told the stop sweep there was a short to
-                    # protect. Adopting it is how the artifact became state.
+                latest_trade = self._latest_filled_trade(session, sym)
+                if not self._may_adopt_orphan(ex_pos.side, latest_trade):
                     self._log.warning(
                         "short_position_not_adopted",
                         symbol=sym,
                         exchange_size=str(ex_pos.size),
+                        bucket_id=latest_trade.bucket_id if latest_trade else None,
                     )
                     continue
-                latest_trade = self._latest_filled_trade(session, sym)
                 strategy_id = latest_trade.strategy_id if latest_trade else "unknown"
                 bucket_id = latest_trade.bucket_id if latest_trade else None
                 strategy_name = (
@@ -706,10 +738,17 @@ class Reconciler:
                 )
                 side = _exchange_side_to_position(ex_pos.side)
                 # Never adopt more than the bot's OWN net quantity: if the user
-                # also holds this cash symbol, the exchange size is bot+user, so
-                # cap at what the bot opened (shared account only).
+                # also holds this symbol, the exchange size is bot+user, so cap
+                # at what the bot opened (shared account only).
+                #
+                # abs(): ownership is signed for a bucket that can hold shorts,
+                # so the bot's own short reads -1 here. A Position row carries
+                # magnitude in ``quantity`` and direction in ``side``, and a
+                # bare min() would write -1 into a row already marked SHORT —
+                # a double negative that every downstream size calculation
+                # would then get backwards.
                 import_qty = (
-                    min(ex_pos.size, owned[sym])
+                    min(ex_pos.size, abs(owned[sym]))
                     if self._shared_account
                     else ex_pos.size
                 )

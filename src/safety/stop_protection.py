@@ -46,9 +46,21 @@ from src.core.models import (
     Trade,
 )
 from src.order_manager.manager import OrderManager
-from src.order_manager.ownership import bot_owned_quantities
+from src.order_manager.ownership import bot_owned_quantities, bucket_allows_shorts
 
 _log = get_logger("safety.stop_protection")
+
+
+def _allows_shorts(bucket_id: str | None) -> bool:
+    """May a position attributed to ``bucket_id`` legitimately be SHORT?
+
+    An UNATTRIBUTED symbol answers False. Attribution is late by design — the
+    Position row is written by the 5-minute reconciler while this sweep runs
+    seconds after a fill — so "we do not know whose bucket this is" is exactly
+    the settlement-artifact case, not the derivative one, and the conservative
+    answer is the one that refuses to act on it.
+    """
+    return bool(bucket_id) and bucket_allows_shorts(bucket_id)  # type: ignore[arg-type]
 
 # Re-place the stop when its trigger sits more than this relative distance
 # from the expected trigger (entry price moved on adds, config changed).
@@ -376,7 +388,20 @@ def plan_stop_protection(
         # Dhan rejected that one. Had it been accepted, triggering it would have
         # BOUGHT 15 shares — opening a real long position with no strategy
         # behind it, from the module whose entire job is reducing risk.
-        if shared and pos.side == "short":
+        #
+        # A DERIVATIVE bucket is the opposite case and the same refusal there
+        # is dangerous rather than safe. Selling to open is an ordinary entry,
+        # ownership is signed so a short IS provable, and this `continue` sits
+        # BEFORE the attached-stop branch below — so a short skipped here never
+        # reaches ``plan.attached``. Two things follow, both bad: the coverage
+        # invariant reads a protected position as naked and HALTs the bucket,
+        # and the orphan pass at the end of this function sees a venue leg with
+        # no matching holding and CANCELS the only stop on a live short. Ask
+        # the bucket, not the account — as ``bucket_runner`` and the reconciler
+        # both do (Decision 037).
+        if shared and pos.side == "short" and not _allows_shorts(
+            attribution.get(pos.symbol, (None, None))[0]
+        ):
             _log.warning(
                 "short_position_not_protected_on_shared_account",
                 symbol=pos.symbol,
@@ -426,9 +451,13 @@ def plan_stop_protection(
             continue
 
         # Never protect more than the bot's own quantity (overlap guard).
+        # abs(): ownership is signed on a bucket that can hold shorts, so the
+        # bot's own short reads -1 here. A bare min() would yield a negative
+        # size, fall through the `<= 0` guard below, and silently leave the
+        # short unprotected — the exact outcome this branch exists to prevent.
         size = pos.size
         if shared:
-            size = min(pos.size, owned_quantities[pos.symbol])  # type: ignore[index]
+            size = min(pos.size, abs(owned_quantities[pos.symbol]))  # type: ignore[index]
         if size <= 0:
             continue
 
@@ -495,7 +524,10 @@ def plan_stop_protection(
     for pos in positions:
         if pos.size <= 0 or pos.side not in ("long", "short"):
             continue
-        if shared and (owned_quantities or {}).get(pos.symbol, Decimal("0")) <= 0:
+        # abs(): a signed short is -1, and `<= 0` would drop it from bot_held —
+        # which is the set that keeps a venue-attached leg from being retired
+        # as an orphan. Dropping a live short here CANCELS its only stop.
+        if shared and abs((owned_quantities or {}).get(pos.symbol, Decimal("0"))) <= 0:
             continue
         bot_held.add(pos.symbol)
     # ``recent_entries`` is the guard against the race this sweep would

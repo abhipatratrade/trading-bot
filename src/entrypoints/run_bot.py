@@ -232,6 +232,39 @@ def _price_bands(data: object, is_dhan: bool) -> dict[str, Decimal | None] | Non
     return out
 
 
+def bucket_watch_for(bucket, tick_interval_seconds: int) -> BucketWatch:
+    """The invariants' view of one bucket, derived wholly from the bucket.
+
+    Public and extracted so it can be tested, which is the point. Inlined in
+    ``main`` it was a keyword-argument list, and ``derivatives`` — added by
+    Decision 036 to select signed ownership and short-aware holdings — was
+    simply never written into it. The field defaults to False, so nothing
+    failed: every bucket claimed to be cash-only, the whole signed path was
+    dead for four months, and commodity-indian's genuine NATGASMINI short on
+    2026-09-04 was reported by ``foreign_positions`` as one of the user's own
+    trades.
+
+    A silently-defaulted safety flag is not detectable by reading ``main``.
+    Derived here from the bucket instead, every field of it, so a bucket that
+    gains a capability gains the matching check with it.
+    """
+    cfg = bucket.config
+    return BucketWatch(
+        bucket_id=bucket.id,
+        tick_interval_seconds=tick_interval_seconds,
+        # Only a same-day product must be flat at 15:15. swing-indian carries
+        # MTF for days; crypto has no session at all.
+        intraday=(cfg.product == "INTRADAY"),
+        # INR-native equity only — see BucketWatch.notional_budget_inr.
+        notional_budget_inr=(
+            cfg.capital_inr * cfg.leverage_max
+            if bucket.market == Market.INDIAN
+            else None
+        ),
+        derivatives=bucket.trades_derivatives(),
+    )
+
+
 def _handle_signal(signum: int, _frame: object) -> None:
     global _shutdown
     _log.info("shutdown_signal_received", signal=signum)
@@ -805,20 +838,8 @@ def main() -> None:
     # stays with the breakers.
     watches: dict[str, list[BucketWatch]] = {}
     for runner in runners:
-        cfg = runner.bucket.config
-        indian = runner.bucket.market == Market.INDIAN
-        watches.setdefault(cfg.account_ref, []).append(
-            BucketWatch(
-                bucket_id=runner.bucket.id,
-                tick_interval_seconds=runner.tick_interval_seconds,
-                # Only a same-day product must be flat at 15:15. swing-indian
-                # carries MTF for days; crypto has no session at all.
-                intraday=(cfg.product == "INTRADAY"),
-                # INR-native equity only — see BucketWatch.notional_budget_inr.
-                notional_budget_inr=(
-                    cfg.capital_inr * cfg.leverage_max if indian else None
-                ),
-            )
+        watches.setdefault(runner.bucket.config.account_ref, []).append(
+            bucket_watch_for(runner.bucket, runner.tick_interval_seconds)
         )
     invariant_thresholds = InvariantThresholds(
         squareoff_grace_minutes=settings.squareoff_grace_minutes,

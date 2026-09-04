@@ -30,12 +30,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from decimal import Decimal
+from functools import cache
 from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from src.core.logging import get_logger
 from src.core.models import BrokerName, OrderSide, OrderStatus, Trade
+from src.shared.bucket import load_bucket
+
+_log = get_logger("order_manager.ownership")
 
 # Widest bot holding period across the Indian buckets (swing-indian caps at
 # ~30 days) plus a buffer. A bot entry older than this can't correspond to a
@@ -147,6 +152,26 @@ def net_owned(trades: Iterable[_TradeLike]) -> dict[str, Decimal]:
     return {sym: q for sym, q in net_owned_signed(trades).items() if q > 0}
 
 
+@cache
+def bucket_allows_shorts(bucket_id: str) -> bool:
+    """Can this bucket legitimately hold a SHORT? Cached for the process.
+
+    ``buckets.yaml`` is in git and only changes across a restart, and
+    ``load_bucket`` re-reads and re-validates the whole file on every call —
+    which this asks on the hot path, once per symbol-set per tick.
+
+    An id that is not in ``buckets.yaml`` answers False: that means the bot is
+    not running the bucket, so the rows are historical, and False is the
+    pre-036 view they were written under. Never let this raise — it sits inside
+    the ownership check that every safety sweep depends on.
+    """
+    try:
+        return load_bucket(bucket_id).allows_shorts
+    except Exception:
+        _log.warning("ownership_bucket_unknown", bucket_id=bucket_id)
+        return False
+
+
 def bot_owned_quantities(
     session: Session,
     *,
@@ -154,7 +179,7 @@ def bot_owned_quantities(
     bucket_ids: list[str],
     now: datetime,
     window_days: int = OWNERSHIP_WINDOW_DAYS,
-    signed: bool = False,
+    signed: bool | None = None,
 ) -> dict[str, Decimal]:
     """``{symbol: net_qty}`` the bot holds — the DB-backed wrapper.
 
@@ -166,9 +191,26 @@ def bot_owned_quantities(
     ``signed`` (Decision 036) returns negative quantities for shorts. It must
     be True for any caller that can hold them: with the long-only default a
     naked short is absent from the result, which every safety path reads as
-    "not ours" — no stop, no flatten, no reconciliation. Default False so the
-    pre-036 callers keep exactly the view they were written against.
+    "not ours" — no stop, no flatten, no reconciliation.
+
+    **It defaults to the BUCKETS, not to False.** Shipped as ``signed: bool =
+    False`` with the note that callers who need it would pass it, and the six
+    that need it did not. ``BucketWatch.derivatives`` — the one flag that
+    selected it — was never assigned at its only construction site, so the
+    whole path was dead. commodity-indian opened a real short on 2026-09-04 and
+    every account-level check filed it under the user's own trading: the
+    reconciler refused to adopt it, so ``select_exits`` never ran; the sweep
+    saw nothing to protect; ``foreign_positions`` reported it as a stranger's.
+
+    So the question is now answered from the bucket that would hold the
+    position rather than from each caller's memory. A cash-equity bucket has
+    ``allows_shorts`` False and keeps exactly the pre-036 long-only view, which
+    is what stops a settlement artifact (a sale out of holdings shows as a
+    negative day-position) from being read as a real short. Pass ``signed``
+    explicitly only to override that, and say why.
     """
+    if signed is None:
+        signed = any(bucket_allows_shorts(b) for b in bucket_ids)
     if not bucket_ids:
         return {}
     cutoff = now - timedelta(days=window_days)
