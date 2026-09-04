@@ -37,9 +37,11 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import ClassVar
 
+from src.core.clock import RealClock
 from src.core.logging import get_logger
 from src.core.models import Position
 from src.data_sources.base import MarketData
+from src.shared.bars import completed_bars
 from src.shared.base_strategy import EntryCandidate, Strategy
 from src.shared.bucket import load_bucket
 from src.shared.contract_selection import (
@@ -64,6 +66,12 @@ _REPLAY_DAYS = 90
 
 # Dhan's interval key for the 15-minute bar this strategy signals on.
 _TF = "15m"
+
+# The same interval as a number, for the completed-bar filter. Dhan hands back
+# the bar still forming, and `Bar` in src/shared/scanner/cci.py is documented as
+# "one COMPLETED OHLC bar" — see src/shared/bars.py for what happened when it
+# was given a partial one.
+_TF_MINUTES = 15
 
 
 class CciGasReversion15m(Strategy):
@@ -95,8 +103,6 @@ class CciGasReversion15m(Strategy):
         registry = getattr(data, "fno", None)
         if registry is None:
             return None
-        from src.core.clock import RealClock
-
         selector = ContractSelector(registry, self._selection_config())
         chosen = selector.select(
             underlying, spot=Decimal("1"), side="buy", on=RealClock().now().date()
@@ -106,7 +112,15 @@ class CciGasReversion15m(Strategy):
     def _state_for(
         self, underlying: str, data: MarketData
     ) -> tuple[CCIState, object, list, object] | None:
-        """Replay the contract's bars and return the settled state machine."""
+        """Replay the contract's COMPLETED bars; return the settled machine.
+
+        The fourth element is the timestamp of the last bar replayed, and after
+        the ``completed_bars`` filter it names a settled bar. That matters more
+        than it looks: ``select_entries`` compares a signal's ``ts`` against it,
+        so if it named the forming bar the gate could only ever fire while that
+        bar was still moving, and a signal confirmed at a bar's CLOSE would be
+        unreachable — by then the feed has moved on to the next partial bar.
+        """
         contract = self._contract_for(underlying, data)
         if contract is None:
             _log.warning("cci_no_contract", underlying=underlying)
@@ -118,6 +132,17 @@ class CciGasReversion15m(Strategy):
                 "cci_bars_unavailable", contract=contract.symbol, exc_info=True
             )
             return None
+        # BEFORE the length check, so "enough history" counts settled bars, and
+        # before the replay, so neither the state machine nor `last_ts` can see
+        # a price that is still moving.
+        forming = len(raw)
+        raw = completed_bars(raw, minutes=_TF_MINUTES, now=RealClock().now())
+        if len(raw) < forming:
+            _log.debug(
+                "cci_dropped_forming_bar",
+                contract=contract.symbol,
+                dropped=forming - len(raw),
+            )
         if len(raw) < 40:
             _log.warning(
                 "cci_insufficient_history",
@@ -162,6 +187,14 @@ class CciGasReversion15m(Strategy):
         one, and there is nothing to place. The backtest took 125 trades, not
         one per tick, so this is also the reading that matches it — dedup
         becomes a second line of defence rather than the only one.
+
+        The test is only as honest as ``last_ts``. Shipped on 09-02 it compared
+        against the bar Dhan was still WRITING, which inverted it: the gate
+        could fire only while a bar moved, and a signal that settled at a bar's
+        close was unreachable forever after. Live at 18:22 IST on 09-04 it
+        proposed the same short on four consecutive ticks and then stopped —
+        exactly the span of one forming bar. ``_state_for`` now replays settled
+        bars only, so this asks what it says it asks.
         """
         out: list[EntryCandidate] = []
         for underlying in candidates:
