@@ -61,6 +61,7 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | swing-indian strategy | Midcap-150 1h Mean Reversion, LIVE 2026-07-27 — Decision 032. Blasting Momentum is inert (`_blasting_momentum.py`, no master row) |
 | Kill-switch semantics | Blocks risk-increasing actions only: strategy exits + breaker watch continue while killed — Decision 024 |
 | Session invariants | Per-tick PROCESS assertions beside the equity breakers (square-off, stop coverage, notional, rejects, per-bucket liveness) — Decision 033 |
+| Stop-coverage severity | HALT while the bucket's own venue is open, NOTICE once it shuts (no DAY stop can rest) — Decision 038 |
 | Supervision authority | Invariants and any future agent may HALT (kill switch) at most; only a deterministic breaker may FLATTEN — Decision 033 |
 | USD/INR rate | FIXED 85 in each bucket's allocator.yaml (no live FX feed) — user decision 2026-07-07, see Decision 024 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |

@@ -64,7 +64,12 @@ from src.core.models import (
 from src.order_manager.ownership import bot_owned_quantities
 from src.safety import kill_switch
 from src.shared.contracts import parse_contract_symbol
-from src.shared.market_calendar import IST, is_trading_day
+from src.shared.market_calendar import (
+    IST,
+    NseSession,
+    is_trading_day,
+    nse_session,
+)
 
 _log = get_logger("safety.session_invariants")
 
@@ -116,6 +121,12 @@ class BucketWatch:
     # The bucket's own allocation, for the margin-utilisation ceiling. None
     # skips that check.
     capital_inr: Decimal | None = None
+    # Decision 038 — the exchange whose session decides whether a protective
+    # stop CAN rest right now. NSE and MCX close daily and Dhan expires DAY
+    # orders with them; None means the venue never closes (crypto), so a
+    # missing stop there is always a fault. Defaulting to None keeps every
+    # crypto bucket's severity byte-identical to pre-038.
+    venue: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +257,7 @@ def check_stop_coverage(
     open_orders: list[OpenOrder],
     sustain_ticks: int,
     attached_stops: dict[str, Decimal] | None = None,
+    session_open: bool = True,
 ) -> InvariantResult:
     """Every bot-held position needs a resting reduce-only stop (Decision 022).
 
@@ -256,6 +268,22 @@ def check_stop_coverage(
 
     Runs AFTER the sweep, so a gap here means the sweep tried and failed (or
     never planned one) — not that it hasn't got to it yet.
+
+    ``session_open`` is False when this bucket's venue is shut (Decision 038).
+    The check still runs and still pages, but it drops to NOTICE, because
+    outside the session the finding is no longer actionable: Dhan expires DAY
+    orders at the close, so no stop CAN rest until the venue reopens, and the
+    kill switch does not create one. Halting there bought nothing — per
+    Decision 024 exits, the sweep and the breakers all keep running while
+    killed — and cost a bucket that was dead at the next open. On 2026-09-04
+    that halted swing-indian at 01:34 IST over KEI and commodity-indian over
+    NATGASMINI, and both stayed down until cleared by hand six days later.
+
+    It is deliberately NOT an exemption. An unprotected overnight position is
+    still real, still paged, and still the thing Decision 035 wants Forever
+    Orders to fix; this only stops the alarm from disabling the bucket over a
+    condition that cannot be resolved at that hour. Inside the session a
+    missing stop means the sweep genuinely failed, and that still HALTS.
 
     ``attached_stops`` (Decision 034) are positions the VENUE protects via a
     stop leg carried on the entry order itself. They count as covered on their
@@ -301,17 +329,26 @@ def check_stop_coverage(
     if not uncovered:
         return InvariantResult(name, bucket_id, ok=True)
 
+    if session_open:
+        message = (
+            f"NO PROTECTIVE STOP on {bucket_id}: {', '.join(uncovered)} — the "
+            f"sweep did not leave a resting reduce-only stop. These positions "
+            f"are naked if the bot or VM dies."
+        )
+    else:
+        message = (
+            f"UNPROTECTED OVERNIGHT on {bucket_id}: {', '.join(uncovered)} — "
+            f"the venue is closed, so no stop can rest until it reopens. These "
+            f"positions are naked to a gap. Not halting: nothing can be placed "
+            f"at this hour."
+        )
     return InvariantResult(
         name,
         bucket_id,
         ok=False,
-        severity=Severity.HALT,
-        message=(
-            f"NO PROTECTIVE STOP on {bucket_id}: {', '.join(uncovered)} — the "
-            f"sweep did not leave a resting reduce-only stop. These positions "
-            f"are naked if the bot or VM dies."
-        ),
-        detail={"uncovered": uncovered},
+        severity=Severity.HALT if session_open else Severity.NOTICE,
+        message=message,
+        detail={"uncovered": uncovered, "session_open": session_open},
         sustain_ticks=sustain_ticks,
     )
 
@@ -1054,6 +1091,10 @@ def run_session_invariants(
 
     ``check_liveness`` is False outside an open session: a bucket that is
     correctly idle overnight is not stalled.
+
+    ``stop_coverage``'s session gate is derived per bucket from ``watch.venue``
+    rather than taken from the caller, because buckets sharing an account do
+    not share a session (Decision 038).
     """
     clk = clock or RealClock()
     now = clk.now()
@@ -1142,6 +1183,15 @@ def run_session_invariants(
                 grace_minutes=thresholds.squareoff_grace_minutes,
             )
         )
+        # PER-BUCKET, not per-account (Decision 038). commodity-indian and
+        # swing-indian share one Dhan account but not one session: MCX trades
+        # until 23:30 IST against NSE's 15:30. Reusing the account-level NSE
+        # answer would downgrade a genuine naked MCX short to a notice for the
+        # eight hours MCX is still open — the exact window the NATGASMINI short
+        # was live in.
+        stop_session_open = watch.venue is None or (
+            nse_session(now, exchange=watch.venue) is not NseSession.CLOSED
+        )
         results.append(
             check_stop_coverage(
                 bucket_id=watch.bucket_id,
@@ -1149,6 +1199,7 @@ def run_session_invariants(
                 open_orders=open_orders,
                 sustain_ticks=thresholds.stop_coverage_sustain_ticks,
                 attached_stops=attached_stops,
+                session_open=stop_session_open,
             )
         )
         results.append(

@@ -262,6 +262,12 @@ def bucket_watch_for(bucket, tick_interval_seconds: int) -> BucketWatch:
             else None
         ),
         derivatives=bucket.trades_derivatives(),
+        # Decision 038 — the venue whose session decides whether a stop CAN
+        # rest. `cfg.exchange` defaults to "NSE", which is right for the equity
+        # buckets and wrong for crypto, so the market test rather than a bare
+        # read: Delta never closes, and None keeps those buckets at HALT around
+        # the clock. MCX resolves to its own 09:00-23:30 bounds, not NSE's.
+        venue=(cfg.exchange if bucket.market == Market.INDIAN else None),
     )
 
 

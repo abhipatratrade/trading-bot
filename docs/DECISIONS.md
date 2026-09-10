@@ -2172,3 +2172,89 @@ places a real (resting) order and therefore needs explicit approval first.
   The Decision 036 F&O buckets and swing-indian could delegate indicator-based
   exits to the venue — subject to whether the specific indicator is expressible.
   Nothing in this repo uses that today.
+
+---
+
+## 038 — `stop_coverage` halts inside the session and pages outside it
+
+**Status: implemented 2026-09-11.** Narrows what one invariant may do. Read it
+with Decision 033 (invariants may HALT at most) and Decision 035 (the overnight
+stop), which this does not solve and is not a substitute for.
+
+### The behaviour being changed
+
+`check_stop_coverage` asserts that every bot-held position carries a resting
+reduce-only stop, and HALTs the bucket after two consecutive violations. Dhan
+expires DAY orders at the session close, so from the close until the next open
+**no stop can rest** — the assertion is unsatisfiable for the whole overnight,
+and the check fired against a condition nothing could resolve.
+
+On 2026-09-04 that halted two buckets within 45 minutes of each other:
+
+| bucket | IST | position | why the stop was missing |
+|---|---|---|---|
+| commodity-indian | 00:49 | NATGASMINI short | the bot cancelled its own stop 14s after placing it — the short-blindness fixed in `03013f3` / `f592f7e` |
+| swing-indian | 01:34 | KEI long | a long, so that bug cannot apply; no complaint for the 14 hours NSE was open, first alarm only after the close |
+
+Both stayed halted six days, until cleared by hand on 2026-09-10.
+
+### Why the halt was the wrong response, specifically
+
+Per Decision 024 a kill switch blocks only risk-increasing actions: strategy
+exits, the stop sweep and the breakers all keep running while killed. **It does
+not create a stop.** So halting at 01:34 IST added no protection whatsoever. It
+bought one thing only — a bucket that was dead when the market opened, and a
+discovery lag measured in sessions.
+
+The observation was correct. The *response* was the error.
+
+### The change
+
+`check_stop_coverage` takes `session_open`. Outside the session the violation
+still fires, still pages, is still audited, and still names the uncovered
+symbols — but at `Severity.NOTICE`, which `enforce_session_invariants` never
+escalates to a halt (`would_halt` requires HALT). Inside the session nothing
+moves: a missing stop there means the sweep genuinely failed, and it halts as
+before. The parameter defaults to `True`, so an untaught caller keeps pre-038
+behaviour.
+
+**This is a severity change, not an exemption.** An unprotected overnight
+position remains real and remains reported. What stops is the alarm disabling
+the bucket over something unfixable at that hour.
+
+### The gate is PER-BUCKET, and that is the load-bearing part
+
+`run_bot` already computes a session flag per ACCOUNT for `check_liveness`, and
+reusing it here would have been wrong. commodity-indian and swing-indian share
+one Dhan account and do **not** share a session: MCX trades 09:00–23:30 IST
+against NSE's 09:15–15:30. An account-level NSE answer would downgrade a
+genuine naked MCX short to a notice for the eight hours MCX is still open —
+precisely the window the NATGASMINI short was live in.
+
+So `BucketWatch` gains `venue`, derived in `bucket_watch_for` from the bucket
+itself, and the flag is computed per bucket via `nse_session(now,
+exchange=watch.venue)`. `venue` is `None` for crypto — Delta never closes, so a
+missing stop there is always a fault and keeps HALTing around the clock.
+`config.exchange` defaults to `"NSE"`, so it is derived through a `Market`
+test rather than read bare, which would have marked every crypto bucket shut
+each night.
+
+`test_bucket_watch_wiring.py` pins the wiring, for the reason that file already
+exists: `derivatives` was added to the dataclass, given tests, and never
+written at its one construction site, leaving the signed path dead for four
+months. A silently-defaulted safety flag is not detectable by reading `main`.
+
+### What this does NOT fix
+
+The overnight gap is still uncovered. Decision 035 wants a stop that survives
+the close, and the Forever Order research at the end of Decision 037 says
+`MTF` is an allowed creation `productType` in both readings — so
+**swing-indian's overnight gap is closable and has been since 2026-08-18**.
+The recorded blocker stands: a Forever stop FAILS OPEN, so cancel-on-close is a
+prerequisite.
+
+Until that lands, the honest position is: these buckets are unprotected
+overnight by design, the bot now says so once a night instead of halting, and
+commodity-indian's own edge *is* that exposure — `buckets.yaml` records 81 of
+125 backtested trades held across a session close netting +Rs 122,021, against
+44 intraday-only trades netting -Rs 25,584.

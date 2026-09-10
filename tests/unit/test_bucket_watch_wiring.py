@@ -68,3 +68,34 @@ def test_the_bucket_id_and_tick_interval_are_carried_through() -> None:
     watch = bucket_watch_for(load_bucket("commodity-indian"), 97)
     assert watch.bucket_id == "commodity-indian"
     assert watch.tick_interval_seconds == 97
+
+
+# ── Decision 038: the venue whose session governs stop coverage ─────────
+
+
+def test_each_indian_bucket_carries_its_own_venue() -> None:
+    """MCX and NSE do not share a session — 23:30 IST against 15:30 — and the
+    two buckets share a Dhan account, so an account-level answer would be wrong
+    for one of them for eight hours a day."""
+    assert _watch("commodity-indian").venue == "MCX"
+    assert _watch("swing-indian").venue == "NSE"
+    assert _watch("intraday-indian").venue == "NSE"
+
+
+def test_a_crypto_bucket_has_no_venue() -> None:
+    """Delta never closes, so a missing stop there is always a fault and must
+    keep HALTing. `config.exchange` defaults to "NSE", so reading it bare would
+    have marked crypto shut every night."""
+    assert _watch("longterm-crypto").venue is None
+
+
+def test_venue_tracks_the_bucket_rather_than_a_literal() -> None:
+    """Same guard as `derivatives` above: whatever buckets.yaml says, the watch
+    must say. A silently-defaulted safety flag is not detectable by reading
+    `main`."""
+    from src.shared.bucket import Market, load_bucket
+
+    for bucket_id in ("commodity-indian", "swing-indian", "intraday-indian"):
+        bucket = load_bucket(bucket_id)
+        assert bucket.market == Market.INDIAN
+        assert bucket_watch_for(bucket, 60).venue == bucket.config.exchange
