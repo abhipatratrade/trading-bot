@@ -76,3 +76,13 @@ data/dhan_universe.json
 # so committing one would seed the VM with a truncated catalogue AND trip the
 # same ff-only deploy break the line above records.
 data/dhan_fno_universe*.json
+
+# Agent skills installed by `npx skills add` (e.g. dhan-oss/dhanhq-skills).
+# Reference material for whoever is driving the editor, not something the bot
+# imports — the repo talks to Dhan through its own clients in src/brokers/dhan/,
+# not the dhanhq SDK these skills assume. .claude/skills/ holds absolute-path
+# symlinks into .agents/, which would land on the VM dangling, and skills-lock.json
+# pins upstream commits that are a local install detail.
+.agents/
+.claude/skills/
+skills-lock.json
