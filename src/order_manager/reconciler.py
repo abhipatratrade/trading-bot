@@ -137,6 +137,34 @@ class Reconciler:
             and bucket_allows_shorts(latest_trade.bucket_id)
         )
 
+    def _must_flatten_short_row(
+        self, side: PositionSide, bucket_id: str | None
+    ) -> bool:
+        """Is this existing SHORT Position row a corrupt artifact to destroy?
+
+        The mirror of ``_may_adopt_orphan``: same question, asked of a DB row
+        rather than an exchange position, and it MUST answer the opposite way.
+        One pass runs both -- this first, adoption second -- so a bucket the
+        adopting half will re-import is a bucket this half must leave alone.
+
+        Asking the bucket in only one of the two places is worse than asking in
+        neither, because the halves then fight. Case 0 flattened every short on
+        a shared account while Decision 037 taught Case 2 to adopt a derivative
+        one: 632 flatten/re-adopt cycles on commodity-indian between
+        2026-09-04 and 2026-09-08, one every ~7 minutes, stopping only when the
+        strategy exited NATGASMINI. Nothing outside the transaction ever saw
+        the FLAT state, so the cost was churned ``opened_at``/``entry_price``
+        and 632 junk RECONCILE_DIFF rows rather than a wrong trade -- but a
+        rule that undoes itself every pass is not a rule.
+
+        ``test_short_row_flatten_agrees_with_adoption`` pins the two together.
+        """
+        if not self._shared_account or side != PositionSide.SHORT:
+            return False
+        # No bucket to ask ⇒ keep the cash reading. "We cannot say whose this
+        # is" is the settlement-artifact case, not the derivative one.
+        return not (bucket_id and bucket_allows_shorts(bucket_id))
+
     def _scope_positions(self) -> list[Any]:
         """Extra WHERE clauses restricting Position rows to this account's buckets."""
         if self._bucket_ids is None:
@@ -623,8 +651,9 @@ class Reconciler:
 
             self._close_unattributed_positions(report, session, exchange_by_symbol)
 
-            # Case 0: a SHORT row on a shared account is not ours, whatever put
-            # it there. Flatten it, and do so BEFORE anything else reads it.
+            # Case 0: a SHORT row on a shared account is not ours -- UNLESS the
+            # bucket that opened it can legitimately hold one. Flatten the rest,
+            # and do so BEFORE anything else reads them.
             #
             # This is cleanup AND containment. The stop sweep now refuses to
             # protect a short, but a short Position row is also picked up by
@@ -633,8 +662,10 @@ class Reconciler:
             # carry ``allow_when_killed=True`` (Decision 024), so the kill
             # switch would NOT have stopped it — the one path where a stale row
             # could still have opened a real position.
+            #
+            # Which rows qualify is ``_must_flatten_short_row`` (Decision 037).
             for db_pos in db_positions:
-                if not self._shared_account or db_pos.side != PositionSide.SHORT:
+                if not self._must_flatten_short_row(db_pos.side, db_pos.bucket_id):
                     continue
                 self._log.warning(
                     "short_position_row_flattened",
@@ -650,7 +681,7 @@ class Reconciler:
                     {
                         "type": "short_position_row_flattened",
                         "symbol": db_pos.symbol,
-                        "reason": "shorts are never the bot's on a shared account",
+                        "reason": "this bucket cannot hold a short on a shared account",
                     }
                 )
             db_positions = [
