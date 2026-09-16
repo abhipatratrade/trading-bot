@@ -944,6 +944,14 @@ class BucketRunner:
             # allocator against current margin, carry its own protective stop,
             # and be refused if the preflight cannot price it. Placing it
             # inline would bypass all three.
+            #
+            # KNOWN, AND ACCEPTED (user decision 2026-09-17): since e3da632 the
+            # entry path fires only on the bar a FRESH signal appears, and the
+            # machine still thinks it is in the trade after this close — so in
+            # practice nothing reopens the far leg and a roll means "close and
+            # go flat". The user judged a single trade lasting into the 15-day
+            # floor unlikely enough not to build the re-entry. If that changes,
+            # the fix is a roll-pending marker the entry path honours.
             _log.info(
                 "roll_reopen_deferred_to_entry_path",
                 bucket_id=self.bucket.id,

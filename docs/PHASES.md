@@ -1032,6 +1032,17 @@ Either way the halt would have refused it.
 - [ ] The open October long @293.2 is on the wrong side of the engine's
       short. **Not the bot's call and not this session's** — it holds a
       resting stop at 280.1; the user decides whether to close it by hand
+- [x] **Roll re-entry — DECIDED, not built (user, 2026-09-17).** Found while
+      answering "what happens at expiry": `_roll_expiring` closes the near
+      leg inside the 15-day floor and defers the far leg to the entry path,
+      but since `e3da632` that path fires only on a FRESH signal bar, so in
+      practice a roll is "close and go flat", not "carry forward". The user
+      judged a single trade lasting into the floor unlikely enough to leave
+      it. Documented in the runner; the October lot will be closed on
+      10-13 and nothing will reopen it. Also noted: `check_expiry_window`
+      treats NATGASMINI as physically settled (no `cash_settled_underlyings`
+      is wired), which is wrong for MCX gas but fails safe — it halts and
+      pages two days out rather than letting anything ride
 - [ ] **FOR THE ENGINE SESSION — the 15m series was overwritten.**
       `data/mcx/NATGASMINI_15m.csv` was re-exported 2026-09-16 22:09 and no
       longer reproduces the frozen run: `scripts/cci_gas_parity.py` scores
