@@ -118,7 +118,10 @@ def main() -> int:
         return 2
 
     static = DhanTokenManager(static_token=token)
-    data = DhanData(token_manager=static)
+    # client_id is REQUIRED for the quote: /v2/marketfeed/* 401s without the
+    # client-id header — the exact bug that dropped BLUESTARCO 38 times on
+    # 2026-08-07. The order client below sets it too, from the same row.
+    data = DhanData(token_manager=static, client_id=client_id)
     security_id, segment = data.resolve(symbol)
     client = DhanClient(
         token_manager=static,
