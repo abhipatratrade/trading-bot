@@ -62,6 +62,9 @@ Full rationale lives in `docs/DECISIONS.md`. Quick reference:
 | Kill-switch semantics | Blocks risk-increasing actions only: strategy exits + breaker watch continue while killed — Decision 024 |
 | Session invariants | Per-tick PROCESS assertions beside the equity breakers (square-off, stop coverage, notional, rejects, per-bucket liveness) — Decision 033 |
 | Stop-coverage severity | HALT while the bucket's own venue is open, NOTICE once it shuts (no DAY stop can rest) — Decision 038 |
+| Overnight stops | Dhan Forever Order (GTT) for `stop_validity: forever` buckets (swing-indian), retired at the reduce-only chokepoint before any close; DARK behind `forever_stops_enabled` until `scripts/nse_forever_probe.py` proves NSE_EQ+MTF — Decision 035 |
+| Intraday square-off | The RUNNER closes on the wall clock at `BucketConfig.squareoff` (15:15 IST); the strategy's bar-driven exit stays untouched. Dhan's 5m feed ends at 15:10, so a bar-only exit never fires — Phase 12c |
+| commodity-indian signal series | CCI on a continuous front-month-BY-EXPIRY splice (`shared/continuous.py`), executed on the 15-day-floor contract — `signal_source: continuous`, the series the run was validated on — Phase 12b |
 | Supervision authority | Invariants and any future agent may HALT (kill switch) at most; only a deterministic breaker may FLATTEN — Decision 033 |
 | USD/INR rate | FIXED 85 in each bucket's allocator.yaml (no live FX feed) — user decision 2026-07-07, see Decision 024 |
 | Determinism | No LLM in the trading loop; agentic perimeter later |

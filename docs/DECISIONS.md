@@ -1522,9 +1522,11 @@ so the normal path rests a standalone stop).
 
 ---
 
-## 035 — GTT (Forever Orders) for overnight stop protection — PROPOSED, NOT BUILT
-Date: 2026-08-18
-Status: **Proposed. Nothing is built. Do not treat as implemented.**
+## 035 — GTT (Forever Orders) for overnight stop protection — BUILT DARK 2026-09-16
+Date: 2026-08-18 (proposed) · 2026-09-16 (built, switch off)
+Status: **Built and tested; ships OFF behind `forever_stops_enabled`. NSE_EQ +
+MTF is unproven at the venue until `scripts/nse_forever_probe.py --place`
+reports ACCEPTED from the VM IP. See "Built" at the end of this decision.**
 Amends (if adopted): 022, for the multi-day Indian buckets only
 Related house rules: #2, #8
 
@@ -1616,6 +1618,39 @@ happened. Do not build this until that observation exists.
 - **`_detect_unrecorded_exits` already covers the settlement side** — a GTT that
   fires while the bot is down writes no Trade row, and that mechanism records it
   from the position shortfall without needing to ask the venue.
+
+### Built — 2026-09-16 (Phase 12a)
+
+What forced it: on 2026-09-12 01:34 IST `stop_coverage` halted swing-indian
+over KEI / GODREJPROP / COCHINSHIP — the nightly false halt Decision 038 fixes
+(committed 09-11, not pushed) — and the three longs sat naked every night
+from close to the next sweep. Built to the constraints above, one for one:
+
+- **One stop per symbol.** `plan_stop_protection` already treats a resting GTT
+  (`reduce_only`, `stop_price`) as coverage, so no DAY stop is rested beside
+  it. `run_session_invariants` now merges the GTT book under the switch, so
+  `stop_coverage` sees it too.
+- **Ownership.** `_to_forever_order` sets `reduce_only` only on a GTT with our
+  correlationId; the sweep and the retire path act on nothing else.
+- **Retirement on exit.** `DhanClient.place_order` retires every resting GTT of
+  ours on the symbol at the same reduce-only chokepoint that retires a super
+  order's stop leg, and RAISES `AttachedStopRetireError` — aborting the close
+  — if it cannot. The orphan sweep is the second net.
+- **Settlement.** `get_order` answers a GTT id from the forever book: resting ⇒
+  open, gone ⇒ canceled; a fired GTT's fill is booked by
+  `_detect_unrecorded_exits` from the position shortfall, as this decision said.
+- **The body** is `scripts/mcx_forever_probe.py`'s accepted shape — `SINGLE`,
+  `LIMIT` with the price 1% through the trigger (the GTT vocabulary has no
+  SL-M), `validity DAY` on the child. `forever_body_for()` is the one builder,
+  and the NSE probe sends exactly what the sweep would.
+- **Plumbing.** `OrderRequest.forever`, `BucketConfig.stop_validity`
+  (`day`|`forever`; swing-indian is `forever`), `Settings.forever_stops_enabled`
+  (default False), threaded through `run_bot` to the sweep, the adapter and the
+  invariants. Trade rows carry `extra.forever`.
+
+To turn on: run the probe from the VM with `--place`, and on ACCEPT set
+`FOREVER_STOPS_ENABLED=true` and restart. The next sweep rests one GTT per
+swing-indian position and cancels nothing that is already resting.
 
 ## 036 — Two Indian F&O buckets: futures-indian and options-indian
 Date: 2026-08-28

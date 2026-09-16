@@ -830,6 +830,7 @@ def ensure_stop_protection(
     shared_account: bool = False,
     attached_stops_enabled: bool = False,
     forever_stops_enabled: bool = False,
+    forever_by_bucket: dict[str, bool] | None = None,
 ) -> StopPlan:
     """Make the exchange state match the plan for one sub-account.
 
@@ -839,6 +840,12 @@ def ensure_stop_protection(
     ``shared_account`` (Decision 027 followup): on the Dhan account, which also
     holds the user's manual positions, only stops the bot's OWN holdings — the
     user's positions and their resting stops are never touched.
+
+    ``forever_by_bucket`` (Decision 035) names the buckets whose protective
+    stop should rest as a GTT that survives the session close — the multi-day
+    buckets, whose DAY stops Dhan expires at 15:30 and which were therefore
+    naked every night. Effective only with ``forever_stops_enabled``; with the
+    master switch off every bucket keeps its DAY stop exactly as before.
 
     ``product_by_bucket`` is what makes the attribution above MATTER. Without
     it ``place_order`` omits ``product``, ``OrderRequest.product`` is None, and
@@ -1035,6 +1042,12 @@ def ensure_stop_protection(
                 product=(product_by_bucket or {}).get(scope),
                 allow_when_killed=True,
                 intent_id=f"stop-{stop.trigger}-{stop.size}-{minute}",
+                # Decision 035 — the overnight kind, for the buckets that
+                # carry positions overnight. Both switches must be on.
+                forever=bool(
+                    forever_stops_enabled
+                    and (forever_by_bucket or {}).get(scope, False)
+                ),
             )
             reset_place_failures(fail_key)
         except Exception:

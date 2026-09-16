@@ -78,7 +78,7 @@ from src.shared.contract_selection import (
     plan_roll,
 )
 from src.shared.contracts import is_derivative, underlying_of
-from src.shared.market_calendar import NseSession, nse_session, parse_ist_time
+from src.shared.market_calendar import IST, NseSession, nse_session, parse_ist_time
 from src.shared.regime.brain import RegimeConfig, load_regime_config, predict_regime
 from src.shared.regime.store import MARKET_SENTINEL
 from src.shared.scanner.engine import (
@@ -784,7 +784,66 @@ class BucketRunner:
                     continue
                 if self._close_position(om, strat_name, pos, regimes.get(sym)):
                     exited += 1
+                    recent_exit_keys.add((strat_name, sym))
+
+        exited += self._run_squareoff(om, by_strategy, recent_exit_keys)
         return exited
+
+    def _run_squareoff(
+        self,
+        om: OrderManager,
+        by_strategy: dict[str, dict[str, Position]],
+        already_exiting: set[tuple[str, str]],
+    ) -> int:
+        """Close what the bucket still holds once its square-off time has passed.
+
+        On the WALL CLOCK, deliberately. intraday-indian's strategy squares off
+        from the latest bar's timestamp — right for a backtest replay, and it
+        was this bucket's only exit. Dhan's 5m feed has ended at a 15:10 stamp
+        on every session since 2026-08-03, so "latest bar stamped >= 15:15" has
+        been unsatisfiable on every session the bucket has traded. CASTROLIND,
+        IIFL and COFORGE carry no square-off row at all; PPLPHARMA's one 15:18
+        attempt was refused. Dhan's MIS auto-square-off (~15:20) has been the
+        whole mechanism, and the CNC fallback (Decision 031) has no such net —
+        the first MIS-ineligible name to fill would have been carried overnight
+        as delivery on a bucket whose entire premise is being flat by close.
+
+        This runs AFTER the strategies' own exits and skips anything already
+        closing, so a strategy that does fire on time is never second-guessed;
+        it only picks up what the feed left behind. Lives in the runner so the
+        validated strategy logic stays bar-driven and replays identically
+        (House Rule 9) — the runner is where the clock already is.
+
+        Only fires while the session is open: run_once returns before exits
+        once ``nse_session`` says CLOSED, so the window is squareoff..close,
+        and a close that fails every tick of it lands on the ``squareoff``
+        invariant, which HALTs and pages.
+        """
+        at = self.bucket.config.squareoff
+        if not at or not by_strategy:
+            return 0
+        now_ist = self._clock.now().astimezone(IST)
+        if now_ist.time() < parse_ist_time(at):
+            return 0
+
+        closed = 0
+        for strat_name, held in by_strategy.items():
+            for sym, pos in held.items():
+                if (strat_name, sym) in already_exiting:
+                    continue
+                _log.warning(
+                    "runner_squareoff",
+                    bucket_id=self.bucket.id,
+                    strategy=strat_name,
+                    symbol=sym,
+                    quantity=str(pos.quantity),
+                    squareoff=at,
+                    now_ist=now_ist.strftime("%H:%M:%S"),
+                )
+                if self._close_position(om, strat_name, pos, None):
+                    closed += 1
+                    already_exiting.add((strat_name, sym))
+        return closed
 
     def _roll_expiring(self, om: OrderManager) -> int:
         """Carry open derivative positions into the next contract.

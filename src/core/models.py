@@ -644,6 +644,38 @@ class Heartbeat(Base, TimestampMixin):
     extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
+# ---------------------------------------------------------------------------
+# Contract bar cache — Phase 12b
+# ---------------------------------------------------------------------------
+class ContractBar(Base):
+    """One COMPLETED OHLCV bar of one derivative contract.
+
+    Exists so a continuous front-month series (``shared/continuous.py``) can
+    still read the pre-roll leg after that contract expires: Dhan's scrip
+    master drops an expired contract, and with it any way to fetch its bars.
+    Written through on every live fetch; read back only for a contract the
+    registry no longer lists. A cache, not state — the bot never decides
+    anything from a row here that it could not have fetched, it only keeps
+    what it did fetch.
+    """
+
+    __tablename__ = "contract_bar"
+    __table_args__ = (
+        UniqueConstraint("symbol", "tf", "ts", name="uq_contract_bar"),
+        Index("ix_contract_bar_symbol_tf", "symbol", "tf"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    tf: Mapped[str] = mapped_column(String(8), nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    high: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    low: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    close: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Money, nullable=False, default=Decimal("0"))
+
+
 class DhanToken(Base, TimestampMixin):
     """The one live Dhan access token for a client id, shared across machines.
 
@@ -729,6 +761,7 @@ __all__ = [
     "BucketState",
     "DailyEquityAnchor",
     "Heartbeat",
+    "ContractBar",
     "DhanToken",
     "SessionReport",
 ]

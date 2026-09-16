@@ -344,6 +344,10 @@ def main() -> None:
     # bucket → broker product its stops must be placed under. Crypto has no
     # product dimension, so only the Dhan buckets populate this.
     stop_products: dict[str, str] = {}
+    # bucket -> True when its protective stop should rest as a GTT that
+    # survives the session (Decision 035). Read from buckets.yaml; inert
+    # unless settings.forever_stops_enabled.
+    stop_validities: dict[str, bool] = {}
     # bucket → the VENUE whose session hours gate its sweep. Not cosmetic: one
     # Dhan account now spans two exchanges with different hours (NSE 09:15
     # -15:30, MCX 09:00-23:30), and the sweep used to ask about NSE for all of
@@ -430,6 +434,7 @@ def main() -> None:
             if bucket.config.product:
                 stop_products[bucket.id] = bucket.config.product
             stop_exchanges[bucket.id] = bucket.config.exchange or "NSE"
+            stop_validities[bucket.id] = bucket.config.stop_validity == "forever"
             if bucket.config.carry_interest_apr is not None:
                 carry_aprs[bucket.id] = bucket.config.carry_interest_apr
             # Decision 037 — which derivative venues this process needs a
@@ -519,6 +524,9 @@ def main() -> None:
                 # eviction self-heals within ~2 minutes; retrying across that
                 # window is the difference between a blip and an outage.
                 _probe_with_retry(client, ref)
+                # Decision 035 — tell the adapter whether a reduce-only close
+                # must first retire a resting GTT. Same switch as the sweep.
+                client.forever_stops = settings.forever_stops_enabled
                 brokers[ref] = client
                 order_managers[ref] = OrderManager(client, BrokerName.DHAN, clock)
                 reconcilers[ref] = Reconciler(
@@ -818,6 +826,10 @@ def main() -> None:
                     # Decision 034 master switch. OFF ⇒ the sweep never
                     # touches the super-order endpoint at all.
                     attached_stops_enabled=settings.attached_stops_enabled,
+                    # Decision 035 master switch, same shape. OFF => the sweep
+                    # never touches the forever-order endpoint at all.
+                    forever_stops_enabled=settings.forever_stops_enabled,
+                    forever_by_bucket=stop_validities,
                 )
                 _note_safety_ok(
                     f"stop_sweep_error:{ref}",
@@ -882,6 +894,7 @@ def main() -> None:
                     shared_account=ref in dhan_accounts,
                     check_liveness=live_session,
                     attached_stops_enabled=settings.attached_stops_enabled,
+                    forever_stops_enabled=settings.forever_stops_enabled,
                 )
                 enforce_session_invariants(
                     results,

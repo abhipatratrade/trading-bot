@@ -23,10 +23,31 @@ contract_selection:
   # No ceiling: "nearest past the floor" is the whole rule, and a max would
   # only ever refuse the contract the floor just selected.
   max_days_to_expiry: null
-  # CCI is computed on the FUTURES prints, not on a spot index — there is no
-  # spot series for natural gas on this venue, and the backtest signalled on
-  # the contract.
-  signal_source: contract
+  # WHICH futures series the CCI is computed on — Phase 12b, 2026-09-16.
+  #
+  # `contract` (until 09-16): the execution contract's own 90 days. Around every
+  # roll that is the WRONG series: the 15-day floor above moves execution to
+  # the next month fifteen days before the front expires, and from that tick
+  # the machine reasoned over the next month's history while the validated run
+  # (TradingView NATGASMINI1!, front month BY EXPIRY, spliced unadjusted) was
+  # still on the front. Live 09-10..16 the engine went short on September and
+  # the bot bought October — opposite books, each correct on its own inputs.
+  #
+  # `continuous`: the front-by-expiry splice the backtest actually ran on,
+  # built in src/shared/continuous.py from per-contract bars with a
+  # write-through cache (contract_bar) for the leg Dhan stops serving on
+  # expiry. The SIGNAL comes from the same series as the 125-trade run; only
+  # the ORDER goes to the contract the floor selects. This is the one value
+  # with a backtest_ref behind it (results/handoff/cci_gas_15m/), which is why
+  # it is the value and not merely an option. To revert: `contract`.
+  #
+  # First deployment caveat: the cache starts empty and expired contracts are
+  # gone from the scrip master, so for dates before the current front's tenure
+  # the series is that front's OWN earlier bars (September's, back to June) —
+  # exactly what `contract` used while September was the execution contract.
+  # It converges: from the next roll on, the outgoing leg is cached before it
+  # is needed, and the splice matches the run's.
+  signal_source: continuous
   # The run applied no liquidity filter. Recorded as zero rather than invented:
   # a threshold nobody tested would change which trades happen.
   min_open_interest: 0

@@ -92,6 +92,17 @@ class OrderRequest:
     # genuinely want no target leave it None and let the adapter choose a value
     # it can immediately cancel.
     attached_target_price: Decimal | None = None
+    # Decision 035 — rest this protective stop as a venue GTT (Dhan "Forever
+    # Order") that survives the session close, instead of a DAY order that Dhan
+    # expires at 15:30. Only meaningful with ``stop_price``; ignored otherwise.
+    #
+    # Why it is a request flag and not adapter policy: a Forever stop FAILS
+    # OPEN. A DAY stop that outlives its position expires by itself; a GTT
+    # rests for up to 365 days and, when it fires against stock we no longer
+    # hold, OPENS a short. So the caller that asks for one must also own its
+    # retirement — the sweep's orphan pass and the reduce-only close path both
+    # do — and nothing should get one by default.
+    forever: bool = False
 
 
 @dataclass(frozen=True, slots=True)

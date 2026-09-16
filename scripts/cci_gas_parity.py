@@ -31,7 +31,7 @@ import argparse
 import csv
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -47,13 +47,31 @@ _TRADES = _ENGINE / "results" / "handoff" / "cci_gas_15m" / "trades.json"
 _TICK = Decimal("0.10")
 
 
-def _load_bars(path: Path) -> list[Bar]:
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _stamp(row: dict) -> datetime:
+    """Either CSV shape the engine has written: ISO ``date`` (the original
+    handoff export) or epoch-seconds ``time`` (``tv_export.js``, which the
+    engine session re-exports with each reconciliation). Both are IST."""
+    if "date" in row:
+        return datetime.fromisoformat(row["date"])
+    return datetime.fromtimestamp(int(row["time"]), _IST)
+
+
+def _load_bars(path: Path, *, until: datetime | None = None) -> list[Bar]:
+    """Bars up to ``until`` (inclusive). The frozen run ends 2026-08-26; a
+    re-exported CSV keeps growing past it, and trades the machine takes after
+    the run's window are new trades, not parity failures."""
     bars: list[Bar] = []
     with path.open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
+            ts = _stamp(row)
+            if until is not None and ts > until:
+                break
             bars.append(
                 Bar(
-                    ts=datetime.fromisoformat(row["date"]),
+                    ts=ts,
                     open=Decimal(row["open"]),
                     high=Decimal(row["high"]),
                     low=Decimal(row["low"]),
@@ -100,8 +118,10 @@ def main() -> int:
         print(f"missing input:\n  bars   {_BARS}\n  trades {_TRADES}")
         return 2
 
-    bars = _load_bars(_BARS)
     expected = _load_expected(_TRADES)
+    # Replay through the end of the frozen run's last session, no further.
+    last_exit = max(datetime.fromisoformat(e["exit_time"]) for e in expected)
+    bars = _load_bars(_BARS, until=last_exit.replace(hour=23, minute=59))
     print("CCI gas 15m parity")
     print(f"  bars:     {len(bars):,}  ({bars[0].ts:%Y-%m-%d} -> {bars[-1].ts:%Y-%m-%d})")
     print(f"  expected: {len(expected)} trades\n")

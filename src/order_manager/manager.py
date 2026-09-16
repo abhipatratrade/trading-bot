@@ -118,6 +118,7 @@ class OrderManager:
         strategy_name: str | None = None,
         allow_when_killed: bool = False,
         extra_payload: dict[str, Any] | None = None,
+        forever: bool = False,
     ) -> PlacementResult:
         now = self._clock.now()
         client_oid = make_client_order_id(
@@ -217,6 +218,12 @@ class OrderManager:
                 # engine's in-flight-exit dedup; pairs as a real exit in
                 # P&L enrichment only once it actually fills.
                 extra["protective_stop"] = True
+            if forever:
+                # Decision 035 — rests in the venue's GTT book, not the working
+                # order book, and survives the session. Stamped so the ledger
+                # can tell which stops were the overnight kind, and so a reader
+                # of a REJECTED row knows which endpoint refused it.
+                extra["forever"] = True
         trade = Trade(
             strategy_id=strategy_id,
             bucket_id=bucket_id,
@@ -273,6 +280,7 @@ class OrderManager:
                     attached_target_price=attached_target_price,
                     product=product,
                     fallback_max_size=fallback_max_size,
+                    forever=forever and stop_price is not None,
                 )
             )
         except AttachedStopRetireError:

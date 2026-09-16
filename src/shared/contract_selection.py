@@ -137,7 +137,14 @@ class ContractSelectionConfig(BaseModel):
     # runner routes on it — but it belongs in the same block because it is the
     # other half of "which series does this strategy actually look at?", and
     # splitting the two across files is how they drift.
-    signal_source: str = Field(default="underlying", pattern="^(underlying|contract)$")
+    # "continuous" (Phase 12b): the strategy signals on a front-month-by-expiry
+    # splice of the underlying's contracts — what TradingView's ``1!`` is and
+    # what the CCI gas run was validated on — and executes on whatever the
+    # rules above select. See ``shared/continuous.py`` for why "contract" and
+    # "continuous" can hold opposite positions for days around a roll.
+    signal_source: str = Field(
+        default="underlying", pattern="^(underlying|contract|continuous)$"
+    )
 
     @model_validator(mode="after")
     def _check_rule_inputs(self) -> ContractSelectionConfig:

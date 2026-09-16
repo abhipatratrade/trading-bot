@@ -112,6 +112,13 @@ buckets:
     # any position that arrives without a distance (manual import, reconciler
     # adoption) — deliberately wide, and the sweep only ever tightens from it.
     stop_loss_pct: 20
+    # Decision 035 — this bucket holds MTF for days, and its DAY stop dies at
+    # 15:30 every night: from 08-18 (found) to 09-16 (built) the book was naked
+    # between the close and the next morning's sweep, and stop_coverage halted
+    # it at 01:34 for a stop nothing could place (Decision 038). A Forever
+    # Order rests through the night. INERT until settings.forever_stops_enabled
+    # is on, which waits on scripts/nse_forever_probe.py proving NSE_EQ + MTF.
+    stop_validity: forever
     # Decision 034 — entries carry their protective stop ON the order
     # (Dhan Super Order), so a stop the venue refuses refuses the ENTRY too.
     # Armed 2026-08-18 (user decision). The Decision 022 sweep stays behind
@@ -154,6 +161,12 @@ buckets:
     # notional is Rs 10k, where the Rs 20 brokerage cap is ~0.4% round-trip
     # against a ~0.62% mean trade.
     fallback_product: CNC
+    # Phase 12c — the runner's own square-off, on the wall clock. The strategy
+    # squares off from the latest 5m bar's stamp and Dhan has not served a
+    # 15:15-stamped bar since 2026-08-03, so its exit never fired: all four
+    # live trades were closed by Dhan's MIS auto-square-off, and CNC has no
+    # such net. This is what makes the CNC fallback above safe.
+    squareoff: "15:15"
     # Entry window differs from swing-indian's 09:45: the earliest reversal
     # candle closes at 09:30 (Decision 029).
     entry_start: "09:30"

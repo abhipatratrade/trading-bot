@@ -117,6 +117,14 @@ class ScannerConfig(BaseModel):
     # fixed index membership (NIFTY-100) rather than a broker-wide sweep — the
     # constituents live in git so the scanned set is auditable (House Rule 7).
     symbols: list[str] = Field(default_factory=list)
+    # Phase 12b — the signal bar, in minutes, for the ``pinned`` engine's
+    # perception record. That engine has nothing to filter or rank, so it used
+    # to persist nothing at all; a bucket with no scanner_snapshot and no
+    # SCANNER_RUN is indistinguishable from a dead one, which is exactly how
+    # commodity-indian was reported dead for a week it spent completing a pass
+    # every 90 seconds. One row per completed bar is enough to show it looked.
+    # None keeps the pre-12b behaviour (no record) for any other pinned config.
+    bar_minutes: int | None = Field(default=None, ge=1, le=1440)
 
 
 def load_scanner_config(path: Path) -> ScannerConfig:
@@ -234,11 +242,11 @@ def run_scan(
         # Deliberately NOT the "generic" path, which joins against
         # ``symbol_mapping`` for the crypto Binance/Delta overlap and would
         # return nothing here.
-        return ScanResult(
+        return run_pinned_scan(
             bucket_id=bucket_id,
-            date=scan_date,
-            universe=list(config.symbols),
-            evaluated_count=len(config.symbols),
+            config=config,
+            scan_date=scan_date,
+            now=now or datetime.now(UTC),
         )
     if config.engine == "equity_meanrev_1h":
         return run_meanrev_scan(
@@ -576,6 +584,120 @@ def entries_taken_today(bucket_id: str, day: date_type) -> int:
 # In-process cache: bucket_id → (bar_key, ScanResult). The 1h signal cannot
 # change inside a bin, so a 60s tick loop must not re-fetch 94 symbols × 2
 # series every minute. A restart simply re-scans the current bin.
+# bucket_id -> (bar_key, result) of the last pinned bin recorded. See
+# ``run_pinned_scan``: the runner ticks every ~90s and the record is per BAR.
+_PINNED_SCAN_CACHE: dict[str, tuple[str, ScanResult]] = {}
+
+
+def pinned_bar_key(now: datetime, bar_minutes: int) -> str:
+    """``YYYY-MM-DD#HH:MM`` of the bin that ``now`` falls in, IST.
+
+    The OPEN of the current bin, not the last completed one: the record says
+    "the loop reached the scanner during this bar", which is what the
+    reconciliation needs to count, and it is written on the first tick of the
+    bar rather than after it closes.
+    """
+    ist = now.astimezone(_ist())
+    floored = ist.replace(
+        minute=(ist.minute // bar_minutes) * bar_minutes, second=0, microsecond=0
+    ) if bar_minutes < 60 else ist.replace(
+        hour=(ist.hour // (bar_minutes // 60)) * (bar_minutes // 60),
+        minute=0, second=0, microsecond=0,
+    )
+    return f"{floored.date().isoformat()}#{floored.strftime('%H:%M')}"
+
+
+def run_pinned_scan(
+    *,
+    bucket_id: str,
+    config: ScannerConfig,
+    scan_date: date_type,
+    now: datetime,
+) -> ScanResult:
+    """The pinned universe, plus a perception record once per signal bar.
+
+    The universe is ``config.symbols``, unfiltered — that part has not changed.
+    What is new is that the bucket leaves a trace of having looked.
+
+    Until Phase 12b this engine persisted nothing, and the consequence showed
+    up in the September reconciliation: commodity-indian was reported "dead
+    09-09 → 09-15" on the strength of zero audit rows, while the VM journal
+    shows it completing a pass every ~90 seconds the whole time — kill-switched
+    for two of those days, and finding no entry on the October contract for
+    the rest. Every other bucket writes a SCANNER_RUN per scan, which is what
+    ``check_scan_coverage`` and the reconciliation scripts count; this one was
+    invisible to both by construction.
+
+    One row per completed bar (``bar_minutes``), not per tick: the runner
+    ticks every 60-90s and a row each time would be 500 rows a day saying the
+    same thing. Keyed like the meanrev scan so a restart mid-bar replaces
+    cleanly. With ``bar_minutes`` unset it behaves exactly as before.
+    """
+    result = ScanResult(
+        bucket_id=bucket_id,
+        date=scan_date,
+        universe=list(config.symbols),
+        evaluated_count=len(config.symbols),
+    )
+    if config.bar_minutes is None:
+        return result
+
+    key = pinned_bar_key(now, config.bar_minutes)
+    cached = _PINNED_SCAN_CACHE.get(bucket_id)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    with session_scope() as session:
+        session.execute(
+            delete(ScannerSnapshot).where(
+                ScannerSnapshot.date == scan_date,
+                ScannerSnapshot.strategy_id == bucket_id,
+                ScannerSnapshot.bar_key == key,
+            )
+        )
+        for symbol in config.symbols:
+            session.add(
+                ScannerSnapshot(
+                    date=scan_date,
+                    strategy_id=bucket_id,
+                    symbol=symbol,
+                    bar_key=key,
+                    metrics={},
+                    filter_results={"reason": "pinned"},
+                    rank_score=None,
+                    passed=True,
+                )
+            )
+        session.add(
+            AuditLog(
+                strategy_id=bucket_id,
+                event_type=AuditEventType.SCANNER_RUN,
+                message=(
+                    f"pinned scan [{key}]: {len(config.symbols)} symbol(s) "
+                    f"handed to the strategy"
+                ),
+                payload={
+                    "bucket_id": bucket_id,
+                    "date": str(scan_date),
+                    "bar_key": key,
+                    "universe": list(config.symbols),
+                    # The same funnel every other engine writes, read by
+                    # check_scan_coverage. A pinned universe cannot narrow —
+                    # nothing filters it — so the three counts agree; the
+                    # strategy's own bar fetch is where blindness would show,
+                    # and it logs that itself (cci_bars_unavailable).
+                    "configured": len(config.symbols),
+                    "attempted": len(config.symbols),
+                    "evaluated": len(config.symbols),
+                    "passed": len(config.symbols),
+                    "unevaluable": 0,
+                },
+            )
+        )
+    _PINNED_SCAN_CACHE[bucket_id] = (key, result)
+    return result
+
+
 _MEANREV_SCAN_CACHE: dict[str, tuple[str, ScanResult]] = {}
 
 

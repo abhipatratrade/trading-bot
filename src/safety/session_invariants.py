@@ -1083,6 +1083,7 @@ def run_session_invariants(
     shared_account: bool = False,
     check_liveness: bool = True,
     attached_stops_enabled: bool = False,
+    forever_stops_enabled: bool = False,
 ) -> list[InvariantResult]:
     """Evaluate every invariant for one account. Reads, never writes.
 
@@ -1102,6 +1103,21 @@ def run_session_invariants(
 
     positions = broker.get_positions()
     open_orders = broker.get_open_orders()
+    # Decision 035 — a Forever stop rests in a SECOND book. Without this the
+    # coverage check would page "NO PROTECTIVE STOP" over a position that is
+    # protected overnight by exactly the order this feature exists to place.
+    # Gated like the sweep's own lookup, and for the same quota reason.
+    if forever_stops_enabled and hasattr(broker, "supports_forever_orders"):
+        try:
+            if broker.supports_forever_orders():  # type: ignore[attr-defined]
+                open_orders = [
+                    *open_orders,
+                    *broker.get_forever_orders(),  # type: ignore[attr-defined]
+                ]
+        except Exception:
+            # A failed read costs one tick of a possible false NOTICE/HALT
+            # about coverage; it must not fail every other invariant.
+            _log.warning("forever_orders_lookup_failed", account_ref=account_ref, exc_info=True)
     entry_prices = {p.symbol: p.entry_price for p in positions}
     reject_since = now - timedelta(minutes=thresholds.reject_window_minutes)
 

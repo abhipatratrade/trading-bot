@@ -22,6 +22,10 @@
 engine: pinned
 universe: mcx_natural_gas_mini
 universe_size: 1
+# Phase 12b — leave one SCANNER_RUN + snapshot row per 15m bar so the bucket is
+# visible to check_scan_coverage and to reconcile_commodity_cci.py. Without it
+# the September reconciliation read a week of ~500 passes/day as "dead".
+bar_minutes: 15
 
 filters: []
 ranker:

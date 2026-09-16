@@ -44,6 +44,7 @@ from src.data_sources.base import MarketData
 from src.shared.bars import completed_bars
 from src.shared.base_strategy import EntryCandidate, Strategy
 from src.shared.bucket import load_bucket
+from src.shared.continuous import PostgresBarStore, continuous_bars
 from src.shared.contract_selection import (
     ContractSelectionConfig,
     ContractSelector,
@@ -109,6 +110,80 @@ class CciGasReversion15m(Strategy):
         )
         return chosen.contract if chosen.ok else None
 
+    def _signal_bars(self, underlying: str, contract, data: MarketData) -> list | None:
+        """The COMPLETED bars the machine replays. Which series is a config choice.
+
+        ``signal_source: contract`` (the original): the execution contract's
+        own 90 days. Simple, and wrong around every roll — the floor moves
+        execution to the next month fifteen days before the front expires, and
+        from that tick the machine reasons over the next month's history while
+        the validated run (TradingView ``NATGASMINI1!``) is still on the front.
+        Live 2026-09-10..16: the engine went short on September, the bot found
+        a long on October. Opposite books.
+
+        ``signal_source: continuous`` (Phase 12b): the front-month-by-expiry
+        splice the run actually used, built in ``shared/continuous.py`` from
+        per-contract bars with a write-through cache for the leg Dhan stops
+        serving on expiry. The signal then comes from the same series as the
+        backtest; only the ORDER goes to the floor-selected contract.
+
+        Returns None when the series cannot be built; the caller treats that as
+        "cannot evaluate", never as "flat".
+        """
+        cfg = self._selection_config()
+        now = RealClock().now()
+        if cfg.signal_source == "continuous":
+            registry = getattr(data, "fno", None)
+            live = {
+                c.symbol: c.expiry
+                for c in (registry.contracts if registry is not None else [])
+                if c.underlying == underlying and c.is_future
+            }
+            bars, windows = continuous_bars(
+                underlying=underlying,
+                tf=_TF,
+                tf_minutes=_TF_MINUTES,
+                days=_REPLAY_DAYS,
+                now=now,
+                live_expiries=live,
+                fetch=lambda sym: data.get_ohlcv_history(sym, _TF, days=_REPLAY_DAYS),
+                store=PostgresBarStore(),
+            )
+            if not bars:
+                _log.warning("cci_continuous_unavailable", underlying=underlying)
+                return None
+            front = windows[-1].symbol if windows else contract.symbol
+            if front != contract.symbol:
+                # Expected for up to fifteen days a month: signalling on the
+                # front, executing on the next. Logged so the divergence the
+                # September reconciliation found is visible while it is live.
+                _log.info(
+                    "cci_signal_on_front_executes_on_next",
+                    signal_contract=front,
+                    execution_contract=contract.symbol,
+                )
+            return bars
+
+        try:
+            raw = data.get_ohlcv_history(contract.symbol, _TF, days=_REPLAY_DAYS)
+        except Exception:
+            _log.warning(
+                "cci_bars_unavailable", contract=contract.symbol, exc_info=True
+            )
+            return None
+        # BEFORE the length check, so "enough history" counts settled bars, and
+        # before the replay, so neither the state machine nor `last_ts` can see
+        # a price that is still moving.
+        forming = len(raw)
+        raw = completed_bars(raw, minutes=_TF_MINUTES, now=now)
+        if len(raw) < forming:
+            _log.debug(
+                "cci_dropped_forming_bar",
+                contract=contract.symbol,
+                dropped=forming - len(raw),
+            )
+        return raw
+
     def _state_for(
         self, underlying: str, data: MarketData
     ) -> tuple[CCIState, object, list, object] | None:
@@ -125,24 +200,9 @@ class CciGasReversion15m(Strategy):
         if contract is None:
             _log.warning("cci_no_contract", underlying=underlying)
             return None
-        try:
-            raw = data.get_ohlcv_history(contract.symbol, _TF, days=_REPLAY_DAYS)
-        except Exception:
-            _log.warning(
-                "cci_bars_unavailable", contract=contract.symbol, exc_info=True
-            )
+        raw = self._signal_bars(underlying, contract, data)
+        if raw is None:
             return None
-        # BEFORE the length check, so "enough history" counts settled bars, and
-        # before the replay, so neither the state machine nor `last_ts` can see
-        # a price that is still moving.
-        forming = len(raw)
-        raw = completed_bars(raw, minutes=_TF_MINUTES, now=RealClock().now())
-        if len(raw) < forming:
-            _log.debug(
-                "cci_dropped_forming_bar",
-                contract=contract.symbol,
-                dropped=forming - len(raw),
-            )
         if len(raw) < 40:
             _log.warning(
                 "cci_insufficient_history",

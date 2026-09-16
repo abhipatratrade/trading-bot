@@ -938,9 +938,163 @@ entries — 8 BHARATFORG buys are the visible tip of it.
 
 ---
 
+## Phase 12 — Rev-2 handoff: the halted book, the rolled contract, the square-off that could not fire [2026-09-16]
+
+The Backtesting Engine's second reconciliation (2026-08-01 → 09-16): 23 engine
+signals, 8 taken. Same verdict as Phase 11 — the strategies agree with the
+engine wherever the bot evaluated a bar — and, as in Phase 11, the handoff's
+DIAGNOSES needed checking against the VM journal and the ledger before any
+code moved. Two of its three headline faults were not what it said.
+
+### 12a — swing-indian: halted at 01:34 over a stop nothing could place (P0)
+
+**Diagnosis.** `stop_coverage` HALTed the bucket at 2026-09-12 01:34 IST over
+KEI / GODREJPROP / COCHINSHIP. That is the middle of the night: Dhan expires
+DAY orders at 15:30, so no stop CAN rest at 01:34 and the kill switch does not
+create one. This is Decision 038's exact case, and **Decision 038 was already
+fixed — `0035842`, committed 2026-09-11 00:50 IST and never pushed.**
+`origin/main` sat at `251bab8`; the VM ran five days without it. The
+`kill_switch_dwell` invariant from Phase 11 paged the whole time (streak 4,632
+by 09-10, dwell 7,435 min): the alarm worked, the fix stayed on a laptop.
+
+The three longs are protected during the session (the sweep re-rests DAY stops
+from 09:15) and naked between 15:30 and the next open. That overnight gap is
+Decision 035, PROPOSED since 08-18 and still not built. PREMIERENE (09-16
+10:15) was refused by the halt and the journal says so:
+`entries_blocked_kill_switch … would_have_entered=['COCHINSHIP', 'PREMIERENE']`.
+
+- [ ] **Push `0035842`** (with this phase's commit). Deploy = restart; not
+      inside MCX hours with a position open (commodity-indian is long until
+      23:30). USER ACTION — nothing in this session pushed
+- [ ] **A human clears swing-indian's switch AFTER the deploy** — cleared
+      before it, the bucket re-halts tonight at 01:34 exactly as it did on
+      09-12 after the 09-11 00:15 clear
+- [x] Decision 035 BUILT, DARK. `OrderRequest.forever` routes a stop to
+      `/v2/forever/orders` in the shape the MCX probe proved live; the sweep
+      asks for it where `stop_validity: forever` (swing-indian) AND
+      `forever_stops_enabled` (default False); the reduce-only close path
+      retires every resting GTT of ours first and ABORTS the close if it
+      cannot (the fails-open prerequisite); `get_order` answers a GTT id from
+      the forever book; `run_session_invariants` reads that book so
+      `stop_coverage` counts it. 18 tests. Decision 035 updated in DECISIONS.md
+- [x] `scripts/nse_forever_probe.py` — sends `DhanClient.forever_body_for()`,
+      the exact payload the sweep would, as a 1-share SELL on a held
+      swing-indian long, 50% below market, cancelled in a `finally`. Dry-run
+      verified locally (COCHINSHIP → 21508 NSE_EQ, MTF). **USER ACTION: run
+      `--place` from the VM; on ACCEPT set `FOREVER_STOPS_ENABLED=true`**
+
+### 12b — commodity-indian: never dead, twice blind for reasons already known (P0)
+
+**Diagnosis, from the journal, hour by hour.** The bucket completed a pass every
+~90s for the whole "dead" week. The DB looked dead because the `pinned` engine
+writes no `scanner_snapshot` and no `SCANNER_RUN` — this bucket has no
+perception record at all, so the reconciliation had nothing to count.
+
+| window | what the loop was doing |
+|---|---|
+| 09-05 00:49 → 09-11 00:15 | **kill-switched** (the same nighttime `stop_coverage` halt as 12a, taken 09-05 00:49). Blocked the 09-10 09:15 long — `entries_blocked_kill_switch … would_have_entered=['NATGASMINI']` ×6 — the engine's +₹2,540 winner |
+| 09-11 00:15 → 09-16 13:01 | clear; `eligible=['cci_gas_reversion_15m'] placed=0` every pass; contract resolved (`NATGASMINI-20261027-FUT`); no `enter` on the OCTOBER series until 09-16 |
+
+So (a) is two things: the pre-038 halt, and the roll. Not a probe, not the
+selector, not the VM.
+
+**(b) is real and structural.** The strategy replays 90 days of the SELECTED
+contract's bars. The 15-day floor rolled selection to October on 09-10, and
+from that moment the machine reasoned over October's own history — a different
+instrument at ~₹14 premium, whose armed flags and CCI prints share nothing with
+the continuous series the 125-trade run was validated on. TradingView's
+`NATGASMINI1!` is front-month BY EXPIRY (it was still quoting September at
+278 on 09-14) with a raw splice at the roll. The engine went short on
+September's series on 09-14; the bot found a long on October's on 09-16.
+Opposite books, both "correct" on their own inputs.
+
+**(c) is the kill switch, not `_MAX_SIGNAL_AGE_BARS`** (which does not exist
+in this strategy). 09-08 09:17: `placing_order side=buy size=1 … exited=1`
+under `blocked=['cci_gas_reversion_15m']`, and no `would_have_entered` line
+in the hour after — the machine produced no entry on Dhan's September bars.
+Either way the halt would have refused it.
+
+- [x] `run_pinned_scan` — one `SCANNER_RUN` + snapshot row per 15m bar
+      (`bar_minutes: 15` in scanner.yaml), keyed like meanrev's so a restart
+      mid-bar replaces cleanly; payload is the funnel `check_scan_coverage`
+      parses. 9 tests
+- [x] `src/shared/continuous.py` — front-by-expiry splice, raw, from
+      per-contract bars with a write-through cache (`contract_bar`, migration
+      0015) for the leg Dhan stops serving on expiry. The strategy signals on
+      it and executes on the floor-selected contract. **Set
+      `signal_source: continuous`** in contracts.yaml — the user's own framing
+      ("the backtest ran the continuous series") and the only value with a
+      backtest_ref; `contract` is a one-line revert. First deployment caveat
+      recorded in the yaml: the cache starts empty, so the series is the
+      current front's own history until the next roll. No order results from
+      the switch on its own — the held October long is exited only when the
+      machine goes FLAT. 17 tests
+- [ ] The open October long @293.2 is on the wrong side of the engine's
+      short. **Not the bot's call and not this session's** — it holds a
+      resting stop at 280.1; the user decides whether to close it by hand
+- [ ] **FOR THE ENGINE SESSION — the 15m series was overwritten.**
+      `data/mcx/NATGASMINI_15m.csv` was re-exported 2026-09-16 22:09 and no
+      longer reproduces the frozen run: `scripts/cci_gas_parity.py` scores
+      **0/125** against it (it scored 125/125 on 09-01 with `cci.py` unchanged
+      since). Trades before 2026-01-01 are absent from the file, and on the
+      same bar — 2026-01-07 18:30 — the new export prints 100.00 where
+      `trades.json` says 102.00. No git, no backup; the 30m/1H files from
+      08-27 sit at a different price level again. Until the original series
+      is restored or the run re-frozen, `reconcile_commodity_cci.py`'s
+      September verdicts — including "engine SHORT since 09-14 @278.2" — rest
+      on a series that does not reproduce the backtest. The parity harness
+      now reads both CSV shapes and replays only through the run's last exit,
+      so it is ready the moment the data is
+
+### 12c — intraday-indian: the square-off has never once fired (P1)
+
+**Diagnosis.** `select_exits` squares off when the latest 5m bar is stamped
+`>= 15:15`. Dhan's 5m feed has ended at a **15:10** stamp on every session
+since 2026-08-03 (the regression logged in `reference_dhan_intraday_feed_ends_1500`;
+72 bars/day, last 15:10). The condition has been unsatisfiable on every
+session this bucket has traded. The ledger agrees: CASTROLIND, IIFL and COFORGE
+carry NO square-off row at all — every SELL before the synthetic close is a
+rejected protective stop — and PPLPHARMA's single 15:18 attempt was refused.
+Dhan's MIS auto-square-off (~15:20) has been the only exit; the reconciler's
+shortfall detector booked it afterwards, with a price when it caught the fill
+the same day (IIFL 15:31, COFORGE 15:35 — the handoff's "16–20 min late") and
+without one when it caught it days later (both 08-18 04:07, the day the
+detector was written).
+
+The docstring calls Dhan's auto-square-off "the backstop". It has been the
+whole mechanism. And Decision 031's CNC fallback has no such backstop — the
+first MIS-ineligible broad-set name that fills would be carried overnight as
+delivery.
+
+- [x] `BucketRunner._run_squareoff` — on the wall clock, in the runner,
+      after the strategies' own exits and skipping anything already closing;
+      `BucketConfig.squareoff` ("15:15" on intraday-indian, None elsewhere).
+      The strategy's bar-driven exit is untouched (House Rule 9) and a test
+      pins that. Chosen over changing the strategy to bar-close semantics:
+      exact to one tick of 15:15, and immune to a feed that stalls earlier
+      than 15:10. 9 tests
+- [x] Exit price follows: the bot's own SELL now fills and records it; the
+      synthetic path is once again the backstop the docstring described
+
+### 12d — Re-run the four reconciliations for 2026-09-01..today
+
+- [x] Re-run 2026-09-01..16. **intraday** (both sets): 0 engine signals, 0
+      blind days; COFORGE 09-09 is a [7] over-trade (pattern parity, P2).
+      **swing**: 4 engine entries, 3 taken at +1/+2/+3 min, 0 blind days, 73/77
+      bins; the 1 miss is PREMIERENE, which the script files as "sizer dropped
+      it silently" and the journal files as `entries_blocked_kill_switch`.
+      **commodity**: 8 transitions, 1 matched, 2 late, 5 missed — every one
+      now attributed (09-01/02 pre-fix, 09-08/10 kill switch, 09-14/16 roll)
+      — but computed on the overwritten CSV above, so the engine side is
+      itself unverified until that series is restored
+
+---
+
 ## Session Log
 
 Append a one-liner per session for traceability.
+
+- 2026-09-16 — **Phase 12: the rev-2 handoff.** Same shape as Phase 11 — the engine's counts were right and two of its three diagnoses were not, and the VM journal settled each in minutes. (12a) swing-indian's 09-12 01:34 halt was Decision 038's exact case, and **038 was already fixed: `0035842`, committed 09-11 00:50, never pushed** — origin sat at `251bab8` for five days while `kill_switch_dwell` paged 4,632 times. Built Decision 035 to close the overnight gap it was masking: GTT stops through the same sweep, the same reduce-only chokepoint retiring them before any close (raise on failure — a Forever stop FAILS OPEN), the invariants reading the GTT book; dark behind `forever_stops_enabled` until `scripts/nse_forever_probe.py --place` proves NSE_EQ + MTF from the VM. (12b) commodity-indian was **never dead**: ~480 passes/day through the "dead" week, kill-switched for two of them (`would_have_entered=['NATGASMINI']` ×6 on 09-10 — the engine's +₹2,540 long, refused by the halt) and finding no entry on the OCTOBER series for the rest. The DB looked dead because the `pinned` engine wrote no perception record at all; it does now, per bar. The roll divergence is real and structural — the strategy replayed the execution contract while the run was validated on `NATGASMINI1!`, front month BY EXPIRY — so the signal now comes from a continuous front-by-expiry splice (`shared/continuous.py`, write-through cache in `contract_bar`) and only the order goes to the floor-selected contract. (c) was the kill switch, not an aging bug; `_MAX_SIGNAL_AGE_BARS` is not in that strategy. (12c) THE LARGEST FINDING: intraday-indian's square-off had **never fired once**. It waits for a 5m bar stamped ≥ 15:15 and Dhan's feed has ended at 15:10 since 2026-08-03 — three of four trades carry no square-off row at all, and Dhan's MIS auto-square-off was the entire exit mechanism, with the CNC fallback (no such net) one fill away from an overnight delivery. Fixed in the runner on the wall clock, strategy untouched (House Rule 9). (12d) September re-run: swing 3/4 with 1–3 min lag and zero blind days; intraday no signals; commodity fully attributed. FOUND ALONG THE WAY, for the engine session: **the 15m gas CSV was overwritten today** and no longer reproduces the frozen run (parity 0/125 on `cci.py` unchanged since its 125/125; 2026-01-07 18:30 prints 100.00 where `trades.json` says 102.00; December absent). NOT PUSHED — the user deploys; the swing-indian switch must be cleared AFTER the deploy or it re-halts at 01:34. 71 new tests, 1173 green, ruff clean.
 
 - 2026-09-01 — **Phase 11: the August execution reconciliation.** The Backtesting Engine's handoff was right that 11 signals should have fired and 4 filled, and right that the strategies are clean — wherever the bot looked, its signals matched. Its DIAGNOSIS was wrong in a way worth recording: it read the blind-day overlap (Aug 4, 5, 17, 24) as exact and inferred "one shared scheduler/VM/timer fault". Querying production instead of the documents, the 64 missing swing bins decompose into THREE causes and two were already fixed before the handoff was written: Aug 4/5 is the dead-token empty universe (`03a7e80`, 08-07 — the `scan_coverage` invariant it added cites those exact dates), Aug 21 11:17 → Aug 24 is the VM OOM (`77e8878` + swap, 08-24), Aug 3 is the pre-bar-key-fix day. THE LIVE ONE, and the largest at 28 bins: **the kill switch was a blindfold.** `run_once` returned before the scanner, so a halted bucket wrote zero snapshot rows — a Decision 024 violation on its face, since scanning increases no risk. A `stop_coverage` trip over an unstopped PIIND held swing-indian from 08-12 13:18 to 08-18 15:05 and took intraday-indian's 08-17 with it; that IS the shared Aug 17 cause, just not the one proposed. The audit log settles it exactly: Aug 4 shows 11 SCANNER_RUNs with `evaluated: 0` (ran, saw nothing), Aug 17 shows none at all (never ran), and the swing bins resume at 15:08 on 08-18 — three minutes after the dashboard disengage. Worse than blind, it was SILENT: `check_bucket_liveness` reads a heartbeat the halted path still beats, and `check_scan_coverage` treats an absent scan as liveness's problem, so six days of blindness fell exactly between the two checks and paged nobody. `check_kill_switch_dwell` now owns that gap, and is deliberately not session-gated so a Friday halt pages over the weekend. TWO CORRECTIONS to the handoff, both worth keeping: (1) the swing reconciliation script's "Aug 5 and 24 actually ran some bins" is an artefact of attributing by `bar_key` rather than scan date — the 09:16 pass reads the PREVIOUS session's stub bin, so a blind Monday still produces a `#6` row for it. The DB has zero rows on both dates. (2) "no reason was recorded" for BLUESTARCO is not so — `sizing_snapshot` held "missing or non-positive mark price" 38 times; the audit log, which is what a person reads, carried only the enum. Both halves are the same defect and both are fixed. On rejections the handoff UNDERSTATED it: not 370 PIIND sells but **588 REJECTED against 9 FILLED for the month, none with a reason**, and 575 of them carry `protective_stop` — the dominant volume is the stop sweep being refused and retried, not entries. Ported `_post_and_verify` with two changes: read before sleeping (the reference's sleep-first costs a second per order in a 60s tick), and run it AFTER the Decision 034 target-leg retirement so nothing delays disarming an unbacktested take-profit. 23 new tests, 1022 green, ruff clean. Both Indian kill switches confirmed disengaged. DEFERRED with reasons in 11d: the missing ~15:16 pass (5 bins), the PIIND double-sell, persisting the decision inputs, and the NIFTY-100-set decision.
 

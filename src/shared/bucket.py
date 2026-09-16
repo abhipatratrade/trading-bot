@@ -154,6 +154,26 @@ class BucketConfig(BaseModel):
     # affordable quantity — so the bucket never spends more margin than budgeted.
     # None ⇒ no fallback; an ineligible scrip fails loudly.
     fallback_product: str | None = None
+    # Phase 12c — the IST wall-clock time ("HH:MM") at or after which the RUNNER
+    # closes every position this bucket still holds, whatever its strategies
+    # say. None ⇒ no runner square-off; the strategies alone decide exits.
+    #
+    # intraday-indian's strategy squares off from the latest bar's timestamp,
+    # which is the right thing for a backtest replay and was the ONLY square-off
+    # this bucket had. Dhan's 5m feed has ended at a 15:10 stamp on every
+    # session since 2026-08-03, so a test of "bar stamped >= 15:15" was never
+    # once true: not one of the bucket's four live trades has been closed by
+    # the bot. Dhan's MIS auto-square-off did it, and the CNC fallback has no
+    # such net at all. This is the backstop the strategy docstring assumed the
+    # broker was. Kept OUT of the strategy so the validated logic stays
+    # bar-driven and replays identically (House Rule 9).
+    squareoff: str | None = None
+    # Decision 035 — how the bucket's protective stop should rest at the venue.
+    # "day": a DAY order, expired by Dhan at the session close and re-rested by
+    # the sweep next morning (every bucket until 2026-09-16). "forever": a GTT
+    # that survives the close, for a bucket that carries positions overnight.
+    # Effective only under settings.forever_stops_enabled; inert otherwise.
+    stop_validity: str = Field(default="day", pattern="^(day|forever)$")
     # Decision 032 — how often the runner takes a full pipeline pass, in
     # seconds. None ⇒ derived from the fastest timeframe in the bucket (see
     # ``BucketRunner``). Set it when a bucket's cadence must be pinned

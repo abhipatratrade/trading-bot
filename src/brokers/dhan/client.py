@@ -278,6 +278,11 @@ class DhanClient(Broker):
         # a tick. An id that is not in here falls back to the working-order
         # endpoint, which is the behaviour every existing caller already has.
         self._forever_ids: set[str] = set()
+        # Decision 035 master switch as the adapter sees it: whether a
+        # reduce-only close must first sweep the GTT book. Set by run_bot from
+        # settings.forever_stops_enabled; False keeps every close on its
+        # pre-035 path with no extra request.
+        self.forever_stops: bool = False
         self._log = get_logger("brokers.dhan")
 
     @classmethod
@@ -400,6 +405,12 @@ class DhanClient(Broker):
         # stale stop is survivable and a double-sell is not.
         if request.reduce_only and request.stop_price is None and not is_super:
             self._retire_attached_stop(request.symbol)
+            # Decision 035 — and any GTT of ours on the same symbol. Only when
+            # the feature is live: the lookup is a real request per close, and
+            # on the account that returned 805 "too many requests" on
+            # 2026-08-31 it is not spent on a guaranteed-empty answer.
+            if self.forever_stops:
+                self._retire_forever_stops(request.symbol)
 
         # THE FREEZE-QUANTITY GUARD (Decision 036). NSE publishes a maximum
         # quantity per ORDER on every derivative; an order above it is refused
@@ -443,6 +454,13 @@ class DhanClient(Broker):
                 f"filled immediately at market. Use the attached stop, or set "
                 f"MCX_STANDALONE_STOPS_VERIFIED once the probe passes.",
             )
+
+        # Decision 035 — a stop asked to survive the session goes to the GTT
+        # book. Its own path: no MTF->CNC fallback (a stop protects a position
+        # that already has a product; changing it protects nothing), no target
+        # leg, no verify-against-the-working-book (it is not in that book).
+        if request.forever and request.stop_price is not None and not is_super:
+            return self._place_forever_stop(request, security_id, exchange, product_type)
 
         path = _SUPER_PATH if is_super else _PLAIN_PATH
         body = (
@@ -626,6 +644,62 @@ class DhanClient(Broker):
         if request.client_order_id:
             body["correlationId"] = request.client_order_id[:25]  # Dhan cap
         return body
+
+    def _forever_body(
+        self,
+        request: OrderRequest,
+        security_id: str,
+        exchange: str,
+        product_type: str,
+    ) -> dict[str, Any]:
+        """A Forever Order (GTT) carrying a protective stop — Decision 035.
+
+        The shape ``scripts/mcx_forever_probe.py`` had ACCEPTED live on
+        2026-08-31 (MCX_COMM + MARGIN): ``orderFlag SINGLE``, ``orderType
+        LIMIT``, a ``triggerPrice`` and a ``price``. The GTT vocabulary has no
+        STOP_LOSS_MARKET, so the limit is set THROUGH the trigger by the same
+        ~1% the MCX stop-limit already uses — a sell fills below its trigger, a
+        buy above — which is as close to a market stop as this order type gets.
+
+        ``validity DAY`` is what the docs list and what the probe sent; on a
+        Forever Order it governs the child placed WHEN the trigger fires, not
+        the trigger itself, which rests up to 365 days. Recorded in Decision
+        035 as a reading rather than a fact, and the probe is how it is
+        re-checked for a new segment or product.
+        """
+        trigger = self._snap_tick(request.stop_price, request.symbol)  # type: ignore[arg-type]
+        through = (
+            trigger * (Decimal("1") - _MCX_STOP_LIMIT_BUFFER)
+            if request.side.lower() == "sell"
+            else trigger * (Decimal("1") + _MCX_STOP_LIMIT_BUFFER)
+        )
+        body: dict[str, Any] = {
+            "dhanClientId": self._client_id,
+            "orderFlag": "SINGLE",
+            "transactionType": request.side.upper(),
+            "exchangeSegment": exchange,
+            "productType": product_type,
+            "orderType": "LIMIT",
+            "validity": "DAY",
+            "securityId": security_id,
+            "quantity": int(request.size),
+            "price": float(self._snap_tick(through, request.symbol)),
+            "triggerPrice": float(trigger),
+        }
+        if request.client_order_id:
+            body["correlationId"] = request.client_order_id[:25]
+        return body
+
+    def forever_body_for(self, request: OrderRequest) -> dict[str, Any]:
+        """The exact payload a forever stop would send — for the probe.
+
+        The probe must prove the body the BOT will send, not a hand-written
+        twin of it; this is the one builder both use.
+        """
+        security_id, exchange = self._resolve(request.symbol)
+        return self._forever_body(
+            request, security_id, exchange, request.product or self._product_type
+        )
 
     def _snap_tick(self, price: Decimal, symbol: str | None = None) -> Decimal:
         """Snap a price onto the contract's own grid (Dhan refuses off-tick).
@@ -1090,6 +1164,80 @@ class DhanClient(Broker):
         """True — proven live on MCX_COMM with MARGIN, 2026-08-31."""
         return True
 
+    def _place_forever_stop(
+        self,
+        request: OrderRequest,
+        security_id: str,
+        exchange: str,
+        product_type: str,
+    ) -> OrderResult:
+        body = self._forever_body(request, security_id, exchange, product_type)
+        self._log.info(
+            "placing_forever_stop",
+            symbol=request.symbol,
+            side=request.side,
+            size=str(request.size),
+            product=product_type,
+            trigger=body["triggerPrice"],
+            limit=body["price"],
+        )
+        result = self._request("POST", _FOREVER_PATH, body)
+        raw = result if isinstance(result, dict) else {}
+        order_id = str(raw.get("orderId", ""))
+        if order_id:
+            # Route a later cancel to the right book without waiting for the
+            # next get_forever_orders() refresh.
+            self._forever_ids.add(order_id)
+        return OrderResult(
+            exchange_order_id=order_id,
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side,
+            size=request.size,
+            price=None,
+            # A GTT is accepted into the resting book; "open" is its truth
+            # until it fires or is cancelled.
+            status="open" if order_id else "pending",
+            raw={**raw, "productType": product_type, "_forever": True},
+        )
+
+    def _retire_forever_stops(self, symbol: str) -> None:
+        """Cancel every resting GTT of OURS on ``symbol`` before we close it.
+
+        The Decision 035 prerequisite. A DAY stop that outlives its position
+        expires by itself; a Forever stop rests up to a year and OPENS a short
+        when it fires against stock we have sold. So this raises on any failure
+        — an unretired GTT must abort the close, for exactly the reason
+        ``_retire_attached_stop`` gives: refusing to sell is recoverable,
+        selling and then being sold again is not.
+
+        Only ours: ``get_forever_orders`` leaves ``reduce_only`` False on a GTT
+        without our correlationId, and the user rests GTTs by hand on this
+        shared account (Decision 027).
+        """
+        try:
+            resting = self.get_forever_orders(symbol)
+        except Exception as exc:
+            raise AttachedStopRetireError(
+                f"cannot confirm whether {symbol} has a resting forever stop: {exc}"
+            ) from exc
+        for order in resting:
+            if not order.reduce_only or order.stop_price is None:
+                continue
+            try:
+                self._request("DELETE", f"{_FOREVER_PATH}/{order.exchange_order_id}")
+            except Exception as exc:
+                raise AttachedStopRetireError(
+                    f"{symbol} forever stop {order.exchange_order_id} would outlive "
+                    f"the position: {exc}"
+                ) from exc
+            self._forever_ids.discard(order.exchange_order_id)
+            self._log.info(
+                "forever_stop_retired_before_close",
+                symbol=symbol,
+                order_id=order.exchange_order_id,
+            )
+
     def get_forever_orders(self, symbol: str | None = None) -> list[OpenOrder]:
         """Resting GTTs, shaped as ``OpenOrder`` so the stop sweep can plan on them.
 
@@ -1209,6 +1357,32 @@ class DhanClient(Broker):
         self._log.debug("set_leverage_noop_mtf", symbol=symbol, leverage=str(leverage))
 
     def get_order(self, exchange_order_id: str) -> OpenOrder | None:
+        # Decision 035 — a GTT is not in the working book, and asking
+        # /v2/orders/{id} for one only returns an error. Answer from the
+        # forever book instead: resting => "open"; gone => "canceled". Gone
+        # covers both a hand cancel and a FIRE — the fill a fired GTT produced
+        # is booked from the position shortfall by _detect_unrecorded_exits,
+        # which Decision 035 named as the settlement path for exactly this.
+        if exchange_order_id in self._forever_ids:
+            try:
+                resting = self.get_forever_orders()
+            except DhanAPIError:
+                return None
+            for o in resting:
+                if o.exchange_order_id == exchange_order_id:
+                    return o
+            return OpenOrder(
+                exchange_order_id=exchange_order_id,
+                client_order_id=None,
+                symbol="",
+                side="",
+                size=Decimal("0"),
+                unfilled_size=Decimal("0"),
+                order_type="",
+                limit_price=None,
+                status="canceled",
+                forever=True,
+            )
         try:
             result = self._request("GET", f"/v2/orders/{exchange_order_id}")
         except DhanAPIError:

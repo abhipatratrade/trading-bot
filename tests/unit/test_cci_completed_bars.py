@@ -81,6 +81,10 @@ def _series(n: int, *, spike_last: bool = False) -> list[_Bar]:
 def _strategy(data: _Data, monkeypatch, *, now: datetime) -> CciGasReversion15m:
     s = CciGasReversion15m()
     s._contract_for = lambda u, d: _Contract()  # type: ignore[assignment]
+    # These exercise the CONTRACT path's completed-bar handling. Phase 12b made
+    # `continuous` the live value, which builds its series from a registry and
+    # a bar store neither of which this harness has; pin the path under test.
+    s._config = s._selection_config().model_copy(update={"signal_source": "contract"})
 
     class _Frozen:
         def now(self) -> datetime:

@@ -251,6 +251,15 @@ class Settings(BaseSettings):
     # forever: a stop_coverage trip on PIIND held swing-indian down from
     # 2026-08-12 to 08-18 — four sessions, 28 scan bins — in silence.
     kill_switch_dwell_minutes: int = 120
+    # Decision 035 master switch. ON => the stop sweep rests a Dhan Forever
+    # Order (GTT, survives the session) instead of a DAY stop for every bucket
+    # whose buckets.yaml says `stop_validity: forever`, the reduce-only close
+    # path retires such GTTs first, and the coverage invariant reads the GTT
+    # book. OFF => nothing touches /v2/forever/orders and every bucket keeps
+    # its DAY stop. Ships OFF: NSE_EQ + MTF is unproven at the venue (only
+    # MCX + MARGIN was probed, 2026-08-31). Flip it only after
+    # scripts/nse_forever_probe.py --place reports ACCEPTED from the VM IP.
+    forever_stops_enabled: bool = False
     # ENFORCING since 2026-08-01 (Decision 033). Shipped observe-only on
     # 2026-07-28 and ran four sessions (28-31 Jul) with no false positive.
     #
