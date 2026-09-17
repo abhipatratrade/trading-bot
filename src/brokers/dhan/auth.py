@@ -380,14 +380,32 @@ class DhanTokenManager:
         # theirs instead of minting a competing one, or N processes thrash,
         # each mint invalidating the others every tick. Skip a cached token
         # equal to the one just rejected — it would only be rejected again.
+        # ...but NOT a peer token that is itself inside the refresh margin.
+        # That is not a peer's fresh mint; it is our own expiring token read
+        # back from the store we wrote it to, and adopting it returns without
+        # minting. Live on 2026-09-17: the token expired 21:27:06 IST, the
+        # margin opened 20:57, and every call from 20:58 adopted that same
+        # token — 167 times in 19 minutes — until Dhan rejected it at 21:17.
+        # The mint then happened under pressure (a rate-limit collision, three
+        # "Invalid TOTP" replies inside one code window) and landed at 21:23:
+        # 25 minutes blind, inside MCX hours, with a position on. Yesterday
+        # the same, a few minutes shorter. The proactive refresh had never
+        # once produced a proactive mint. Letting the margin fall through to
+        # the mint is what makes it proactive.
         peer = self._load_peer()
-        if peer is not None and peer != self._rejected_token:
+        peer_exp = jwt_exp(peer) if peer is not None else None
+        peer_expiring = (
+            peer_exp is not None and self._clock() >= peer_exp - self._margin
+        )
+        if peer is not None and peer != self._rejected_token and not peer_expiring:
             self._token = self._last_good_token = peer
             self._exp = self._last_good_exp = jwt_exp(peer)
             self._rejected_token = None
             self._rejected_serves = 0
             _log.info("dhan_token_adopted_peer_before_mint", exp=self._exp)
             return
+        if peer is not None and peer_expiring:
+            _log.info("dhan_token_peer_inside_margin_minting", peer_exp=peer_exp)
 
         totp = pyotp.TOTP(self._totp_secret)
         last_err: Exception | None = None

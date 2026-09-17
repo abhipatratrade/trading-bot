@@ -582,3 +582,60 @@ def test_remote_store_down_falls_back_to_mint(monkeypatch) -> None:
     mgr = _mgr_remote(_FlakyHttp([good], 0, "no_token"), store)
     assert mgr.token() == good  # save() raised internally but mint still returns
     assert store.saved == []  # nothing persisted, and no exception surfaced
+
+
+# ── the proactive refresh must actually mint, even with a shared store ─
+
+
+def test_proactive_refresh_mints_even_when_the_store_holds_the_same_token(
+    monkeypatch, tmp_path: _Path
+) -> None:
+    """Live 2026-09-17: token exp 21:27, margin opened 20:57, and every call
+    until 21:17 re-adopted that same token from the shared cache instead of
+    minting — 167 times. The mint then happened under Dhan's rejection and
+    cooldown, 25 minutes later, inside MCX hours. A peer token that is itself
+    inside the margin is not a fresh mint; fall through and mint early."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    cache = tmp_path / "tok.json"
+    first = _fake_jwt(int(now[0]) + 3600)    # expires in 1h
+    second = _fake_jwt(int(now[0]) + 90000)  # the proactive mint
+    http = _FlakyHttp([first, second], 0, "no_token")
+    mgr = DhanTokenManager(
+        client_id="C", pin="1234", totp_secret=_TOTP_SECRET,
+        refresh_margin_seconds=1800, http=http, clock=lambda: now[0],
+        token_cache_path=cache,
+    )
+    assert mgr.token() == first and http.calls == 1
+    assert cache.exists()  # the store now holds `first` — the live shape
+
+    now[0] += 3600 - 1700  # inside the margin; `first` still valid 28 min
+    assert mgr.token() == second, "must mint, not re-adopt the expiring token"
+    assert http.calls == 2
+    # and the store now carries the NEW token for peers
+    assert json.loads(cache.read_text())["token"] == second
+
+
+def test_a_peers_genuinely_fresh_token_is_still_adopted_inside_our_margin(
+    monkeypatch, tmp_path: _Path
+) -> None:
+    """The case adoption exists for: while OUR token is expiring, a peer has
+    already minted a fresh one. Adopt it; do not mint a competing one."""
+    monkeypatch.setattr(_time_mod, "sleep", lambda _s: None)
+    now = [1_000_000.0]
+    cache = tmp_path / "tok.json"
+    ours = _fake_jwt(int(now[0]) + 3600)
+    http = _FlakyHttp([ours], 0, "no_token")
+    mgr = DhanTokenManager(
+        client_id="C", pin="1234", totp_secret=_TOTP_SECRET,
+        refresh_margin_seconds=1800, http=http, clock=lambda: now[0],
+        token_cache_path=cache,
+    )
+    assert mgr.token() == ours
+
+    # A peer mints and writes the store while we are inside our margin.
+    peers = _fake_jwt(int(now[0]) + 90000)
+    cache.write_text(json.dumps({"token": peers, "minted_at": now[0]}))
+    now[0] += 3600 - 1700
+    assert mgr.token() == peers
+    assert http.calls == 1, "adopted the peer's fresh token — no second mint"
