@@ -918,17 +918,35 @@ class InvariantThresholds:
     cash_min_dte: int = DEFAULT_CASH_MIN_DTE
 
 
+# Dhan's answer to an INTRADAY order once its own MIS auto-square-off has run
+# (~15:11:30 IST). That is the venue closing a window whose positions it has
+# just closed itself, not the order path failing — so it must not count toward
+# reject_rate. On 2026-09-24 five square-off exits sent at 15:16-15:17 met this
+# refusal and halted intraday-indian into the next session over positions Dhan
+# had already flattened at 15:11:41.
+_INTRADAY_CUTOFF_REFUSAL = "intraday orders cannot be placed at this time"
+
+
+def is_intraday_cutoff_refusal(reject_reason: object) -> bool:
+    """True for Dhan's after-square-off refusal of an intraday order. PURE."""
+    return _INTRADAY_CUTOFF_REFUSAL in str(reject_reason or "").lower()
+
+
 def count_recent_rejects(
     *,
     broker_name: BrokerName,
     bucket_id: str,
     since: datetime,
 ) -> int:
-    """REJECTED trade rows for one bucket since ``since``."""
+    """REJECTED trade rows for one bucket since ``since``.
+
+    Excludes Dhan's intraday cut-off refusal (``is_intraday_cutoff_refusal``);
+    every other rejection counts, including a refusal with no recorded reason.
+    """
     with session_scope() as session:
-        return len(
+        rows = (
             session.execute(
-                select(Trade.id).where(
+                select(Trade).where(
                     Trade.broker == broker_name,
                     Trade.bucket_id == bucket_id,
                     Trade.status == OrderStatus.REJECTED,
@@ -937,6 +955,11 @@ def count_recent_rejects(
             )
             .scalars()
             .all()
+        )
+        return sum(
+            1
+            for t in rows
+            if not is_intraday_cutoff_refusal((t.extra or {}).get("reject_reason"))
         )
 
 

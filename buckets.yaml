@@ -160,12 +160,24 @@ buckets:
     # a failed square-off leaves an overnight delivery position; and at 1x the
     # notional is Rs 10k, where the Rs 20 brokerage cap is ~0.4% round-trip
     # against a ~0.62% mean trade.
-    fallback_product: CNC
+    #
+    # REVERSED 2026-09-25 (user decision): back to the original — an
+    # MIS-ineligible scrip is not traded. The second guard above was never
+    # true: every exit path sends the BUCKET's product (INTRADAY), not the
+    # product the position was bought under, so a CNC fallback could not be
+    # closed by the bot at all, and Dhan never auto-closes CNC. With every
+    # position MIS, "if the bot's exit fails, Dhan's square-off closes it"
+    # holds without exception. The fallback never fired (0 CNC entries,
+    # 2026-07-27..09-24). Cost: on the rare day an MIS-ineligible name signals,
+    # its entry is refused on each tick the signal is fresh, and three
+    # refusals in 15 minutes halt the bucket via reject_rate — loud, not silent.
+    fallback_product: null
     # Phase 12c — the runner's own square-off, on the wall clock. The strategy
     # squares off from the latest 5m bar's stamp and Dhan has not served a
     # 15:15-stamped bar since 2026-08-03, so its exit never fired: all four
     # live trades were closed by Dhan's MIS auto-square-off, and CNC has no
-    # such net. This is what makes the CNC fallback above safe.
+    # such net. (The CNC fallback this was meant to guard is off since
+    # 2026-09-25 — see fallback_product.)
     #
     # 15:09, user decision 2026-09-25 — not the backtest's 15:15. Dhan's RMS
     # squares off MIS at ~15:11:30 (15:11:28 on 08-25 and 09-09, 15:11:41 on

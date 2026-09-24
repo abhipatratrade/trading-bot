@@ -601,14 +601,25 @@ def test_one_x_size_is_the_cash_affordable_quantity() -> None:
     4x MIS needs 4x the cash as CNC. At ₹100/share a ₹10k slot is 100 shares,
     NOT the 400 that 4x MIS would have bought.
     """
-    r = _runner_with(_LevFeed(Decimal("4")))
+    r = _fallback_runner(_LevFeed(Decimal("4")))
     assert r._one_x_size(
         price=Decimal("100"), margin_budget=Decimal("10000")
     ) == Decimal("100")
 
 
+def _fallback_runner(data: object) -> BucketRunner:
+    """A runner on a bucket that still HAS a CNC fallback (swing-indian).
+
+    intraday-indian's fallback was switched off 2026-09-25; the 1x arithmetic
+    is unchanged and still guards swing-indian's MTF->CNC retry."""
+    r = object.__new__(BucketRunner)
+    r.bucket = load_bucket("swing-indian")
+    r._data = data
+    return r
+
+
 def test_one_x_size_rounds_down_to_whole_shares() -> None:
-    r = _runner_with(_LevFeed(None))
+    r = _fallback_runner(_LevFeed(None))
     assert r._one_x_size(
         price=Decimal("330"), margin_budget=Decimal("10000")
     ) == Decimal("30")  # 30.3 → 30
@@ -650,8 +661,12 @@ def test_swing_bucket_declares_cnc_fallback_so_mtf_retry_is_capped() -> None:
     ) == Decimal("100")
 
 
-def test_intraday_bucket_declares_cnc_fallback() -> None:
-    assert load_bucket("intraday-indian").config.fallback_product == "CNC"
+def test_intraday_bucket_has_no_cnc_fallback() -> None:
+    """Reversed 2026-09-25 (user decision). Every exit path sends the bucket's
+    product, so a CNC fallback could not be closed by the bot, and Dhan never
+    auto-closes CNC. All-MIS is what lets Dhan's own square-off back up a
+    failed 15:09 exit."""
+    assert load_bucket("intraday-indian").config.fallback_product is None
 
 
 # ---------------------------------------------------------------------------

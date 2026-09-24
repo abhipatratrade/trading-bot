@@ -295,6 +295,54 @@ def test_reject_rate_halts_at_threshold() -> None:
     assert res.severity is Severity.HALT
 
 
+def test_dhans_intraday_cutoff_refusal_is_recognised() -> None:
+    """The exact reason stored on 2026-09-24, and nothing broader."""
+    assert si.is_intraday_cutoff_refusal(
+        "RMS:34126092459201:Intraday orders cannot be placed at this time."
+    )
+    assert not si.is_intraday_cutoff_refusal("MTF is not permitted for this Scrip")
+    assert not si.is_intraday_cutoff_refusal(None)
+    assert not si.is_intraday_cutoff_refusal("")
+
+
+def test_the_cutoff_refusal_does_not_count_toward_reject_rate(monkeypatch) -> None:
+    """Five exits refused after Dhan had already flattened the positions
+    halted intraday-indian into the next session. That refusal is the venue
+    closing its window, not the order path failing — every other rejection,
+    including one with no recorded reason, still counts."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from src.core.models import BrokerName
+
+    cutoff = "RMS:1:Intraday orders cannot be placed at this time."
+    rows = [
+        SimpleNamespace(extra={"reject_reason": cutoff}),
+        SimpleNamespace(extra={"reject_reason": cutoff}),
+        SimpleNamespace(extra={"reject_reason": cutoff}),
+        SimpleNamespace(extra={"reject_reason": "Insufficient margin"}),
+        SimpleNamespace(extra=None),
+    ]
+
+    class _Session:
+        def execute(self, _stmt):
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: rows)
+            )
+
+    @contextmanager
+    def _scope():
+        yield _Session()
+
+    monkeypatch.setattr(si, "session_scope", _scope)
+    n = si.count_recent_rejects(
+        broker_name=BrokerName.DHAN,
+        bucket_id="intraday-indian",
+        since=datetime(2026, 9, 24, 9, 30),
+    )
+    assert n == 2
+
+
 # ---------------------------------------------------------------------------
 # check_bucket_liveness
 # ---------------------------------------------------------------------------
