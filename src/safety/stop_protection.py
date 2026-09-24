@@ -88,13 +88,44 @@ _ENTRY_GRACE_MINUTES = 5
 _MAX_PLACE_FAILURES = 3
 _place_failures: dict[tuple[str, str, str], int] = {}
 
+# (account_ref, symbol) -> the exchange order id of the last stop this sweep
+# placed for it. The STACKING GUARD: if the planner asks for a stop again while
+# that order is still live at the venue, the sweep cannot see its own stop, and
+# placing another only makes a second one it cannot see either. This class of
+# bug has now happened twice — ``reduce_only`` hardcoded False on 2026-08-12,
+# and a correlationId Dhan's GTT list never returns on 2026-09-24, which rested
+# 305 forever sells against 26 held shares. The guard does not care WHY the
+# stop is invisible, which is the point.
+#
+# In memory on purpose: a restart forgets it and costs at most one extra stop,
+# whereas a persisted record that outlived its order would block a real one.
+_last_placed: dict[tuple[str, str], str] = {}
+
 
 def reset_place_failures(key: tuple[str, str, str] | None = None) -> None:
     """Clear the retry budget — for tests, and for a symbol that recovered."""
     if key is None:
         _place_failures.clear()
+        _last_placed.clear()
     else:
         _place_failures.pop(key, None)
+
+
+def _still_live(broker: Broker, exchange_order_id: str) -> bool:
+    """Is this order still resting at the venue? Fails toward False.
+
+    False on a lookup error, deliberately: the worst case of a wrong False is
+    ONE duplicate stop, while a wrong True withholds protection from a position
+    for as long as the lookup keeps failing.
+    """
+    try:
+        order = broker.get_order(exchange_order_id)
+    except Exception:
+        _log.warning(
+            "stop_liveness_lookup_failed", order_id=exchange_order_id, exc_info=True
+        )
+        return False
+    return order is not None and order.status in ("open", "pending", "partial")
 
 
 def should_attempt_place(
@@ -324,6 +355,7 @@ def plan_stop_protection(
     entry_prices: dict[str, Decimal] | None = None,
     attached_stops: dict[str, Decimal] | None = None,
     recent_entries: set[str] | None = None,
+    paused_buckets: set[str] | None = None,
 ) -> StopPlan:
     """Diff exchange positions against resting protective stops.
 
@@ -350,6 +382,13 @@ def plan_stop_protection(
             own quantity, so an overlapping user holding is never covered. When
             None (crypto — exclusive sub-account, Decision 019), every position
             is the bot's and behaviour is unchanged.
+        paused_buckets: buckets whose venue is SHUT this tick. Their positions
+            are left exactly as they are — nothing placed, nothing cancelled.
+            Dropping them from ``stop_pct_by_bucket`` alone is not enough: an
+            attributed symbol with no pct falls through to ``fallback_pct``,
+            the smallest pct of the buckets still OPEN. On 2026-09-24 that
+            swept swing-indian's POLICYBZR all evening at commodity-indian's
+            4.5% (trigger 1441.00) because MCX trades until 23:30.
     """
     plan = StopPlan()
     ticks = tick_sizes or {}
@@ -411,6 +450,13 @@ def plan_stop_protection(
                 symbol=pos.symbol,
                 size=str(pos.size),
             )
+            continue
+
+        # Venue shut for this bucket: touch nothing. POP its stops as well as
+        # skipping, or the orphan pass below would read them as stops with no
+        # position behind them and cancel the protection it was told to leave.
+        if attribution.get(pos.symbol, (None, None))[0] in (paused_buckets or set()):
+            stops_by_symbol.pop(pos.symbol, None)
             continue
 
         # Decision 034: the venue is already holding a stop attached to this
@@ -831,6 +877,7 @@ def ensure_stop_protection(
     attached_stops_enabled: bool = False,
     forever_stops_enabled: bool = False,
     forever_by_bucket: dict[str, bool] | None = None,
+    paused_buckets: set[str] | None = None,
 ) -> StopPlan:
     """Make the exchange state match the plan for one sub-account.
 
@@ -963,6 +1010,7 @@ def ensure_stop_protection(
         recent_entries=(
             _load_recent_entry_symbols(bucket_ids, clk.now()) if attached else None
         ),
+        paused_buckets=paused_buckets,
     )
 
     fallback_bucket = bucket_ids[0] if bucket_ids else "unknown"
@@ -1010,6 +1058,7 @@ def ensure_stop_protection(
             )
 
     minute = clk.now().strftime("%Y%m%d%H%M")
+    cancelled_ids = {o.exchange_order_id for o in plan.cancel}
     for stop in plan.place:
         scope = stop.bucket_id or fallback_bucket
         fail_key = (account_ref, stop.symbol, str(stop.trigger))
@@ -1024,8 +1073,30 @@ def ensure_stop_protection(
                 trigger=str(stop.trigger),
             )
             continue
+        last_key = (account_ref, stop.symbol)
+        previous = _last_placed.get(last_key)
+        # A stop this sweep just cancelled to re-place (drift, a size change)
+        # was SEEN — that is how it got on the cancel list — so it proves
+        # nothing about visibility, and Dhan may still report it live for a
+        # moment after the DELETE.
+        if previous and previous not in cancelled_ids and _still_live(broker, previous):
+            _log.error(
+                "stop_invisible_refusing_to_stack",
+                account_ref=account_ref,
+                symbol=stop.symbol,
+                live_order_id=previous,
+                trigger=str(stop.trigger),
+            )
+            send_alert_dedup(
+                f"stop_invisible:{account_ref}:{stop.symbol}",
+                f"[{scope}] {stop.symbol}: the stop placed earlier (order "
+                f"{previous}) is LIVE at the venue but the sweep cannot see it — "
+                f"NOT placing another. A bug is hiding this account's stops; "
+                f"check the order book and the GTT book.",
+            )
+            continue
         try:
-            order_manager.place_order(
+            placed = order_manager.place_order(
                 strategy_id=scope,
                 bucket_id=stop.bucket_id,
                 strategy_name=stop.strategy_name or "stop_protection",
@@ -1050,6 +1121,13 @@ def ensure_stop_protection(
                 ),
             )
             reset_place_failures(fail_key)
+            if placed.exchange_order_id and placed.status in (
+                OrderStatus.OPEN,
+                OrderStatus.PENDING,
+            ):
+                _last_placed[last_key] = placed.exchange_order_id
+            else:
+                _last_placed.pop(last_key, None)
         except Exception:
             _place_failures[fail_key] = _place_failures.get(fail_key, 0) + 1
             _log.error(

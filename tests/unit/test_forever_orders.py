@@ -59,13 +59,14 @@ class _FakeHttp:
         raise AssertionError(f"unexpected {method} {url}")
 
 
-def _client(http: _FakeHttp) -> DhanClient:
+def _client(http: _FakeHttp, *, ledger: set[str] | None = None) -> DhanClient:
     return DhanClient(
         token_manager=DhanTokenManager(static_token="TOK"),
         client_id="C1",
         resolve_symbol=_resolve,
         base_url="https://api.dhan.co",
         http=http,
+        owns_order_id=(lambda oid: oid in ledger) if ledger is not None else None,
     )
 
 
@@ -137,6 +138,50 @@ def test_dhan_na_correlation_is_not_ours() -> None:
         {"GET /v2/forever/orders": [_Resp([_gtt(correlation="NA")])]}
     )
     assert _client(http).get_forever_orders()[0].reduce_only is False
+
+
+def test_the_ledger_proves_our_gtt_when_dhan_omits_correlation() -> None:
+    """THE LIVE SHAPE. Dhan's GTT list has no ``correlationId`` key at all
+    (read from the account 2026-09-24), so correlationId alone disowned every
+    GTT the bot placed: the sweep saw no stop and placed another each tick,
+    305 of them, none of which the orphan pass could ever cancel."""
+    http = _FakeHttp(
+        {"GET /v2/forever/orders": [_Resp([_gtt(correlation=None)])]}
+    )
+    o = _client(http, ledger={"GTT1"}).get_forever_orders()[0]
+
+    assert o.reduce_only is True
+    assert o.client_order_id is None  # nothing to echo, and none invented
+
+
+def test_a_gtt_neither_proof_claims_is_the_users() -> None:
+    http = _FakeHttp(
+        {"GET /v2/forever/orders": [_Resp([_gtt(order_id="USER1", correlation=None)])]}
+    )
+    assert _client(http, ledger={"GTT1"}).get_forever_orders()[0].reduce_only is False
+
+
+def test_a_ledger_proven_gtt_satisfies_the_position() -> None:
+    """End to end through the parser: the stop the bot placed last tick must
+    stop the planner asking for another."""
+    http = _FakeHttp({"GET /v2/forever/orders": [_Resp([
+        _gtt(correlation=None, trigger=257.85, price=255.25),
+    ])]})
+    resting = _client(http, ledger={"GTT1"}).get_forever_orders()
+    plan = plan_stop_protection(
+        positions=[PositionInfo(
+            symbol="NATGASMINI-20260925-FUT",
+            side="long",
+            size=Decimal("1"),
+            entry_price=Decimal("270"),
+        )],
+        open_orders=resting,
+        stop_pct_by_bucket=_PCTS,
+        attribution=_ATTR,
+        owned_quantities={"NATGASMINI-20260925-FUT": Decimal("1")},
+    )
+    assert plan.place == []
+    assert plan.cancel == []
 
 
 def test_unknown_status_still_counts_as_resting() -> None:

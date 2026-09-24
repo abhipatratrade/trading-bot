@@ -1652,6 +1652,20 @@ To turn on: run the probe from the VM with `--place`, and on ACCEPT set
 `FOREVER_STOPS_ENABLED=true` and restart. The next sweep rests one GTT per
 swing-indian position and cancels nothing that is already resting.
 
+**Switched OFF again 2026-09-24 — the Ownership bullet above was wrong.**
+Enabled 2026-09-17. Dhan's `GET /v2/forever/orders` returns NO `correlationId`
+field, so every GTT the bot placed read as the user's: invisible to the sweep
+(one new GTT per tick), to the orphan pass, and to the retire-on-close guard.
+305 were resting by 20:50 IST — 291 SELLs of 26 POLICYBZR against 26 held, and
+14 on COCHINSHIP, sold 2026-09-18. All cancelled by hand (user-approved); the
+flag is `false` on the VM. The probe passed because it cancels by the orderId
+it was just handed and never needs the list to recognise its own order.
+Fixed: GTT ownership is now correlationId OR the ledger (`_owns_order`, the
+super-order proof); a shut venue's bucket is `paused_buckets` in the planner
+rather than falling to another bucket's pct; and the sweep refuses to place a
+stop while the one it placed last is still live but unseen. Re-enable only
+after a live GTT has been seen as ours by `get_forever_orders()` on the VM.
+
 ## 036 — Two Indian F&O buckets: futures-indian and options-indian
 Date: 2026-08-28
 Status: **Phases A–D built. Nothing trades — neither bucket exists in buckets.yaml yet. Two gates remain open: the margin preflight has still never run against a live account, and the fee card is unsigned. Multi-leg structures are NOT supported; naked shorts and single legs are.**

@@ -655,3 +655,50 @@ def test_falls_back_to_broker_entry_when_ledger_has_none() -> None:
         entry_prices=None,
     )
     assert p.place[0].trigger == Decimal("900")
+
+
+# ── a bucket whose venue is shut (2026-09-24) ───────────────────────────
+
+_SHARED_ATTR = {
+    "POLICYBZR": ("swing-indian", "mean_reversion_1h"),
+    "NATGASMINI-20261027-FUT": ("commodity-indian", "cci_gas_reversion_15m"),
+}
+_OWNED = {"POLICYBZR": Decimal("26"), "NATGASMINI-20261027-FUT": Decimal("1")}
+
+
+def _after_nse_close(**kw):
+    """The 20:17 IST shape: NSE shut, MCX trading, one Dhan account."""
+    return plan_stop_protection(
+        positions=[
+            PositionInfo(symbol="POLICYBZR", side="long", size=Decimal("26"),
+                         entry_price=Decimal("1508.90")),
+            PositionInfo(symbol="NATGASMINI-20261027-FUT", side="long",
+                         size=Decimal("1"), entry_price=Decimal("270")),
+        ],
+        # Only the OPEN venue's bucket keeps its pct — what _sweep_stops passes.
+        stop_pct_by_bucket={"commodity-indian": Decimal("4.5")},
+        attribution=_SHARED_ATTR,
+        owned_quantities=_OWNED,
+        tick_sizes={"POLICYBZR": Decimal("0.05"),
+                    "NATGASMINI-20261027-FUT": Decimal("0.05")},
+        **kw,
+    )
+
+
+def test_a_shut_venues_position_borrows_no_other_buckets_pct() -> None:
+    """Without the pause, POLICYBZR fell through to the account's smallest pct
+    — commodity-indian's 4.5% — and was re-stopped at 1441.00 every tick until
+    MCX closed at 23:30."""
+    p = _after_nse_close(open_orders=[], paused_buckets={"swing-indian"})
+
+    assert [s.symbol for s in p.place] == ["NATGASMINI-20261027-FUT"]
+
+
+def test_a_shut_venues_resting_stop_is_not_cancelled_as_an_orphan() -> None:
+    """Skipping the position is only half of it. Its stop must be popped too,
+    or the orphan pass reads 'stop with no position' and strips it."""
+    theirs = _stop(symbol="POLICYBZR", size="26", trigger="1373.10", oid="S1")
+    p = _after_nse_close(open_orders=[theirs], paused_buckets={"swing-indian"})
+
+    assert p.cancel == []
+    assert "POLICYBZR" not in [s.symbol for s in p.place]

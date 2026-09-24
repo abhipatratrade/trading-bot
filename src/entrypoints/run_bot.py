@@ -792,14 +792,23 @@ def main() -> None:
             # the old gate was protecting: an NSE-equity stop is still never
             # retried at 22:40, because its bucket drops out of `pcts` while
             # the MCX bucket stays in.
+            #
+            # Filtering `pcts` is NOT enough on its own, and on 2026-09-24 it
+            # was all there was: the planner gave the dropped bucket's symbols
+            # the smallest pct still in the map, so swing-indian's POLICYBZR was
+            # swept all evening at commodity-indian's 4.5%. The shut buckets
+            # are passed as `paused_buckets` too, which the planner leaves
+            # untouched.
+            paused: set[str] = set()
             if ref in dhan_accounts:
                 swept_at = clock.now()
-                pcts = {
-                    b: p
-                    for b, p in pcts.items()
+                paused = {
+                    b
+                    for b in pcts
                     if nse_session(swept_at, exchange=stop_exchanges.get(b, "NSE"))
-                    is not NseSession.CLOSED
+                    is NseSession.CLOSED
                 }
+                pcts = {b: p for b, p in pcts.items() if b not in paused}
                 if not pcts:
                     continue
             # Before the sweep, and outside its try: a target leg that failed
@@ -830,6 +839,7 @@ def main() -> None:
                     # never touches the forever-order endpoint at all.
                     forever_stops_enabled=settings.forever_stops_enabled,
                     forever_by_bucket=stop_validities,
+                    paused_buckets=paused,
                 )
                 _note_safety_ok(
                     f"stop_sweep_error:{ref}",

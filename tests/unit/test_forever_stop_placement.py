@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import inspect
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from src.brokers.base import OrderRequest, OrderType
 from src.brokers.dhan.auth import DhanTokenManager
 from src.brokers.dhan.client import AttachedStopRetireError, DhanClient
+from src.core.models import OrderStatus
 from src.safety import session_invariants as si
 from src.safety import stop_protection as sp
 
@@ -59,7 +61,9 @@ class _FakeHttp:
         return [c["url"].split(".co", 1)[1] for c in self.calls if c["method"] == method]
 
 
-def _client(http: _FakeHttp, *, forever_stops: bool = False) -> DhanClient:
+def _client(
+    http: _FakeHttp, *, forever_stops: bool = False, ledger: set[str] | None = None
+) -> DhanClient:
     c = DhanClient(
         token_manager=DhanTokenManager(static_token="TOK"),
         client_id="C1",
@@ -67,6 +71,7 @@ def _client(http: _FakeHttp, *, forever_stops: bool = False) -> DhanClient:
         base_url="https://api.dhan.co",
         product_type="MTF",
         http=http,
+        owns_order_id=(lambda oid: oid in ledger) if ledger is not None else None,
     )
     c.forever_stops = forever_stops
     return c
@@ -195,6 +200,21 @@ def test_a_close_retires_our_resting_gtt_first() -> None:
     assert cancel_at < sell_at
 
 
+def test_a_close_retires_a_gtt_only_the_ledger_can_prove() -> None:
+    """COCHINSHIP, 2026-09-18: sold, and its 14 GTT sells kept resting with no
+    position behind them, because Dhan's GTT list omits correlationId and the
+    retire step could not claim a single one."""
+    http = _FakeHttp({
+        "GET /v2/super/orders": [_Resp([])],
+        "GET /v2/forever/orders": [_Resp([_gtt("GTT1", correlation=None)])],
+        "DELETE /v2/forever/orders/GTT1": [_Resp({"orderStatus": "CANCELLED"})],
+        "POST /v2/orders": [_Resp({"orderId": "777", "orderStatus": "TRADED"})],
+        "GET /v2/orders/777": [_Resp({"orderStatus": "TRADED"})],
+    })
+    _client(http, forever_stops=True, ledger={"GTT1"}).place_order(_close())
+    assert http.paths("DELETE") == ["/v2/forever/orders/GTT1"]
+
+
 def test_the_users_gtt_on_the_same_scrip_is_left_resting() -> None:
     """Decision 027: no correlationId of ours, not ours, not touched."""
     http = _FakeHttp({
@@ -276,6 +296,7 @@ class _OM:
 
     def place_order(self, **kw):
         self.placed.append(kw)
+        return SimpleNamespace(exchange_order_id=None, status=None)
 
     def cancel_order(self, **kw):  # pragma: no cover
         pass
@@ -310,9 +331,7 @@ def _long(symbol: str, qty: str, entry: str):
     return PositionInfo(symbol=symbol, side="long", size=Decimal(qty), entry_price=Decimal(entry))
 
 
-@pytest.fixture
-def swept(monkeypatch):
-    """Drive the real sweep with the ledger lookups stubbed."""
+def _stub_ledger(monkeypatch) -> None:
     monkeypatch.setattr(sp, "_load_attribution", lambda *a, **k: {
         "KEI": ("swing-indian", "mean_reversion_1h"),
         "COFORGE": ("intraday-indian", "gap_down_reversal_broad"),
@@ -333,6 +352,13 @@ def swept(monkeypatch):
     monkeypatch.setattr(sp, "session_scope", _scope)
     monkeypatch.setattr(sp, "should_attempt_place", lambda *a, **k: True)
     monkeypatch.setattr(sp, "reset_place_failures", lambda *a, **k: None)
+    monkeypatch.setattr(sp, "_last_placed", {})
+
+
+@pytest.fixture
+def swept(monkeypatch):
+    """Drive the real sweep with the ledger lookups stubbed."""
+    _stub_ledger(monkeypatch)
 
     def run(*, enabled: bool, by_bucket: dict[str, bool]):
         om = _OM()
@@ -360,6 +386,60 @@ def test_only_the_configured_bucket_gets_a_forever_stop(swept):
 def test_with_the_master_switch_off_nobody_does(swept):
     got = swept(enabled=False, by_bucket={"swing-indian": True})
     assert got == {"KEI": False, "COFORGE": False}
+
+
+# ── the stacking guard: never place a stop on top of one you cannot see ──
+
+
+class _BlindBroker(_Broker):
+    """A venue that holds the bot's stops while every listing hides them —
+    the 2026-09-24 shape, where the GTT list omitted correlationId."""
+
+    def __init__(self, positions, live: set[str]):
+        super().__init__(positions)
+        self.live = live
+
+    def get_order(self, oid):
+        return SimpleNamespace(status="open" if oid in self.live else "canceled")
+
+
+class _PlacingOM(_OM):
+    def place_order(self, **kw):
+        self.placed.append(kw)
+        return SimpleNamespace(
+            exchange_order_id=f"GTT{len(self.placed)}", status=OrderStatus.OPEN
+        )
+
+
+def test_a_live_stop_the_sweep_cannot_see_is_not_stacked(monkeypatch):
+    _stub_ledger(monkeypatch)
+    alerts: list[str] = []
+    monkeypatch.setattr(sp, "send_alert_dedup", lambda key, msg: alerts.append(msg))
+    om = _PlacingOM()
+    live: set[str] = set()
+    broker = _BlindBroker([_long("KEI", "7", "4883.5")], live)
+
+    def tick():
+        sp.ensure_stop_protection(
+            account_ref="dhan",
+            bucket_ids=["swing-indian"],
+            broker=broker,
+            order_manager=om,
+            stop_pct_by_bucket={"swing-indian": Decimal("20")},
+            shared_account=True,
+        )
+
+    tick()
+    live.add("GTT1")  # it rests at the venue; the listing still hides it
+    tick()
+    tick()
+
+    assert len(om.placed) == 1
+    assert alerts and "NOT placing another" in alerts[0]
+
+    live.clear()  # fired, or cancelled by hand: a stop is genuinely needed
+    tick()
+    assert len(om.placed) == 2
 
 
 # ── configuration and wiring ────────────────────────────────────────────
@@ -392,3 +472,6 @@ def test_run_bot_threads_the_switch_everywhere():
     assert src.count("forever_stops_enabled=settings.forever_stops_enabled") == 2
     assert "client.forever_stops = settings.forever_stops_enabled" in src
     assert "forever_by_bucket=stop_validities" in src
+    # A venue that is shut must reach the planner as PAUSED, not merely be
+    # missing from the pct map (2026-09-24: POLICYBZR at commodity's 4.5%).
+    assert "paused_buckets=paused" in src

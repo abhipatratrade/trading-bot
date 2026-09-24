@@ -258,7 +258,7 @@ class DhanClient(Broker):
         self._contract_spec = contract_spec
         # Ledger-backed ownership proof for super orders, injected because this
         # adapter stays DB-free (the backtester imports it). See
-        # ``_owns_super_order`` for why correlationId alone is not enough.
+        # ``_owns_order`` for why correlationId alone is not enough.
         self._owns_order_id = owns_order_id
         # Dhan securityId -> the symbol THIS BOT uses. Injected like
         # ``resolve_symbol``, so the adapter still knows nothing about the
@@ -830,10 +830,14 @@ class DhanClient(Broker):
         result = self._request("GET", _SUPER_PATH) or []
         if not isinstance(result, list):
             return []
-        return [o for o in result if self._owns_super_order(o)]
+        return [o for o in result if self._owns_order(o)]
 
-    def _owns_super_order(self, order: dict[str, Any]) -> bool:
-        """Can we PROVE this super order is the bot's? (Decision 027.)
+    def _owns_order(self, order: dict[str, Any]) -> bool:
+        """Can we PROVE this super order or GTT is the bot's? (Decision 027.)
+
+        Written for super orders, and a GTT needs it for a harder reason: Dhan's
+        forever-order list carries no ``correlationId`` field AT ALL (checked
+        live 2026-09-24), so for a GTT the ledger is the only proof there is.
 
         Two independent proofs, because neither alone is sufficient:
 
@@ -901,7 +905,7 @@ class DhanClient(Broker):
         raw_orders = self._request("GET", _SUPER_PATH) or []
         if not isinstance(raw_orders, list):
             raw_orders = []
-        owned = [o for o in raw_orders if self._owns_super_order(o)]
+        owned = [o for o in raw_orders if self._owns_order(o)]
 
         out: dict[str, Decimal] = {}
         for order in owned:
@@ -1212,7 +1216,7 @@ class DhanClient(Broker):
         selling and then being sold again is not.
 
         Only ours: ``get_forever_orders`` leaves ``reduce_only`` False on a GTT
-        without our correlationId, and the user rests GTTs by hand on this
+        ``_owns_order`` cannot prove, and the user rests GTTs by hand on this
         shared account (Decision 027).
         """
         try:
@@ -1248,11 +1252,11 @@ class DhanClient(Broker):
         needs these is ``plan_stop_protection``, which asks a narrower question:
         what protective stops are resting right now?
 
-        ``reduce_only`` carries the same correlationId proof as the working-order
-        path, and for the same Decision 027 reason: the sweep CANCELS what it
+        ``reduce_only`` carries the ``_owns_order`` proof (correlationId, else
+        the ledger), for the Decision 027 reason: the sweep CANCELS what it
         matches, and the user places GTTs by hand in the Dhan app on this shared
-        account. A GTT without our correlationId is theirs, stays False here, and
-        is therefore invisible to the planner rather than merely skipped by it.
+        account. A GTT neither proof claims is theirs, stays False here, and is
+        therefore invisible to the planner rather than merely skipped by it.
         """
         result = self._request("GET", _FOREVER_PATH) or []
         if not isinstance(result, list):
@@ -1280,10 +1284,17 @@ class DhanClient(Broker):
         # `price` — so read the field that should hold it, then fall back rather
         # than reporting a stop with no trigger at all.
         trig = o.get("triggerPrice") or o.get("price")
-        ours = _is_ours(o.get("correlationId"))
+        # correlationId OR the ledger — never correlationId alone. Dhan's GTT
+        # list does not return that field, so the correlationId-only check this
+        # replaced disowned every GTT the bot ever placed: the sweep saw no
+        # resting stop and placed another every tick (305 stacked on POLICYBZR
+        # and COCHINSHIP by 2026-09-24), and neither the orphan pass nor the
+        # cancel-before-close guard could retire a single one.
+        ours = self._owns_order(o)
+        correlation = o.get("correlationId")
         return OpenOrder(
             exchange_order_id=str(o.get("orderId", "")),
-            client_order_id=str(o["correlationId"]) if ours else None,
+            client_order_id=str(correlation) if _is_ours(correlation) else None,
             symbol=self._symbol_of(o),
             side=str(o.get("transactionType", "")).lower(),
             size=qty,
