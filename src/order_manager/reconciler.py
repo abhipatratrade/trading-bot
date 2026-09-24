@@ -410,13 +410,6 @@ class Reconciler:
         if positions is None:
             positions = self._broker.get_positions()
 
-        broker_qty: dict[str, Decimal] = {}
-        for p in positions:
-            if p.side == "long" and p.size > 0:
-                broker_qty[p.symbol] = broker_qty.get(
-                    p.symbol, Decimal("0")
-                ) + p.size
-
         now = self._clock.now()
         with session_scope() as session:
             ledger = bot_owned_quantities(
@@ -426,21 +419,19 @@ class Reconciler:
                 now=now,
             )
 
-        shortfalls: dict[str, Decimal] = {}
-        for symbol, owned in ledger.items():
-            gap = owned - broker_qty.get(symbol, Decimal("0"))
-            if gap > 0:
-                shortfalls[symbol] = gap
-
-        confirmed = self._confirm_shortfalls(shortfalls)
+        confirmed = self._confirm_shortfalls(exit_shortfalls(ledger, positions))
         if not confirmed:
             return
 
-        sells = self._todays_sell_fills()
+        fills = self._todays_fills()
         for symbol, qty in confirmed.items():
+            # The sign says which way the account moved: a vanished long was
+            # SOLD, a vanished short was BOUGHT back.
+            side = "sell" if qty > 0 else "buy"
             try:
                 self._write_unrecorded_exit(
-                    symbol, qty, sells.get(symbol, []), report
+                    symbol, abs(qty), fills.get((symbol, side), []), report,
+                    side=side,
                 )
             except Exception:
                 self._log.error(
@@ -474,17 +465,16 @@ class Reconciler:
                 self._shortfall_seen.pop(symbol, None)
         return confirmed
 
-    def _todays_sell_fills(self) -> dict[str, list]:
-        """``symbol → today's SELL fills``. Empty on any failure."""
+    def _todays_fills(self) -> dict[tuple[str, str], list]:
+        """``(symbol, side) → today's fills``. Empty on any failure."""
         try:
             fills = self._broker.get_fills()
         except Exception:
             self._log.warning("unrecorded_exit_fills_fetch_failed", exc_info=True)
             return {}
-        out: dict[str, list] = {}
+        out: dict[tuple[str, str], list] = {}
         for f in fills:
-            if str(f.side).lower() == "sell":
-                out.setdefault(f.symbol, []).append(f)
+            out.setdefault((f.symbol, str(f.side).lower()), []).append(f)
         return out
 
     def _write_unrecorded_exit(
@@ -493,10 +483,17 @@ class Reconciler:
         qty: Decimal,
         sell_fills: list,
         report: ReconcileReport,
+        *,
+        side: str = "sell",
     ) -> None:
-        """Write the SELL row the bot never sent, and page about it.
+        """Write the exit row the bot never sent, and page about it.
 
-        The price is taken from today's SELL fills ONLY when their total
+        ``side`` is the direction of that exit: ``sell`` for a long that left
+        the account, ``buy`` for a short that was bought back — a derivative
+        bucket's attached stop firing, Decision 037. ``sell_fills`` holds
+        today's fills on THAT side, whatever the parameter's historical name.
+
+        The price is taken from today's fills ONLY when their total
         quantity matches the shortfall exactly. That is a deliberately strict
         rule: on a shared account the trade book also carries the USER's sells,
         and a partial match could not be told apart from theirs. An exit with
@@ -519,8 +516,14 @@ class Reconciler:
             )
             price = agg.avg_price if agg else None
 
+        exit_side = OrderSide(side)
+        # The entry this exit closes sits on the OTHER side: a short opened
+        # with a SELL, so looking only at BUYs would attribute its exit to
+        # nobody (or to the wrong bucket).
+        entry_side = OrderSide.SELL if exit_side == OrderSide.BUY else OrderSide.BUY
+
         with session_scope() as session:
-            entry = self._latest_open_entry(session, symbol)
+            entry = self._latest_open_entry(session, symbol, side=entry_side)
             bucket_id = entry.bucket_id if entry else self._bucket_ids[0]
             strategy_name = entry.strategy_name if entry else None
 
@@ -530,7 +533,7 @@ class Reconciler:
             client_oid = make_client_order_id(
                 bucket_id or "unknown",
                 symbol,
-                "sell",
+                side,
                 now,
                 f"unrecorded-exit-{now.strftime('%Y%m%d')}",
             )
@@ -554,7 +557,7 @@ class Reconciler:
                     strategy_name=strategy_name or "unrecorded_exit",
                     broker=self._broker_name,
                     symbol=symbol,
-                    side=OrderSide.SELL,
+                    side=exit_side,
                     quantity=qty,
                     price=price,
                     client_order_id=client_oid,
@@ -595,23 +598,29 @@ class Reconciler:
             quantity=str(qty),
             price=str(price) if price is not None else None,
         )
+        moved = (
+            "left the account" if exit_side == OrderSide.SELL
+            else "of a SHORT were bought back"
+        )
         send_alert(
-            f"[reconciler] {symbol}: {qty} share(s) left the account with no "
+            f"[reconciler] {symbol}: {qty} unit(s) {moved} with no "
             f"order from the bot "
             f"({'@ ' + str(price) if price is not None else 'FILL PRICE UNKNOWN'})"
             f" — ledger corrected. Cause: stop leg, auto-square-off, or a "
-            f"manual sell."
+            f"manual {'sell' if exit_side == OrderSide.SELL else 'buy'}."
         )
 
-    def _latest_open_entry(self, session: Any, symbol: str) -> Trade | None:
-        """Newest unpaired BUY entry for ``symbol``, for attribution."""
+    def _latest_open_entry(
+        self, session: Any, symbol: str, *, side: OrderSide = OrderSide.BUY
+    ) -> Trade | None:
+        """Newest unpaired entry on ``side`` for ``symbol``, for attribution."""
         rows = (
             session.execute(
                 select(Trade)
                 .where(
                     Trade.broker == self._broker_name,
                     Trade.symbol == symbol,
-                    Trade.side == OrderSide.BUY,
+                    Trade.side == side,
                     *self._scope_trades(),
                 )
                 .order_by(Trade.created_at.desc())
@@ -1570,3 +1579,47 @@ def _exchange_side_to_position(side: str) -> PositionSide:
     if s in ("short", "sell"):
         return PositionSide.SHORT
     return PositionSide.FLAT
+
+
+def exit_shortfalls(
+    ledger: dict[str, Decimal], positions: list[Any]
+) -> dict[str, Decimal]:
+    """``{symbol: SIGNED qty}`` the ledger counts but the account no longer holds. PURE.
+
+    Positive: a LONG the account sold without the bot (a stop leg, Dhan's MIS
+    auto-square-off, the user's hand). Negative: a SHORT the account bought
+    back the same way — Decision 037's derivative short, whose attached stop
+    fires as a BUY.
+
+    Each direction is measured only against the broker's positions on THAT
+    side, so the long half is exactly the pre-037 rule. It has to be: selling
+    held stock shows as a SHORT day-position for minutes (Dhan settlement), and
+    netting that against the holding would read a live position as sold.
+
+    The short half did not exist. On 2026-09-23 a NATGASMINI short's stop leg
+    bought it back at the venue, nothing recorded the exit, and the ledger kept
+    counting −1 for good. The next day that phantom cancelled a real +1 long to
+    zero: the bot filed its own position as the user's and retired its stop leg
+    as an orphan, six minutes after opening it.
+    """
+    longs: dict[str, Decimal] = {}
+    shorts: dict[str, Decimal] = {}
+    for p in positions:
+        if p.size <= 0:
+            continue
+        if p.side == "long":
+            longs[p.symbol] = longs.get(p.symbol, Decimal("0")) + p.size
+        elif p.side == "short":
+            shorts[p.symbol] = shorts.get(p.symbol, Decimal("0")) + p.size
+
+    out: dict[str, Decimal] = {}
+    for symbol, owned in ledger.items():
+        if owned > 0:
+            gap = owned - longs.get(symbol, Decimal("0"))
+            if gap > 0:
+                out[symbol] = gap
+        elif owned < 0:
+            gap = -owned - shorts.get(symbol, Decimal("0"))
+            if gap > 0:
+                out[symbol] = -gap
+    return out

@@ -225,9 +225,16 @@ def bot_owned_quantities(
     is what stops a settlement artifact (a sale out of holdings shows as a
     negative day-position) from being read as a real short. Pass ``signed``
     explicitly only to override that, and say why.
+
+    **Per SYMBOL, by the buckets that traded it — not per account.** This
+    asked ``any(bucket_allows_shorts(b) for b in bucket_ids)``, and one Dhan
+    account carries swing-indian, intraday-indian AND commodity-indian, so
+    commodity's True switched the whole account to signed. Every cash scrip
+    whose entry had aged out of the window while its exit had not then read as
+    a bot-owned SHORT — CASTROLIND −267, PPLPHARMA −238, PIIND −30 on
+    2026-09-24 — and "owned" is the only thing keeping the safety sweeps off
+    the user's own holding of those names.
     """
-    if signed is None:
-        signed = any(bucket_allows_shorts(b) for b in bucket_ids)
     if not bucket_ids:
         return {}
     cutoff = now - timedelta(days=window_days)
@@ -242,4 +249,13 @@ def bot_owned_quantities(
         .scalars()
         .all()
     )
-    return net_owned_signed(rows) if signed else net_owned(rows)
+    if signed is True:
+        return net_owned_signed(rows)
+    if signed is False:
+        return net_owned(rows)
+    shorts_ok = {t.symbol for t in rows if t.bucket_id and bucket_allows_shorts(t.bucket_id)}
+    return {
+        sym: q
+        for sym, q in net_owned_signed(rows).items()
+        if q > 0 or sym in shorts_ok
+    }

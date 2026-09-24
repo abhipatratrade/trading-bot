@@ -37,6 +37,7 @@ class _T:
     quantity: Decimal
     status: OrderStatus = OrderStatus.FILLED
     extra: dict = field(default_factory=dict)
+    bucket_id: str | None = None
 
 
 class _Session:
@@ -69,6 +70,9 @@ def _short_one() -> list[_T]:
 
 
 def _owned(bucket: str, rows: list[_T], **kw) -> dict[str, Decimal]:
+    # The query scopes rows to ``bucket_ids``, so every real row carries one.
+    for r in rows:
+        r.bucket_id = r.bucket_id or bucket
     return bot_owned_quantities(
         _Session(rows),  # type: ignore[arg-type]
         broker_name=BrokerName.DHAN,
@@ -141,17 +145,43 @@ def test_an_explicit_signed_flag_beats_the_bucket() -> None:
     }
 
 
-def test_a_mixed_account_is_signed_if_any_bucket_can_be() -> None:
-    """One reconciler and one sweep serve every Dhan bucket at once. Deciding
-    long-only because most of them are cash would hide the derivative one's
-    short — the account-level view has to admit the widest case."""
-    owned = bot_owned_quantities(
-        _Session(_short_one()),  # type: ignore[arg-type]
+_ACCOUNT = ["swing-indian", "intraday-indian", "commodity-indian"]
+
+
+def _account_owned(rows: list[_T]) -> dict[str, Decimal]:
+    return bot_owned_quantities(
+        _Session(rows),  # type: ignore[arg-type]
         broker_name=BrokerName.DHAN,
-        bucket_ids=["swing-indian", "intraday-indian", "commodity-indian"],
+        bucket_ids=_ACCOUNT,
         now=_NOW,
     )
-    assert owned.get(_SYM) == Decimal("-1")
+
+
+def test_a_mixed_account_still_sees_the_derivative_short() -> None:
+    """One reconciler and one sweep serve every Dhan bucket at once. Deciding
+    long-only because most of them are cash would hide the derivative one's
+    short."""
+    rows = [
+        _T(r.symbol, r.side, r.quantity, extra=r.extra, bucket_id="commodity-indian")
+        for r in _short_one()
+    ]
+    assert _account_owned(rows).get(_SYM) == Decimal("-1")
+
+
+def test_a_mixed_account_keeps_cash_symbols_long_only() -> None:
+    """2026-09-24: deciding per ACCOUNT made commodity's True sign every cash
+    scrip too. CASTROLIND's entry had aged out of the window while its exit had
+    not, so it read as a bot-owned SHORT of 267 — and "owned" is the only thing
+    keeping the safety sweeps off the user's own holding of that name."""
+    rows = [
+        _T("CASTROLIND", OrderSide.SELL, Decimal("267"),
+           extra={"reduce_only": True}, bucket_id="intraday-indian"),
+        _T(_SYM, OrderSide.SELL, Decimal("1"),
+           extra={"reduce_only": False}, bucket_id="commodity-indian"),
+    ]
+    owned = _account_owned(rows)
+    assert "CASTROLIND" not in owned
+    assert owned[_SYM] == Decimal("-1")
 
 
 def test_no_buckets_means_no_holdings() -> None:
