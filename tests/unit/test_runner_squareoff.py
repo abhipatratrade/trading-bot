@@ -157,12 +157,14 @@ def test_nothing_held_is_a_noop(make_runner):
 
 
 def test_intraday_indian_is_configured_for_it():
-    """The yaml promise 'the 15:15 square-off closes CNC exactly as it closes
-    MIS' is only true if this line stays."""
+    """15:09, before Dhan's ~15:11:30 MIS auto-square-off — after it Dhan
+    refuses new intraday orders, which is how every 15:15 exit was refused
+    and tripped the reject_rate kill switch on 2026-09-24 (user decision
+    2026-09-25)."""
     from src.shared.bucket import load_buckets
 
     cfg = {b.id: b.config for b in load_buckets()}
-    assert cfg["intraday-indian"].squareoff == "15:15"
+    assert cfg["intraday-indian"].squareoff == "15:09"
     assert cfg["swing-indian"].squareoff is None
     assert cfg["commodity-indian"].squareoff is None
 

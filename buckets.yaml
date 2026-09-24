@@ -166,7 +166,17 @@ buckets:
     # 15:15-stamped bar since 2026-08-03, so its exit never fired: all four
     # live trades were closed by Dhan's MIS auto-square-off, and CNC has no
     # such net. This is what makes the CNC fallback above safe.
-    squareoff: "15:15"
+    #
+    # 15:09, user decision 2026-09-25 — not the backtest's 15:15. Dhan's RMS
+    # squares off MIS at ~15:11:30 (15:11:28 on 08-25 and 09-09, 15:11:41 on
+    # 09-24) and then REFUSES new intraday orders, so a 15:15 square-off never
+    # once landed: on 09-24 all five exits went out at 15:16-15:17, were
+    # refused, and the refusals tripped the reject_rate kill switch. 15:09
+    # lands before Dhan; if an exit still fails, Dhan's own square-off closes
+    # the MIS position a couple of minutes later. The wall clock is checked
+    # per TICK (~2 min on this bucket), so "15:09" means the first tick at or
+    # after 15:09:00 — on 09-24 that tick came at 15:09:46.
+    squareoff: "15:09"
     # Entry window differs from swing-indian's 09:45: the earliest reversal
     # candle closes at 09:30 (Decision 029).
     entry_start: "09:30"
