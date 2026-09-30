@@ -31,6 +31,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from src.core import retention
 from src.core.alerts import (
     note_alert_recovery,
+    note_sustained_failure,
+    note_sustained_recovery,
     send_alert,
     send_alert_dedup,
     verify_alert_channel,
@@ -57,15 +59,38 @@ from src.shared.market_calendar import IST, is_trading_day
 _log = get_logger("scheduler")
 
 _HEARTBEAT_ALERT_KEY = f"heartbeat_stale:{SERVICE_BOT_WORKER}"
+_HEARTBEAT_BLIND_ALERT_KEY = f"heartbeat_watch_blind:{SERVICE_BOT_WORKER}"
+
+# Three consecutive misses at the 2-minute cadence. A single failed read is a
+# Railway idle-connection drop that pool_pre_ping retries on the next run.
+_HEARTBEAT_BLIND_GRACE_SECONDS = 6 * 60
 
 
 def _heartbeat_watch() -> None:
-    """Page when the bot-worker heartbeat is stale; ping once on recovery."""
+    """Page when the bot-worker heartbeat is stale; ping once on recovery.
+
+    A watch that cannot READ the heartbeat is itself an outage, and it must
+    page. It used to log and return: from 2026-09-28 a SQLAlchemy 2.1 rebuild
+    left this container without its DB driver, and the dead-man's switch
+    failed every two minutes for two days without sending a single message —
+    a dead VM in that window would have gone unreported.
+    """
     try:
         beat_at = last_beat(SERVICE_BOT_WORKER)
     except Exception:
         _log.exception("heartbeat_watch_db_error")
+        note_sustained_failure(
+            _HEARTBEAT_BLIND_ALERT_KEY,
+            f"🚨 DEAD-MAN'S SWITCH IS BLIND: the scheduler cannot read the "
+            f"database, so a dead {SERVICE_BOT_WORKER}/VM would NOT be paged. "
+            f"Check the Railway scheduler logs.",
+            grace_seconds=_HEARTBEAT_BLIND_GRACE_SECONDS,
+        )
         return
+    note_sustained_recovery(
+        _HEARTBEAT_BLIND_ALERT_KEY,
+        "✅ Dead-man's switch can read the database again.",
+    )
     threshold = get_settings().heartbeat_stale_seconds
     stale, age = staleness(beat_at, datetime.now(tz=UTC), threshold)
     if stale:

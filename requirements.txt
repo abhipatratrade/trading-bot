@@ -17,7 +17,11 @@ pydantic-settings>=2.2
 pyotp>=2.9
 python-multipart>=0.0.9
 PyYAML>=6.0
-SQLAlchemy>=2.0
+# <2.1: SQLAlchemy 2.1 made psycopg 3 the default driver for a bare
+# postgresql:// URL, and only psycopg2 is installed. An unpinned Railway
+# rebuild on 2026-09-28 pulled 2.1.1 and took the scheduler + dashboard off
+# the database for two days while the VM, still on 2.0, kept working.
+SQLAlchemy>=2.0,<2.1
 structlog>=24.1
 uvicorn[standard]>=0.29
 websockets>=12.0
